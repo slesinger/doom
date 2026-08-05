@@ -1,0 +1,15 @@
+# Build artifacts. Note that build/doom.prg and build/main.vs are already
+# tracked and deliberately stay so: until KickAssembler is available they are
+# the only way to run the engine and reproduce the current hang.
+build/*.prg
+build/*.sym
+build/*.vs
+build/*.png
+build/*.bin
+build/assets.reu
+
+# KickAssembler is not vendored; see IMPLEMENTATION_PLAN.md
+tools/kickass/
+
+__pycache__/
+*.pyc
