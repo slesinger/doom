@@ -1,4 +1,14 @@
-# Doom C64U Dummy Pipeline Language
+# Doom C64U Pipeline Model (PipeScript)
+
+> **What this document is.** A high-level, deliberately non-runnable model of
+> the *target* frame loop, written in a made-up language (`PipeScript`) so that
+> stage boundaries, queue capacities and overflow policies can be stated without
+> committing to 6510 detail.
+>
+> For the **implemented** pipeline — the same journey in real assembly, with
+> cycle counts and a worked frame — see **[`pipeline.md`](pipeline.md)**.
+> §10 below maps every stage here onto the routine that implements it (or
+> records that nothing does).
 
 This file defines a high-level conceptual pipeline using a made-up language named `PipeScript`.
 It is intentionally non-runnable and focuses on the frame loop and stage boundaries.
@@ -285,3 +295,40 @@ input -> player movement -> camera update -> sector visibility -> wall collectio
 -> wall filtering -> wall projection + column clipping -> sprite cull/sort
 -> draw command packing -> rasterize -> commit backbuffer -> audio -> next frame
 ```
+
+## 8. Stage-To-Implementation Map
+
+Where each stage above actually lives in `src/`, as of Milestone 1.
+`pipeline.md` §14 carries the same table with the reasoning behind each gap.
+
+| PipeScript stage | Implemented in | State |
+|---|---|---|
+| `PollInput` | `input.asm` → `readInput` | complete |
+| `SimulatePlayer` | `input.asm` → `movePlayer`, `checkSector` | integer coords, undo-based collision, no `dt` |
+| `ResolveCamera` | `render/walls.asm` → `renderFrame` (inline) | complete |
+| `PredictStreaming` | — | not started (no REU streaming) |
+| `BuildVisibleSectorSet` | `render/walls.asm` → `popLoop` portal stack | no PVS, no supersectors; `PSTKMAX = 12` |
+| `CollectCandidateWalls` | `render/walls.asm` → `renderSector` wall loop | complete |
+| `FilterWalls` | `render/walls.asm` → `doWall` (near plane, backface, window clamp) | complete |
+| `sort.front_to_back` | **not needed** — convex sectors project to disjoint column ranges | by construction |
+| `ProjectWallsToColumns` | `render/walls.asm` → `lineSetup` + `!colloop` | complete |
+| `BuildSpriteCandidates` | — | not started |
+| `CullAndSortSprites` | — | not started |
+| `BuildDrawCommands` | **fused** — spans emitted directly from the column loop | no draw-command queue exists |
+| `RasterizeWallsAndSprites` | `math.asm` → `spanFill` | flat-shaded, no textures, no sprites |
+| `draw_deferred_floors_and_ceilings` | drawn inline instead | causes ~20% overdraw through portals |
+| `CommitBackbuffer` | `render/chunky2mc.asm` → `convert`, `flip` | complete; no dirty-tile masks |
+| `UpdateAudio` | — | not started |
+| `EndFrame` / `quality.degrade_step` | — | no profiling, no quality scaling |
+
+Two structural divergences are choices rather than omissions:
+
+- **No draw-command queue.** §5.4-5.5 build `draw_cmds` and rasterize them in a
+  later pass; the implementation writes spans directly from the column loop.
+  That saves a queue, a packing pass and the RAM for both — but it forecloses
+  `scheduler.pack_by_material_page` and the deferred floor/ceiling pass. This is
+  the decision to revisit when textures make material-page locality matter.
+- **Every cap is hard, none are adaptive.** `PSTKMAX`, 160 columns and 176 rows
+  are compile-time limits with deterministic overflow (satisfying rules R1-R3),
+  but rule R4's quality downgrade needs a per-frame cycle counter the engine
+  does not yet have.

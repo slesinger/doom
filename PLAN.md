@@ -1,3 +1,10 @@
+# Session log — black-screen investigation (2026-08)
+
+> Archived notes from the debugging session that diagnosed the first-frame hang.
+> Kept for the forensic detail. **`IMPLEMENTATION_PLAN.md` supersedes this** as
+> the current status and fix list, and `pipeline.md` §13 explains the failure in
+> terms of which pipeline stage's invariant is being violated.
+
 Published to claude/fable-5-progress-review-2xjdpc (commit 7243611). No PR opened — say the word if you want one.
 What the previous session was chasing, and what it actually is
 Their instinct was right. build/mon.txt (break cd76 if .X > $a0) was watching for a column index past 159 — at the hang, X = $B5 (181).

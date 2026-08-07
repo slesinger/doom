@@ -1,4 +1,21 @@
-# Doom C64U
+# Doom C64U — Architecture And Design Intent
+
+> **What this document is.** This is the *target* architecture: the engine the
+> project is aiming at, and the reasoning behind its shape. It is deliberately
+> ahead of the code.
+>
+> For the pipeline **as actually implemented** — with real formulas, real cycle
+> counts and a frame traced end to end — see **[`pipeline.md`](pipeline.md)**.
+> For what is built versus broken, see
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+>
+> Milestone 1 implements a subset of what follows: portal traversal, per-column
+> clip windows, flat-shaded walls/floors/ceilings and the multicolor converter.
+> It does **not** yet implement REU streaming, PVS visibility, textures, sprites,
+> audio or quality scaling. Where the implementation deliberately diverges from
+> this document — notably in the numeric formats, see the *Implementation note*
+> in the Preface below — `pipeline.md` §2 and §14 record the difference and the
+> reason.
 
 ## Preface
 
@@ -12,6 +29,17 @@ The mathematical foundation is fixed-point first. Floating point is avoided in t
 - Angles: unsigned turn space (0..65535 for full rotation).
 - Trigonometric lookup tables: quantized sin/cos with interpolation only where needed.
 - Projection terms: precomputed reciprocal and tangent tables to remove divisions from hot paths.
+
+> **Implementation note (Milestone 1).** The code currently uses **signed
+> 16-bit integer** world coordinates and an **8-bit** angle (0..255 per turn),
+> not 16.16 and 0..65535. This halves the cost of every transform multiply and
+> lets the angle wrap for free in a register, at the cost of no sub-unit motion
+> and 1.406° of angular granularity. The 2.14 sine table is already in its final
+> form, so widening the angle is an indexing change, not a data change.
+> Projection still uses runtime division (`udiv`) rather than reciprocal tables;
+> at ~880 cycles per divide and ~6 divides per wall this is measurable but not
+> yet dominant — see `pipeline.md` §12.1, where geometry is 13% of the frame and
+> the two byte-per-pixel passes are 75%.
 
 From this model, each frame is produced by a deterministic sequence:
 
@@ -51,6 +79,12 @@ This document therefore focuses on three complementary goals:
 If these goals are met, the resulting engine will demonstrate that a Doom-like experience on C64 Ultimate is not only feasible, but can be technically disciplined, scalable, and surprisingly fluid when the math and data flow are designed for the machine from the start.
 
 ## Compute Pipeline
+
+> The six stages below are the *target* decomposition. The implemented pipeline
+> collapses some of them — scene calculation and rasterization are fused, and
+> there is no draw-command queue — and omits others entirely. **[`pipeline.md`](pipeline.md)**
+> traces the real thing stage by stage; its §14 maps each of the stages below
+> onto what exists today.
 
 The compute pipeline must be organized around bounded work per frame, not around idealized full-scene accuracy. On C64U, the renderer cannot afford to rediscover the whole world every frame from scratch, nor can it treat texturing or sprite-like objects as independent expensive passes. The viable approach is to move from camera state to a tightly filtered visible working set, then to column-oriented wall and sprite generation, while keeping DMA, REU streaming, and main-memory residency predictable.
 
