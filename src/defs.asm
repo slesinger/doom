@@ -19,14 +19,17 @@
 .const MATHTAB        = $c400
 .const WALLSCODE      = $ca30
 
-// per-column clip windows (page aligned)
+// per-column clip windows (page aligned). colTop/colBot each own a full
+// dedicated page: with spanFill's zSX bounds check in place a stray write
+// can no longer land here, but keeping the pages private removes the
+// aliasing hazard entirely instead of relying solely on that check.
 .const colTop  = $0200              // first open row
 .const colBot  = $0300              // first closed row below
 
-// portal traversal stack
-.const pStkSec = $03a0              // 12 entries
-.const pStkXL  = $03b0
-.const pStkXR  = $03c0
+// portal traversal stack (free space below MATRIX, see main.asm map)
+.const pStkSec = $0b20              // 12 entries
+.const pStkXL  = $0b30
+.const pStkXR  = $0b40
 .const PSTKMAX = 12
 
 //------------------------------------------------------------
@@ -151,5 +154,5 @@
 .const START_A = 0                  // facing east, toward the portal
 .const START_SEC = 0
 
-.const WALLS2         = $9d60      // walls helper routines after math code
-.const visitedSec     = $03d0      // per-frame sector visited flags (16 for testmap)
+.const WALLS2         = $9d80      // walls helper routines after math code
+.const visitedSec     = $0b50      // per-frame sector visited flags (16 for testmap)

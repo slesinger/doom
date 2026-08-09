@@ -8,8 +8,10 @@ is broken, and what happens next. [`README.md`](README.md) indexes all of them.
 
 ## Status
 
-**Milestone 1 — walkable 3D demo: written, not yet working.** Every module is
-complete, but the program hangs during its first frame and the display stays black.
+**Milestone 1 — walkable 3D demo: rendering.** The black-screen JAM is fixed;
+`make shot` now produces a non-black frame (dithered ceiling, wall columns,
+portal gap) instead of hanging. Walking/turning and the remaining visual
+rough edges (see "Known issues" below) haven't been exercised yet.
 
 | File | State |
 |---|---|
@@ -82,34 +84,195 @@ Two facts worth recording:
 
 `sta colBot,x` with `x >= 160` writes straight into the portal stack.
 
+## What fixed the black screen
+
+The four steps from the earlier diagnosis are all applied:
+
+1. **`spanFill` (`src/math.asm`) now bounds-checks both ends of the run**, not
+   just the start: `zSY1` is clamped to 176 before the row count is computed
+   (a span that starts in-bounds but runs long used to walk `spanNextCell`
+   past `rowCell`'s 22 entries one full 8-row cell at a time), and `zSX >= 160`
+   / `zSY0 >= 176` are rejected before either the `xOfs` or `rowCell` lookup.
+   Clamping the start alone (the original step 1) built clean but still let
+   `make debug` catch fresh stray writes at a different address — the end
+   also had to be bounded.
+2. **`zC0` is now clamped down to `zXR`** in `doWall` (`src/render/walls.asm`),
+   not just up to `zXL`, so a wall with `sx0 = 160..255` can no longer store
+   an out-of-range column index.
+3. **`pStkSec`/`pStkXL`/`pStkXR`/`visitedSec` moved to `$0B20-$0B5F`**, free
+   space below MATRIX, out of the page immediately after `colBot`.
+4. `make shot` now produces a non-black frame instead of hanging.
+
+Two more things had to be fixed before any of the above could even be
+*verified*, both now folded into the tree:
+
+- **The Makefile wrote `doom.prg` outside `build/`.** `-odir ../build -o doom.prg`
+  resolved `-odir` relative to the source file's directory but `-o` relative to
+  cwd, so the two disagreed and the PRG landed in the repo root — `make shot`/
+  `make debug` were then running whatever stale binary happened to be sitting in
+  `build/` from a previous manual build. Fixed by pointing `-o` straight at
+  `$(PRG)` (`build/doom.prg`) instead of a bare filename.
+- **`x64sc` was picking up this machine's saved `vicerc`** from other VICE
+  projects (a freezer cartridge, IDE64 drives, JiffyDOS), which silently broke
+  `-autostart`: the PRG got injected but the machine sat at a plain BASIC
+  `READY.` prompt — CPU parked in the KERNAL input loop, nothing ever executed.
+  That is a different failure from the black screen but produces an
+  indistinguishable symptom (a screenshot with no rendered frame) and was
+  giving `make debug` a false-clean 0-diffs result, since a program that never
+  ran also never writes anything to diff. `VICEOPTS` now includes `-default`
+  so `shot`/`debug` are hermetic regardless of what else has run `x64sc` on
+  this machine. `tools/vicedbg/probe.py`'s `ALLOWED` list also needed `SCREEN1`
+  added — it was flagging the converter's legitimate double-buffer writes at
+  `$C000-$C3FF` as unexpected.
+
+`make debug` now reports **zero unexpected differences**, with real traffic
+(not zero) recorded against MATRIX, BITMAP0, both SCREEN buffers, and the
+self-modifying code regions — i.e. it's confirmed the renderer actually ran a
+full frame, not just that nothing crashed.
+
+## Fixed: most of the frame was undrawn (root cause found and fixed)
+
+**Root cause: `renderFrame`'s per-frame `colTop`/`colBot` init loops
+(`walls.asm`, top of `renderFrame`) never actually cleared the arrays.**
+Both loops used the classic 6502 `ldx #159 / ... / dex / bpl loop`
+countdown idiom, but `colTop`/`colBot` have **160** columns (indices
+0-159), and `BPL` branches on the sign bit (bit 7). `159` and every value
+from `128`-`159` already has bit 7 set, so the very first `dex`
+(159→158) leaves the sign bit set and `BPL` fails to branch — the loop
+body runs **exactly once**, writing only column 159, then falls straight
+through. Columns 0-158 of `colTop`/`colBot` were left holding whatever was
+in memory from the *previous* frame's rendering (including mid-frame
+garbage from cell-boundary spanFill writes) instead of the intended
+open-window state `(colTop=0, colBot=176)`. Every downstream symptom
+chased across two sessions — the B→C portal's opening "collapsing" to
+`(0,0)`, wall 2's own columns reading `(0,0)`, the byte-identical
+"garbage" at columns 130-144 — was this same stale/leftover data being
+read back as if it were real per-column window state; none of the wall
+math, portal clamping, or accumulator stepping was ever at fault.
+
+**Fix** (`walls.asm`, `renderFrame`): count `160 → 1` instead of
+`159 → 0`, and terminate with `cpx #0 / bne` instead of `bpl`, which
+doesn't care about the sign bit:
+
+```
+ldx #160
+lda #0
+!:      dex
+        sta colTop,x
+        cpx #0
+        bne !-
+```
+(and the equivalent for `colBot`, `lda #176`). Verified: `make shot` now
+renders ceiling texture, floor, and a real portal opening instead of two
+thin bands + black; `make debug`'s live-vs-PRG diff still reports zero
+unexpected writes, and `MATRIX`/`BITMAP0` non-zero byte counts roughly
+quadrupled (consistent with far more of the frame actually being drawn).
+
+The investigation that led here (several refuted hypotheses about portal
+clamp math, stack corruption, map data, etc. — all correctly refuted,
+since none of them were the bug) is preserved in `debug-notes/` (start at
+`debug-notes/00-index.md`) for the record. Below is that investigation's
+history, kept for context.
+
+**1. Confirmed and isolated: the B→C portal (wall 8) computes a collapsed
+(zero-height) opening.** Per-wall instrumentation logging `(zWIdx2, zC0, zC1)`
+at `!cols:` in `doWall` confirmed every wall's horizontal clip range is
+*correct* for the whole frame — sector A's walls close [0,60), sector B's
+open [61,98) with wall 7 solid at [61,70), wall 8 portal at [71,88), wall 9
+solid at [89,98); sector C then renders again inside wall 8's own [71,88)
+window. That's all as hand-calculated — traversal and horizontal clipping are
+not the bug. But `zBT`/`zBB` (the portal opening's clamped top/bottom rows,
+computed via `clampAcc` in the `!portal:` branch of `doWall`, walls.asm) come
+out `(0, 0)` for every column in wall 8's range, instead of a real opening.
+Since `colTop`/`colBot` get narrowed to that `(0,0)` window, the entire
+column is subsequently seen as *closed* by everything downstream (sector C's
+own walls skip it via the `!closed:` branch) — a razor-thin portal makes the
+whole room behind it vanish. Concretely: `zBTop0/1`/`zBBot0/1` (sector C's
+ceiling/floor projected through the portal, before clamping into
+`[zTW,zBW]`) or the `clampAcc(Y=6)`/`clampAcc(Y=9)` clamp itself is producing
+0 instead of a real row — worth a fresh instrumentation pass logging
+`zBTop0/1`/`zBBot0/1` directly (unclamped) to see whether the bug is in that
+projection or in the clamp.
+
+**2. Reproduced but *not* isolated, and contradicts everything else checked:
+some columns *inside wall 2's own [0,60) range* — a plain solid wall, no
+portal involved — also end up `(0,0)` instead of the expected `(176,0)`**
+(e.g. columns 12–15, 19, 52–60, stable across repeated frame-1 captures).
+`(0,0)` is only ever written by the portal-narrow path in `doWall`, which
+requires `zBack != $ff`. Two lines of evidence say that can't be happening
+for wall 2:
+  - A zero-page *store watchpoint* directly on `zBack` ($3b) for a whole
+    frame showed it is written exactly once per wall, with values `$ff, $ff,
+    $ff, $01, $ff, $ff, $ff, $02, $ff, $ff, $ff` for walls `2,3,4,5,7,8,9,e,f`
+    (matching the map's `wBack` table exactly) — never `$00`/anything else
+    mid-loop for wall 2.
+  - Wall 2's own `zTop0`/`zBot0` (21/100) are sane, non-degenerate, and its
+    `[zC0,zC1]` is exactly `[0,60)` (finding 1's instrumentation) — the solid
+    branch's close (`lda #176 / sta colTop,x` / `lda #0 / sta colBot,x`,
+    walls.asm) is unconditional once reached and cannot itself produce
+    `(0,0)`.
+
+  So by source-code reading this is provably impossible, yet reproduces
+  every capture.
+
+**3. This session (`debug-notes/`): the "impossible" contradiction is real,
+narrowed further, and one leading theory is ruled out.** Two theories that
+would unify findings 1 and 2 — a second, small portal wall inside sector A
+whose columns overlap wall 2's (hand-derived geometry: sector A's own A→B
+portal, wall 3, actually maps to columns `[60,100)`, adjacent to but not
+overlapping wall 2's `[0,60)` — refuted, see `debug-notes/C-second-portal-overlap.md`)
+and portal-stack slot corruption handing a child sector the wrong
+`[zXL,zXR]` window (refuted — live capture confirms sectors B and C receive
+*exactly* the windows their portal walls pushed, see
+`debug-notes/F-stack-slot-corruption.md`) — were both eliminated. A
+camera-locked, per-wall live capture (`debug-notes/A-front-body-clamp.md`)
+placed the `(0,0)` collapse at columns 12-15/19 as already present
+immediately after wall 2's *own* `doWall` call finishes, before any other
+wall has run — so whatever's wrong is inside or upstream of wall 2's own
+column loop, not a cross-wall stomp. The same pass also found a *new*,
+previously-undocumented anomaly: columns 130-144 (inside wall 4's solid
+`[99,159)` range) hold a garbage byte pattern that is byte-identical across
+independent emulator relaunches — ruling out stale/uninitialized RAM, i.e.
+it's a deterministic product of the program, not yet correlated to a
+specific wall or instruction.
+
+**Tooling lesson (important for the next session):** attempts to pin down
+the exact faulty instruction via fine-grained exec/store checkpoints under
+`-warp` produced self-contradictory results — a checkpoint armed at one
+address sometimes reported a halt with the register-read `PC` pointing
+elsewhere entirely (inside unrelated converter code), and a store
+checkpoint on a page-2 byte that should fire every single frame (the
+init loop alone writes it) produced zero hits in a generous window. Coarse
+checkpoints (once per subroutine return, like `renderSector`'s `inc
+zWIdx`) stayed internally consistent and are trusted; fine-grained
+mid-routine ones under `-warp` are not. **Do not chase this further with
+exec/store checkpoints under `-warp`.** The recommended next step is to add
+single-step support to `tools/vicedbg/vicemon.py` (VICE binary-monitor
+`advance`/`step`) and use it with `-warp` off — single-stepping is
+synchronous by construction and immune to the race observed here. Full
+method in `debug-notes/A-front-body-clamp.md`.
+
+Useful commands for a debugging pass like this one:
+
+    x64sc -reu -reusize 16384 -default +confirmonexit -autostartprgmode 1 \
+        +sound -warp -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6510 \
+        -autostart build/doom.prg &
+    python3 tools/vicedbg/probe.py dump build/doom.prg   # colTop/colBot occupancy
+
+(`Mon.quit()` in `vicemon.py` sends the VICE *quit emulator* command, not
+"close this monitor connection" — close the socket directly instead, or the
+next probe call will find nothing listening.)
+
 ## Next steps
-
-1. **Bound the two lookups in `spanFill`** (`src/math.asm`): reject `zSX >= 160`
-   before the `xOfs` lookup and `zSY0 >= 176` before the `rowCell` lookup. A few
-   cycles on a path that already does a 16-bit add, and a memory stomp becomes a
-   dropped span.
-2. **Clamp `zC0` on the high side** in `doWall` (`src/render/walls.asm`). It is
-   currently clamped up to `zXL` but never down to `zXR`, so a wall with
-   `sx0 = 160..255` stores an out-of-range `zC0` and depends solely on the later
-   `cmp zC0 / bcs` to reject it.
-3. **Move `pStkSec`/`pStkXL`/`pStkXR`/`visitedSec`** out of the `$0300` page into the
-   free space below MATRIX (`$0B20-$0FFF`, already covered by the `.errorif * > MATRIX`
-   guard in `src/main.asm`), so `colTop`/`colBot` own private pages.
-4. Rebuild, re-run `make shot`, and confirm a non-black frame: dark stone ceiling
-   band, metal wall band broken by the brighter corridor opening around columns
-   60-99, moss floor below.
-
-The bounds contract each pipeline stage is supposed to establish — and which of
-them are actually enforced — is tabulated in `pipeline.md` §13.2. Worked
-evidence for step 2 is in `pipeline.md` §11.2: at the spawn position, wall 5 of
-sector A really does produce `c0 = 160, c1 = 159` and is rejected *solely* by
-the final `cmp zC0 / bcs` guard.
 
 Beyond Milestone 1, in dependency order: `tools/wad2reu.py` → REU DMA streaming →
 real map geometry replacing `testmap.asm` → textured walls → floors/ceilings →
 sprites → music. `tools/u64push.py` is independent of all of it.
 `pipeline.md` §12.1 gives the current frame budget (~52% at 48 MHz) and §14 the
-full stage-by-stage gap list against the target architecture.
+full stage-by-stage gap list against the target architecture. `pipeline.md`
+§11.2/§13.2 (the wall-5/zC0 worked example and the bounds-contract table) are
+now historical — the gaps they documented are closed — but are left as-is
+since they're useful worked traces of the geometry math.
 
 ## Building and testing
 

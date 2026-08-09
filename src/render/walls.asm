@@ -35,16 +35,24 @@ done:   sta acc+2
 
 //------------------------------------------------------------
 renderFrame:
-        ldx #159                    // open all column windows
+        // open all column windows. NOTE: 160 columns means X ranges
+        // 159..0, and 128..159 all have bit 7 set -- a bpl-terminated
+        // countdown from #159 stops after one iteration (159->158 is
+        // still "negative"), leaving colTop/colBot stale for columns
+        // 1..159 every frame. Count 160..1 instead and test via cpx/bne,
+        // which doesn't care about the sign bit.
+        ldx #160
         lda #0
-!:      sta colTop,x
-        dex
-        bpl !-
-        ldx #159
+!:      dex
+        sta colTop,x
+        cpx #0
+        bne !-
+        ldx #160
         lda #176
-!:      sta colBot,x
-        dex
-        bpl !-
+!:      dex
+        sta colBot,x
+        cpx #0
+        bne !-
         ldy camA                    // camera trig
         lda sinLo,y
         sta camSin
@@ -314,6 +322,9 @@ doWall:
         cmp zXL
         bcs !+
 !useXL: lda zXL
+!:      cmp zXR                     // clamp down to zXR too: sx0 may be
+        bcc !+                      // 160..255, inside the byte but past
+        lda zXR                     // the column-window's right edge
 !:      sta zC0
         lda zSXW1+1                 // c1 = min(sx1-1, zXR)
         bmi !reject2+               // sx1 <= 0 -> fully left

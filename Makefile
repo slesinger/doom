@@ -30,7 +30,12 @@ REUOPTS    = -reu -reusize 16384
 # +confirmexit is not a VICE option (VICE bails out); it is +confirmonexit.
 # -autostartprgmode 1 injects the PRG directly, so no 1541 drive ROMs are
 # needed. +sound keeps a missing audio device from killing a headless run.
-VICEOPTS   = +confirmonexit -autostartprgmode 1 +sound
+# -default ignores this machine's saved vicerc: a vicerc left behind by some
+# other VICE project (e.g. a cartridge or drive ROM override) can silently
+# break -autostart, which fails open into a blank BASIC READY screen that
+# looks a lot like -- but is not -- our own black-screen bug. shot/debug
+# must be hermetic against whatever else has run x64sc on this machine.
+VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 ifneq ($(wildcard $(REUIMG)),)
 REUOPTS   += -reuimage $(REUIMG)
 endif
@@ -43,7 +48,7 @@ setup:
 all: $(PRG)
 
 $(PRG): $(SRC)
-	$(KICKASS) src/main.asm -odir ../build -o doom.prg -showmem \
+	$(KICKASS) src/main.asm -odir build -o $(PRG) -showmem \
 	    -symbolfile -vicesymbols
 
 run: $(PRG)
