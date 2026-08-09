@@ -251,8 +251,12 @@ sdiv:
 // Preserves X. No-op when zSY0 >= zSY1.
 //------------------------------------------------------------
 spanFill:
-        lda zSY1
-        sec
+        lda zSY1                    // clamp the run's far end to the last
+        cmp #177                    // valid row (176 = 22 cell-rows * 8):
+        bcc !+                      // otherwise the cell loop below walks
+        lda #176                    // spanNextCell past rowCell's 22 entries
+        sta zSY1                    // one full cell at a time, unbounded
+!:      sec
         sbc zSY0
         beq !nul+
         bcs !go+
@@ -260,12 +264,16 @@ spanFill:
 !go:    sta zSCnt
         txa
         pha
-        ldx zSX
+        ldx zSX                     // bounds-check before either table lookup:
+        cpx #160                    // an out-of-range index would read past
+        bcs spanEnd                 // xOfs/rowCell into whatever follows them
         lda zSY0
         lsr
         lsr
         lsr
-        tay                         // Y = cell row of first pixel
+        cmp #22
+        bcs spanEnd
+        tay                         // Y = cell row of first pixel (bounds-checked)
         lda xOfsLo,x
         clc
         adc rowCellLo,y

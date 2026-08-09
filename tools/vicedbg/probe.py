@@ -23,11 +23,14 @@ from vicemon import Mon
 
 # regions the engine legitimately writes while running
 ALLOWED = [
-    (0x0200, 0x03FF, "clip/portal-stack"),
+    (0x0200, 0x02FF, "colTop"),
+    (0x0300, 0x03FF, "colBot"),
     (0x0400, 0x07FF, "COLBUF"),
+    (0x0B20, 0x0B5F, "portal-stack/visitedSec"),
     (0x1000, 0x7DFF, "MATRIX"),
     (0x8000, 0x83FF, "SCREEN0"),
     (0xA000, 0xBF3F, "BITMAP0"),
+    (0xC000, 0xC3FF, "SCREEN1"),
     (0x9900, 0x9AFF, "converter code (self-mod)"),
     (0x9B60, 0x9D5F, "math code (self-mod mul8)"),
 ]

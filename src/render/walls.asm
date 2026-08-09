@@ -314,6 +314,9 @@ doWall:
         cmp zXL
         bcs !+
 !useXL: lda zXL
+!:      cmp zXR                     // clamp down to zXR too: sx0 may be
+        bcc !+                      // 160..255, inside the byte but past
+        lda zXR                     // the column-window's right edge
 !:      sta zC0
         lda zSXW1+1                 // c1 = min(sx1-1, zXR)
         bmi !reject2+               // sx1 <= 0 -> fully left

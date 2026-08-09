@@ -8,8 +8,10 @@ is broken, and what happens next. [`README.md`](README.md) indexes all of them.
 
 ## Status
 
-**Milestone 1 — walkable 3D demo: written, not yet working.** Every module is
-complete, but the program hangs during its first frame and the display stays black.
+**Milestone 1 — walkable 3D demo: rendering.** The black-screen JAM is fixed;
+`make shot` now produces a non-black frame (dithered ceiling, wall columns,
+portal gap) instead of hanging. Walking/turning and the remaining visual
+rough edges (see "Known issues" below) haven't been exercised yet.
 
 | File | State |
 |---|---|
@@ -82,34 +84,73 @@ Two facts worth recording:
 
 `sta colBot,x` with `x >= 160` writes straight into the portal stack.
 
+## What fixed the black screen
+
+The four steps from the earlier diagnosis are all applied:
+
+1. **`spanFill` (`src/math.asm`) now bounds-checks both ends of the run**, not
+   just the start: `zSY1` is clamped to 176 before the row count is computed
+   (a span that starts in-bounds but runs long used to walk `spanNextCell`
+   past `rowCell`'s 22 entries one full 8-row cell at a time), and `zSX >= 160`
+   / `zSY0 >= 176` are rejected before either the `xOfs` or `rowCell` lookup.
+   Clamping the start alone (the original step 1) built clean but still let
+   `make debug` catch fresh stray writes at a different address — the end
+   also had to be bounded.
+2. **`zC0` is now clamped down to `zXR`** in `doWall` (`src/render/walls.asm`),
+   not just up to `zXL`, so a wall with `sx0 = 160..255` can no longer store
+   an out-of-range column index.
+3. **`pStkSec`/`pStkXL`/`pStkXR`/`visitedSec` moved to `$0B20-$0B5F`**, free
+   space below MATRIX, out of the page immediately after `colBot`.
+4. `make shot` now produces a non-black frame instead of hanging.
+
+Two more things had to be fixed before any of the above could even be
+*verified*, both now folded into the tree:
+
+- **The Makefile wrote `doom.prg` outside `build/`.** `-odir ../build -o doom.prg`
+  resolved `-odir` relative to the source file's directory but `-o` relative to
+  cwd, so the two disagreed and the PRG landed in the repo root — `make shot`/
+  `make debug` were then running whatever stale binary happened to be sitting in
+  `build/` from a previous manual build. Fixed by pointing `-o` straight at
+  `$(PRG)` (`build/doom.prg`) instead of a bare filename.
+- **`x64sc` was picking up this machine's saved `vicerc`** from other VICE
+  projects (a freezer cartridge, IDE64 drives, JiffyDOS), which silently broke
+  `-autostart`: the PRG got injected but the machine sat at a plain BASIC
+  `READY.` prompt — CPU parked in the KERNAL input loop, nothing ever executed.
+  That is a different failure from the black screen but produces an
+  indistinguishable symptom (a screenshot with no rendered frame) and was
+  giving `make debug` a false-clean 0-diffs result, since a program that never
+  ran also never writes anything to diff. `VICEOPTS` now includes `-default`
+  so `shot`/`debug` are hermetic regardless of what else has run `x64sc` on
+  this machine. `tools/vicedbg/probe.py`'s `ALLOWED` list also needed `SCREEN1`
+  added — it was flagging the converter's legitimate double-buffer writes at
+  `$C000-$C3FF` as unexpected.
+
+`make debug` now reports **zero unexpected differences**, with real traffic
+(not zero) recorded against MATRIX, BITMAP0, both SCREEN buffers, and the
+self-modifying code regions — i.e. it's confirmed the renderer actually ran a
+full frame, not just that nothing crashed.
+
+## Known issues in the rendered frame
+
+`build/shot.png` shows a dithered ceiling band and vertical wall columns with
+a gap (the portal opening), matching the expected geometry — but only for
+roughly the left half/two-thirds of the screen; the right portion of the frame
+is black instead of showing more wall/floor, and there is a thin stray
+vertical line further right. Floor is also not rendering with the expected
+moss color. Not yet root-caused — worth `vicedbg`-tracing per-column
+`colTop`/`colBot` state after a frame the same way the original JAM was
+diagnosed, before touching movement/input.
+
 ## Next steps
-
-1. **Bound the two lookups in `spanFill`** (`src/math.asm`): reject `zSX >= 160`
-   before the `xOfs` lookup and `zSY0 >= 176` before the `rowCell` lookup. A few
-   cycles on a path that already does a 16-bit add, and a memory stomp becomes a
-   dropped span.
-2. **Clamp `zC0` on the high side** in `doWall` (`src/render/walls.asm`). It is
-   currently clamped up to `zXL` but never down to `zXR`, so a wall with
-   `sx0 = 160..255` stores an out-of-range `zC0` and depends solely on the later
-   `cmp zC0 / bcs` to reject it.
-3. **Move `pStkSec`/`pStkXL`/`pStkXR`/`visitedSec`** out of the `$0300` page into the
-   free space below MATRIX (`$0B20-$0FFF`, already covered by the `.errorif * > MATRIX`
-   guard in `src/main.asm`), so `colTop`/`colBot` own private pages.
-4. Rebuild, re-run `make shot`, and confirm a non-black frame: dark stone ceiling
-   band, metal wall band broken by the brighter corridor opening around columns
-   60-99, moss floor below.
-
-The bounds contract each pipeline stage is supposed to establish — and which of
-them are actually enforced — is tabulated in `pipeline.md` §13.2. Worked
-evidence for step 2 is in `pipeline.md` §11.2: at the spawn position, wall 5 of
-sector A really does produce `c0 = 160, c1 = 159` and is rejected *solely* by
-the final `cmp zC0 / bcs` guard.
 
 Beyond Milestone 1, in dependency order: `tools/wad2reu.py` → REU DMA streaming →
 real map geometry replacing `testmap.asm` → textured walls → floors/ceilings →
 sprites → music. `tools/u64push.py` is independent of all of it.
 `pipeline.md` §12.1 gives the current frame budget (~52% at 48 MHz) and §14 the
-full stage-by-stage gap list against the target architecture.
+full stage-by-stage gap list against the target architecture. `pipeline.md`
+§11.2/§13.2 (the wall-5/zC0 worked example and the bounds-contract table) are
+now historical — the gaps they documented are closed — but are left as-is
+since they're useful worked traces of the geometry math.
 
 ## Building and testing
 
