@@ -35,7 +35,7 @@ trade three times (§4.3, §5).
 **Arrays the 6502 indexes with a single `X` must be ≤ 256 entries.** Every
 resident table below is structure-of-arrays with a capacity of 240 or less, so
 every access is a flat `lda table,x` with no 16-bit address arithmetic. This is
-the same reason `testmap.asm` is SoA today.
+the same reason the hand-built test map was SoA before it was deleted.
 
 ---
 
@@ -52,11 +52,11 @@ At REU offset `$000000`, 64 bytes:
 | 8 | 8×`N` | block descriptors |
 
 `mapload.asm` rejects the image if the magic or the version does not match,
-recording why in `mapErr` and leaving `mapOK` at 0. It is not fatal *yet* —
-nothing reads the map, so halting would only break machines the engine
-currently works on — but `make check` and `make u64-map` both assert
-`mapOK == 1`, and it becomes fatal in Phase 4 when the map is the only thing
-there is to draw. That check is not paranoia: this project has already lost a
+recording why in `mapErr` and leaving `mapOK` at 0. **As of Phase 4 that is
+fatal**: the map is the only thing there is to draw,
+so `main.asm` stops with `mapErr` in the border colour rather than rendering
+whatever happens to be in RAM. `make check` and `make u64-map` still assert
+`mapOK == 1` as well. That check is not paranoia: this project has already lost a
 session to a silently absent REU (`IMPLEMENTATION_PLAN.md` §10), and a stale or
 undelivered `assets.reu` fails the same way — every read succeeds and returns
 the wrong thing.
@@ -122,10 +122,11 @@ inspectable in a hex dump, which is not.
 | 22 | 10 | reserved, zero |
 
 `spawnSsector` is redundant — the engine's own BSP descent will find it — and
-that is the point. The engine descends from `spawnX/spawnY` at boot and compares;
-a mismatch means the Python `pointOnSide` and the 6502 `pointOnSide` disagree
-about a sign, which is the single most likely way this pipeline breaks and the
-hardest to see from a rendered frame.
+that is the point. `main.asm` compares the two at boot and halts with
+`mapErr = 9` if they disagree: a mismatch means the Python `pointOnSide` and
+the 6502 `sideOf` disagree about a sign, which is the single most likely way
+this pipeline breaks and the hardest to see from a rendered frame. It passes
+on E1M1 — the first thing the engine proved when the traversal came up.
 
 ### 4.2 `NODES` — 12 arrays of 240 bytes at `$D000`
 
@@ -158,8 +159,12 @@ an instruction per node visit and buys nothing.
 not fit under `$D000` alongside the rest. Without them the walk visits every
 node and relies on column occlusion (`colTop`/`colBot`) plus the `openCols`
 early-out for rejection — correct, just not maximally culled. This is
-`IMPLEMENTATION_PLAN.md` risk #3 and re-adding a quantised bbox is the designed
-escape hatch if the E1M1 frame time demands it.
+`IMPLEMENTATION_PLAN.md` risk #3, and Phase 4 has now **called it in**: E1M1
+costs 3.2x the test map per frame and lands the engine at roughly half the
+25 fps target. The escape hatch is a quantised bbox, and the shape it should
+take is a *streamed* one — 4 bytes per node fetched alongside the node visit,
+in a new block, rather than resident, because there are only 384 free bytes
+under the I/O space and 236 nodes need 944.
 
 ### 4.3 `SECTORS` — 6 arrays of 96 bytes at `$DC00`
 
@@ -175,9 +180,10 @@ Capacity `MAXSEC = 96`; E1M1 uses 85.
 | `$DDE0` | `secCByte` | ceiling shading byte |
 | `$DE40` | — | end; `$DE40-$DEFF` free |
 
-These are exactly `testmap.asm`'s `secFloorLo`/`secFloorHi`/`secCeilLo`/
-`secCeilHi`/`secFByte`/`secCByte` arrays, at fixed addresses instead of assembled
-in. `renderSector` and `checkSector` need no change beyond the labels moving.
+These were `testmap.asm`'s `secFloorLo`/`secFloorHi`/`secCeilLo`/`secCeilHi`/
+`secFByte`/`secCByte` arrays; that file is gone and the arrays live here, under
+the I/O space, which is why every read of them is bracketed by a bank switch
+(§6.1) rather than being a bare `lda`.
 
 Heights are Doom's own units with no rescaling — E1M1's floors span −136…136 and
 ceilings −40…264, so the existing 16-bit integer world coordinates and the
@@ -250,16 +256,20 @@ split at BSP partition lines. The engine never sees a linedef.
 ## 6. Where it lands in the machine
 
 ```
-$0810-$0DC6  main segment     code; .errorif guards the gap below MAPINFO
-$0DC7-$0DFF  free, 57 B       main-segment headroom
+$0810-$0DB1  main segment     code; .errorif guards the gap below MAPINFO
+$0DB2-$0DFF  free, 78 B       main-segment headroom
 $0E00-$0E1F  MAPINFO          32 B, resident block 0
 $0E20-$0E5F  MAPHDR           64 B, the image header, kept for post-mortems
-$0E60-$0EFF  free, 160 B
-$0F00-$0F3F  portal stack     deleted in Phase 4
+$0E60-$0E61  SSECHDR          2 B, the slot header of the current subsector
+$0E70-$0EEE  collision helpers   segNear / padClass, out of line
+$0F00-$0F3F  BSP stack        32 x 16-bit, the address the portal stack had
 $0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
    ...
 $9740-$97BF  SEGBUF           128 B, DMA target for one subsector's segs
-$97C0-$98FF  free, 320 B      (tail of TABLES_FREE)
+$97C0-$98E3  bsp node test    sideOf / nodeStep / bspFindSsec
+   ...
+$CA30-$CE0F  doWall           one seg into the column windows
+$CE10-$CFC2  bsp traversal    renderFrame, renderSsec, ssecFetch, sector reads
    ...
 $D000-$DB3F  NODES            resident block 1   ]
 $DB40-$DBFF  free, 192 B                         ]  under the I/O space:
@@ -269,9 +279,14 @@ $DF00-$DFFF  REU registers    never used as RAM
 ```
 
 `SEGBUF` is in `TABLES_FREE` rather than next to `MAPINFO` because the main
-segment now ends at `$0DC6`: everything below `$0E00` is code headroom, and
-`main.asm` has an `.errorif` on it. Phase 4 gets roughly 250 B of that back by
-deleting `testmap.asm` and the portal stack.
+segment ends just short of `$0E00`: everything below it is code headroom, and
+`main.asm` has an `.errorif` on it. Deleting `testmap.asm` bought about 190 B
+of that back, most of which Phase 5's collision code then spent.
+
+The engine's code now lands in five pieces because the free RAM does. Every
+one of them is bounded by an `.errorif` against whatever follows it, which is
+what makes the arrangement maintainable rather than merely tight: growing a
+routine past its block fails the build with the block's name in the message.
 
 The resident tables end at `$DEFF`, one page short of `$DF00`, so the REU
 register window is never shadowed by map data. That is not an accident of

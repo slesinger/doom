@@ -34,13 +34,15 @@
 .const colTop  = $0200              // first open row
 .const colBot  = $0300              // first closed row below
 
-// Portal traversal stack + per-frame scratch, in the free RAM below MATRIX.
-// Parked at $0f00 rather than immediately after the code: main code had grown
-// to within three bytes of the old $0b20 base. main.asm asserts the gap.
-.const pStkSec = $0f00              // 12 entries
-.const pStkXL  = $0f10
-.const pStkXR  = $0f20
-.const PSTKMAX = 12
+// BSP descent stack, in the free RAM below MATRIX -- the address the portal
+// stack used to occupy. One 16-bit entry (a raw child word, subsector bit and
+// all) per node on the path from the root down to the leaf being rendered, so
+// the depth needed is the tree's depth, not its node count: E1M1's 236 nodes
+// nest about 20 deep. Overflowing drops a far subtree, which costs pixels and
+// nothing else, so the push is guarded rather than asserted.
+.const bspStkLo  = $0f00            // BSPSTKMAX entries
+.const bspStkHi  = $0f20
+.const BSPSTKMAX = 32
 
 //------------------------------------------------------------
 // map residency — where build/assets.reu lands in the machine.
@@ -101,6 +103,31 @@
 .const SEGBUFSZ = 128
 .errorif SEGBUF + SEGBUFSZ > TABLES_FREE_END, "SEGBUF overruns TABLES_FREE"
 
+// The two-byte slot header (segCount, sectorId) that precedes those segs, read
+// by its own short DMA. Separate from SEGBUF because the second transfer's
+// length depends on what the first one says -- docs/reu-format.md §5.
+.const SSECHDR  = $0e60             // 2 B
+
+// Collision helpers, out of line from the main segment. $0e70-$0eff, 144 B.
+.const COLLCODE = $0e70
+
+// bsp.asm lands in two pieces. The traversal proper follows doWall in the walls segment; the node test
+// and the standalone descent go in the tail of TABLES_FREE. Two pieces
+// because the free RAM comes in two pieces -- neither block alone is big
+// enough. Both are asserted against what follows them.
+.const BSPCODE  = $ce10             // after the walls segment, up to $cfff
+.const BSPCODE2 = TABLES_FREE + SEGBUFSZ    // $97c0, tail of TABLES_FREE
+
+// seg record field offsets within SEGBUF, indexed by the seg's byte offset in
+// X. docs/reu-format.md §5.1 froze this layout; a seg is 10 bytes.
+.const SEGSZ    = 10
+.const sgX0     = SEGBUF + 0
+.const sgY0     = SEGBUF + 2
+.const sgX1     = SEGBUF + 4
+.const sgY1     = SEGBUF + 6
+.const sgBack   = SEGBUF + 8
+.const sgRamp   = SEGBUF + 9
+
 // MAPINFO field offsets — docs/reu-format.md §4.1
 .const miNumNodes   = MAPINFO + 0
 .const miNumSsec    = MAPINFO + 2
@@ -131,6 +158,21 @@
 .const bdLen    = 5                 // 2 bytes
 .const bdLoadHi = 7                 // high byte of the C64 load address
 
+// mapErr values -- why the map image was rejected at boot. Zero means it was
+// not. main.asm puts the value in the border and stops, so these double as the
+// only diagnostic a bare machine can give.
+.const MERR_NONE    = 0
+.const MERR_NOREU   = 1             // reuProbe found nothing
+.const MERR_MAGIC   = 2             // header is not "D64U"
+.const MERR_VERSION = 3             // wrong format version
+.const MERR_BLOCKS  = 4             // impossible block count
+.const MERR_ID      = 5             // resident block with an unknown id
+.const MERR_ADDR    = 6             // load address disagrees with defs.asm
+.const MERR_SIZE    = 7             // block longer than the space reserved
+.const MERR_COUNTS  = 8             // MAPINFO exceeds MAXNODES / MAXSEC
+.const MERR_SPAWN   = 9             // the engine's own spawn descent found a
+                                    // different subsector than wad2reu.py did
+
 //------------------------------------------------------------
 // $01 banking. $d000-$dfff is RAM only when the low three bits are %100.
 // Both states keep RAM at $a000 and $e000, where BITMAP0/BITMAP1 live, so
@@ -150,6 +192,9 @@
 .const EYE     = 41                 // eye height above sector floor
 .const MOVE_SPEED = 14              // world units per frame
 .const TURN_SPEED = 3               // angle units (of 256) per frame
+.const MAXSTEP = 24                 // tallest step the player can climb
+.const MINHEAD = 56                 // headroom needed to fit through an opening
+.const PLRAD   = 16                 // player radius, Doom's own value
 
 //------------------------------------------------------------
 // Ultimate 64 / C64 Ultimate turbo control
@@ -262,7 +307,12 @@
 .const zWIdx   = $3c
 .const zWCnt   = $3d
 .const zSecId  = $3e
-.const zWIdx2  = $3f
+.const zWIdx2  = $3f        // seg's byte offset in SEGBUF, live inside doWall
+// The node index sideOf is working on. Shares zWIdx2 deliberately: one is live
+// only inside doWall, the other only inside the BSP descent, and the two never
+// nest. sideOf's 32-bit partial product borrows zTop0..zTop0+3 on the same
+// argument -- those are doWall's line endpoints.
+.const zNodeI  = $3f
 
 .const zRXt    = $80
 .const zRYt    = $82
@@ -287,6 +337,13 @@
 .const backBuf = $4a
 
 //------------------------------------------------------------
+// zero page — BSP traversal ($4b-$4f)
+//------------------------------------------------------------
+.const zChild  = $4b        // current child word: bit 15 = subsector
+.const zFar    = $4d        // the child pushed for later
+.const zSegCnt = $4f        // segs in the subsector now in SEGBUF
+
+//------------------------------------------------------------
 // zero page — camera/player ($50-$5e)
 //------------------------------------------------------------
 .const camX    = $50
@@ -296,9 +353,13 @@
 .const camSec  = $57
 .const camSin  = $58
 .const camCos  = $5a
-.const stackN  = $5c
-.const zXL     = $5d
-.const zXR     = $5e
+.const stackN  = $5c        // BSP stack depth
+.const camSsec = $5d        // the subsector the player is standing in
+// Columns whose window is still open. The frame is finished the moment this
+// reaches zero, which is what replaces the portal walker's inherited [xL,xR]
+// windows as the traversal's termination condition -- without it the walk
+// would visit all 236 nodes every frame.
+.const openCols = $5f
 
 //------------------------------------------------------------
 // zero page — span fill ($60-$67), line accumulators ($68-$7b)
@@ -321,6 +382,12 @@
 .const stepBT  = $78
 .const stepBB  = $7a
 
+// Back sector heights, already relative to the eye. Filled by secBack from the
+// table under the I/O space, so that doWall and the collision test read them
+// from zero page instead of banking on every access.
+.const zBackF  = $7c
+.const zBackC  = $7e
+
 // movement scratch (renderer accs are free while moving)
 .const oldX    = $68
 .const oldY    = $6a
@@ -340,16 +407,10 @@
 .const zMLSum  = $72        // 16-bit sum of the block being copied
 .const zMLId   = $74        // block id x 2, i.e. its offset into mapSum
 
-//------------------------------------------------------------
-// player spawn (test map)
-//------------------------------------------------------------
-.const START_X = 512
-.const START_Y = 512
-.const START_A = 0                  // facing east, toward the portal
-.const START_SEC = 0
+// The player spawn is no longer a constant: it comes from MAPINFO, which
+// wad2reu.py fills from the map's THINGS type 1 (docs/reu-format.md §4.1, §7).
 
 .const WALLS2         = $9d80      // walls helper routines after math code
-.const visitedSec     = $0f30      // per-frame sector visited flags (16 for testmap)
 
 // Free-running 16-bit frame counter, incremented once per completed flip.
 // Nothing in the engine reads it; it exists so that a host can DMA-read it

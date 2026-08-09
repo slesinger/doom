@@ -1,9 +1,16 @@
 //============================================================
 //  input.asm — WASDQE keyboard + joystick port 2, player movement
-//  with convex-sector containment (slide-free blocking collision)
+//  with subsector containment (slide-free blocking collision)
 //
 //  W/S   forward / back        A/D   turn left / right
 //  Q/E   strafe left / right   joy 2 up/down/left/right = W/S/A/D
+//
+//  Collision is tested against the segs of the subsector the
+//  player is standing in -- the same records the renderer streams,
+//  in the same format -- so there is no BLOCKMAP and no second
+//  copy of the geometry. Subsectors are convex, so the containment
+//  test is the sign of one cross product per seg, unchanged from
+//  when it was sectors that were convex.
 //============================================================
 
 
@@ -199,43 +206,62 @@ movePlayer:
         :addWord(zCosT, zMvDY)
 !:      :addWord(zMvDX, camX)
         :addWord(zMvDY, camY)
-        jsr checkSector
+        jsr checkMove
 moveDone:
         rts
 
 //------------------------------------------------------------
-// checkSector: if the player left the current convex sector,
-// either follow a portal or undo the move (solid wall).
-// Interior test: CW winding -> inside means cross <= 0 for all
-// walls, where cross = (x1-x0)*(py-y0) - (y1-y0)*(px-x0).
+// checkMove: the player has already been moved. Test the new point
+// against the segs of the subsector they were standing in; undo the
+// move if it crossed a blocking one, otherwise re-locate them.
+//
+// Interior test, unchanged from the convex-sector version: with the
+// front sector on the right of each directed seg, inside means
+// cross < 0 for every seg, where
+//     cross = (x1-x0)*(py-y0) - (y1-y0)*(px-x0)
+//
+// A subsector's boundary also runs along BSP partition lines, and
+// those edges have no seg. Not blocking there is correct -- they are
+// interior boundaries between subsectors, not walls -- and it is why
+// leaving the subsector is normal rather than exceptional.
+//
+// The limitation is pipeline.md §5.3's, inherited unchanged: one
+// frame's motion that crosses two boundaries at once is only tested
+// against the first.
 //------------------------------------------------------------
-checkSector:
-        ldy camSec
-        lda secWFirst,y
-        sta zWIdx
-        lda secWCount,y
-        sta zWCnt
-!wall:  ldx zWIdx
-        lda wX1Lo,x                 // zTx = x1-x0
+checkMove:
+        lda camSsec                 // the segs the renderer will not have
+        sta zChild                  // loaded yet this frame -- movePlayer
+        lda camSsec+1               // runs before renderFrame
+        sta zChild+1
+        jsr ssecFetch
+        lda zSegCnt
+        bne !+
+        jmp moveOK                  // a subsector with no segs blocks nothing
+!:      sta zWCnt
+        lda #0
+        sta zWIdx                   // seg cursor: a byte offset (SEGSZ)
+!seg:   ldx zWIdx
+        lda sgX1,x                  // zTx = x1-x0
         sec
-        sbc wX0Lo,x
+        sbc sgX0,x
         sta zTx
-        lda wX1Hi,x
-        sbc wX0Hi,x
+        lda sgX1+1,x
+        sbc sgX0+1,x
         sta zTx+1
-        lda wY1Lo,x                 // zTy = y1-y0
+        lda sgY1,x                  // zTy = y1-y0
         sec
-        sbc wY0Lo,x
+        sbc sgY0,x
         sta zTy
-        lda wY1Hi,x
-        sbc wY0Hi,x
+        lda sgY1+1,x
+        sbc sgY0+1,x
         sta zTy+1
         lda camY                    // zA = py-y0
         sec
-        sbc wY0Lo,x
+        sbc sgY0,x
         sta zA
         lda camY+1
-        sbc wY0Hi,x
+        sbc sgY0+1,x
         sta zA+1
         lda zTx                     // P1 = (x1-x0)*(py-y0)
         sta zB
@@ -253,10 +279,10 @@ checkSector:
         ldx zWIdx
         lda camX                    // zA = px-x0
         sec
-        sbc wX0Lo,x
+        sbc sgX0,x
         sta zA
         lda camX+1
-        sbc wX0Hi,x
+        sbc sgX0+1,x
         sta zA+1
         lda zTy                     // P2 = (y1-y0)*(px-x0)
         sta zB
@@ -274,23 +300,27 @@ checkSector:
         sbc zP+3
         bvc !+
         eor #$80
-!:      bmi !inside+                // cross < 0: inside this wall
-        ldx zWIdx                   // outside: portal or solid?
-        lda wBack,x
-        cmp #$ff
-        beq !blocked+
-        sta camSec                  // follow portal
-        tay
-        lda secFloorLo,y            // eye z follows new floor
+!:      bmi !inside+                // cross < 0: inside this seg
+        ldx zWIdx
+        jsr segNear                 // is this the edge actually crossed?
+        bcc !inside+                // no -- a collinear seg further along
+        ldy sgBack,x                // outside: one-sided seg, or a step?
+        cpy #$ff
+        beq moveBlocked
+        jsr stepOK
+        bcc moveBlocked
+        jmp moveOK                  // through the opening: re-locate below
+!inside:
+        lda zWIdx
         clc
-        adc #EYE
-        sta camZ
-        lda secFloorHi,y
-        adc #0
-        sta camZ+1
-        rts
-!blocked:
-        lda oldX                    // solid wall: undo the move
+        adc #SEGSZ
+        sta zWIdx
+        dec zWCnt
+        beq moveOK
+        jmp !seg-
+
+moveBlocked:
+        lda oldX                    // undo: no sliding in M1
         sta camX
         lda oldX+1
         sta camX+1
@@ -299,9 +329,150 @@ checkSector:
         lda oldY+1
         sta camY+1
         rts
-!inside:
-        inc zWIdx
-        dec zWCnt
-        beq !+
-        jmp !wall-
-!:      rts
+
+// Still inside, or legally out: find the subsector the player is in
+// now. Doing this unconditionally rather than only when the seg test
+// said "left" also covers leaving across a partition-line edge, which
+// no seg reports.
+moveOK:
+        jsr bspFindSsec
+        lda zChild
+        sta camSsec
+        lda zChild+1
+        sta camSsec+1
+        jsr ssecFetch               // its header carries the sector id
+        lda zSecId
+        sta camSec
+        jmp setEyeZ
+
+//------------------------------------------------------------
+// stepOK: may the player cross into back sector Y?
+//   carry set = yes. Blocking = a step up over MAXSTEP, or an
+//   opening shorter than MINHEAD -- which is what makes a closed
+//   door solid without the engine knowing what a door is.
+//   Stepping *down* any distance is allowed.
+//------------------------------------------------------------
+stepOK:
+        jsr secBack                 // -> zBackC, zBackF, eye-relative
+        lda zBackC                  // headroom = backCeil - backFloor
+        sec
+        sbc zBackF
+        sta zT
+        lda zBackC+1
+        sbc zBackF+1
+        bmi !block+                 // ceiling below floor: sealed
+        bne !head+                  // >= 256 units of headroom
+        lda zT
+        cmp #MINHEAD
+        bcc !block+
+!head:  lda zBackF                  // step = backFloor - frontFloor. Both are
+        clc                         // eye-relative and the front floor is the
+        adc #EYE                    // eye minus EYE, so the step is just
+        sta zT                      // zBackF + EYE.
+        lda zBackF+1
+        adc #0
+        bmi !ok+                    // stepping down
+        bne !block+
+        lda zT
+        cmp #MAXSTEP+1
+        bcs !block+
+!ok:    sec
+        rts
+!block: clc
+        rts
+
+//------------------------------------------------------------
+//  Collision helpers, in the free RAM between SSECHDR and the
+//  BSP stack. Out of line because the main segment ends 84 bytes
+//  short of MAPINFO and these are 100.
+//------------------------------------------------------------
+.var mainSegPC = *
+.pc = COLLCODE "collision helpers"
+
+//------------------------------------------------------------
+// segNear: X = seg offset. Carry set if the player is beside this
+// seg -- inside its bounding box grown by the player's radius.
+//
+// Without this, containment across a *line* is mistaken for
+// crossing a *seg*, and a subsector whose boundary contains two
+// collinear segs blocks on the wrong one. E1M1's start-room exit is
+// exactly that: subsector 105's edge at y = -3104 is a two-sided
+// seg from x 928 to 1184 and a solid one from 1184 to 1216, the
+// solid one comes first in the slot, and the player walks into it
+// from 250 units away. The bbox is exact for an axis-aligned seg,
+// which is nearly all of them, and conservative for a diagonal --
+// it blocks slightly early there, never late.
+//------------------------------------------------------------
+segNear:
+        lda camX                    // x against both endpoints
+        sec
+        sbc sgX0,x
+        sta zA
+        lda camX+1
+        sbc sgX0+1,x
+        sta zA+1
+        jsr padClass
+        sta zT+1
+        lda camX
+        sec
+        sbc sgX1,x
+        sta zA
+        lda camX+1
+        sbc sgX1+1,x
+        sta zA+1
+        jsr padClass
+        cmp zT+1
+        bne !yaxis+                 // straddles, or within a radius of an end
+        cmp #0
+        bne segFar                  // same side of both ends, and past them
+!yaxis: lda camY
+        sec
+        sbc sgY0,x
+        sta zA
+        lda camY+1
+        sbc sgY0+1,x
+        sta zA+1
+        jsr padClass
+        sta zT+1
+        lda camY
+        sec
+        sbc sgY1,x
+        sta zA
+        lda camY+1
+        sbc sgY1+1,x
+        sta zA+1
+        jsr padClass
+        cmp zT+1
+        bne !near+
+        cmp #0
+        bne segFar
+!near:  sec
+        rts
+segFar: clc
+        rts
+
+//------------------------------------------------------------
+// padClass: zA (signed 16) -> A = $ff below -PLRAD, 0 within, 1 above.
+// Preserves X.
+//------------------------------------------------------------
+padClass:
+        lda zA+1
+        bmi !neg+
+        bne !hi+
+        lda zA
+        cmp #PLRAD+1
+        bcc !zero+
+!hi:    lda #1
+        rts
+!neg:   cmp #$ff
+        bne !lo+
+        lda zA
+        cmp #256-PLRAD
+        bcs !zero+
+!lo:    lda #$ff
+        rts
+!zero:  lda #0
+        rts
+
+.errorif * > bspStkLo, "collision helpers overflow into the BSP stack"
+.pc = mainSegPC "main code (cont)"

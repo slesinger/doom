@@ -31,7 +31,15 @@ U64_HOST  ?= 192.168.1.65
 
 SRC       := $(wildcard src/*.asm src/render/*.asm)
 PRG       := build/doom.prg
-REUIMG    := build/assets.reu
+# Overridable so the whole engine can be run against the 3-sector test map,
+# which goes through the same converter and the same BSP builder:
+#     make run   REUIMG=build/testmap.reu
+#     make shot  REUIMG=build/testmap.reu
+# That is the input to bring a traversal change up on before E1M1's 732 segs
+# are involved -- it separates "the converter is wrong" from "the walk is
+# wrong", which is the distinction that cost the last debugging session six
+# hypotheses (IMPLEMENTATION_PLAN.md §7).
+REUIMG    ?= build/assets.reu
 TESTREU   := build/testmap.reu
 WAD       := assets/DOOM1.WAD
 
@@ -138,8 +146,8 @@ reubench: $(BENCH) u64-config
 # converter or on the traversal, but not on both at once.
 assets: $(REUIMG) $(TESTREU)
 
-$(REUIMG): tools/wad2reu.py $(WAD)
-	$(PYTHON) tools/wad2reu.py $(WAD) -o $(REUIMG)
+build/assets.reu: tools/wad2reu.py $(WAD)
+	$(PYTHON) tools/wad2reu.py $(WAD) -o $@
 
 $(TESTREU): tools/wad2reu.py
 	$(PYTHON) tools/wad2reu.py --map TEST -o $(TESTREU)

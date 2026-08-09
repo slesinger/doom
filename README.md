@@ -6,19 +6,25 @@ up to 64 MHz with 16 MB of REU, 64 KB of main RAM, and a VIC-II painting
 fixed-point throughout, table-driven wherever a table is cheaper than a
 computation.
 
-**Current state: the test-map renderer runs at 50.0 fps on real C64 Ultimate
-hardware, PAL vsync-locked, and `make check` is green** — floor, dithered
-ceiling and a lit far room through a portal, with zero writes outside the
-engine's own buffers.
+**Current state: the engine renders and walks Doom's E1M1**, out of a WAD, on
+a BSP walk of the map's own nodes, with `make check` green — the spawn room's
+ceiling, floor, wall band and the opening through it, and no writes outside
+the engine's own buffers. You can walk out of the start room, down the two
+steps, and into the courtyard, with eye height following the floor.
 
-**E1M1's geometry is now on the machine.** `tools/wad2reu.py` packs it out of
-`DOOM1.WAD` into an REU image, and the engine loads its BSP nodes and sector
-table into the 4 KB of RAM hiding under the I/O space at boot — verified
-byte-for-byte in VICE and by checksum on hardware. What is left for Milestone 1
-(walk around E1M1) is the BSP traversal that reads them and the player
-collision that goes with it. See
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the phase plan and what
-each phase has to prove.
+`tools/wad2reu.py` packs E1M1 out of `DOOM1.WAD` into an REU image; the engine
+loads the BSP nodes and the sector table into the 4 KB of RAM hiding under the
+I/O space at boot and streams each subsector's segs from the REU as it visits
+it. The hand-built test map is gone — it goes through the same packer now, so
+`make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
+verifiable sectors.
+
+**What Milestone 1 still owes:** frame time. E1M1 costs 3.2x the test map per
+frame, which extrapolates to roughly 12-16 fps against the 25 fps target — the
+test map itself runs vsync-locked at 50.0 fps on real hardware. The number
+that matters is the one `make u64-fps` reports on the Ultimate. See
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12 for the measurement and
+the response.
 
 ---
 
@@ -67,14 +73,16 @@ src/main.asm              VIC setup, spawn, main loop, HUD blanking
 src/defs.asm              memory map + zero-page allocation (all .const live here)
 src/math.asm              mul8 (quarter-square), umul16, smulTrig, ssmul32,
                           udiv, sdiv, spanFill
-src/input.asm             WASD + QE strafe + joystick 2, convex-sector containment
+src/input.asm             WASD + QE strafe + joystick 2, subsector containment
+                          and step/headroom collision against the segs
 src/reu.asm               REU DMA primitives + boot-time presence probe
 src/mapload.asm           boot-time load of the resident map blocks from the REU
 src/reuload.asm           standalone PRG: host-driven REU image upload
 src/reubench.asm          standalone REU DMA throughput benchmark
-src/testmap.asm           3 sectors, 16 walls, 2 portals (SoA layout)
-src/render/walls.asm      portal traversal, near-plane clip, projection,
-                          line interpolators, column spans
+src/render/bsp.asm        front-to-back BSP descent, subsector streaming,
+                          point-to-subsector lookup, sector height reads
+src/render/walls.asm      one seg: near-plane clip, projection, line
+                          interpolators, column spans, occlusion
 src/render/chunky2mc.asm  Bayer-dithered chunky -> multicolor converter,
                           double buffering, flip
 tools/vicedbg/            VICE binary-monitor client + live-RAM diff probe

@@ -47,16 +47,8 @@
 // How many descriptors can physically fit in the 64-byte header.
 .const MAXDESCS = [HDRSIZE - 8] / 8
 
-// mapErr values. Zero means "no failure".
-.const MERR_NONE    = 0
-.const MERR_NOREU   = 1             // reuProbe found nothing
-.const MERR_MAGIC   = 2             // header is not "D64U"
-.const MERR_VERSION = 3             // wrong format version
-.const MERR_BLOCKS  = 4             // impossible block count
-.const MERR_ID      = 5             // resident block with an unknown id
-.const MERR_ADDR    = 6             // load address disagrees with defs.asm
-.const MERR_SIZE    = 7             // block longer than the space reserved
-.const MERR_COUNTS  = 8             // MAPINFO exceeds MAXNODES / MAXSEC
+// The mapErr values live in defs.asm with every other .const: main.asm
+// reports one of them itself and is assembled before this file.
 
 //------------------------------------------------------------
 // mapLoad — carry set on success. Sets mapOK/mapErr either way.

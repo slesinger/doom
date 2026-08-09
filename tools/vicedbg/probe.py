@@ -26,8 +26,8 @@ ALLOWED = [
     (0x0200, 0x02FF, "colTop"),
     (0x0300, 0x03FF, "colBot"),
     (0x0400, 0x07FF, "COLBUF"),
-    (0x0E00, 0x0E5F, "MAPINFO/MAPHDR"),
-    (0x0F00, 0x0F3F, "portal-stack/visitedSec"),
+    (0x0E00, 0x0E61, "MAPINFO/MAPHDR/SSECHDR"),
+    (0x0F00, 0x0F3F, "BSP stack"),
     (0x0F40, 0x0F41, "frameCnt"),
     (0x0F42, 0x0F50, "reuScratch/reuOK/mapOK/mapErr/mapSum"),
     (0x1000, 0x7DFF, "MATRIX"),
@@ -132,10 +132,11 @@ MAP_ERR = 0x0F48         # `.const mapErr` in src/defs.asm
 MAP_SUM = 0x0F49         # `.const mapSum` in src/defs.asm, 4 x 16-bit
 REU_IMAGE = "build/assets.reu"
 
-# mapErr values, from src/mapload.asm.
+# mapErr values, from src/defs.asm.
 MERR = {0: "none", 1: "no REU", 2: "bad magic", 3: "wrong version",
         4: "bad block count", 5: "unknown block id", 6: "load address mismatch",
-        7: "block too long", 8: "MAPINFO counts out of range"}
+        7: "block too long", 8: "MAPINFO counts out of range",
+        9: "spawn descent disagrees with the image"}
 
 
 def check_map(m):

@@ -31,10 +31,11 @@ The docs that still said "does not reach a visible frame" — the README,
 | VIC setup, frame loop, HUD blank | `src/main.asm` | complete |
 | Memory map / ZP allocation | `src/defs.asm` | complete |
 | Fixed-point math, `spanFill` | `src/math.asm` | complete, bounds-checked |
-| WASD + joy2, movement, convex containment | `src/input.asm` | complete **for convex sectors only** |
-| Portal traversal, projection, column spans | `src/render/walls.asm` | complete for the test map |
+| WASD + joy2, movement, subsector containment | `src/input.asm` | complete — segs, not BLOCKMAP (Phase 5) |
+| BSP traversal, subsector streaming, point lookup | `src/render/bsp.asm` | complete (Phase 4) |
+| Seg projection, column spans, occlusion | `src/render/walls.asm` | complete — E1M1, not the test map |
 | Chunky→multicolor, double buffer, flip | `src/render/chunky2mc.asm` | complete |
-| Test map (3 sectors, 16 walls) | `src/testmap.asm` | complete |
+| Test map (3 sectors, 16 walls) | `tools/wad2reu.py` `--map TEST` | complete — the hand-assembled `src/testmap.asm` is deleted |
 | VICE monitor client + diff probe | `tools/vicedbg/` | complete, single-step capable |
 | Regression gate (`make check`) | `Makefile`, `tools/checkshot.py` | complete — see §8 |
 | Ultimate REST/FTP client | `tools/u64.py` | complete |
@@ -48,9 +49,7 @@ landed — see §11. What is left is Phase 4's BSP renderer and Phase 5's player
 - ~~**No REU code.**~~ `src/reu.asm`, `src/mapload.asm`, `src/reuload.asm`.
 - ~~**No `tools/wad2reu.py`.**~~ Written; `make assets` produces E1M1 and the
   test map through the same packers.
-- **The renderer still draws `testmap.asm`.** E1M1's geometry is in the REU and
-  its nodes and sectors are resident in RAM, but nothing reads them yet. That
-  is Phase 4.
+- ~~**The renderer still draws `testmap.asm`.**~~ It draws E1M1 — see §12.
 
 ---
 
@@ -306,7 +305,7 @@ is unmistakably E1M1. `make assets` also emits `build/testmap.reu`, the
 3-sector map of `testmap.asm` run through a BSP builder in the same tool, which
 is Phase 4.4's input.
 
-### Phase 4 — The BSP renderer
+### Phase 4 — The BSP renderer ✅ DONE (2026-08-09, §12)
 
 The core of the milestone. Do it in this order so each step is separately
 verifiable.
@@ -331,7 +330,7 @@ verifiable.
 the courtyard through the door opening), `make check` is green, and a scripted
 30-second walk under `make debug` reports zero unexpected writes.
 
-### Phase 5 — The player in E1M1
+### Phase 5 — The player in E1M1 — 1-4 done, no sliding (§12)
 
 1. **Sector lookup** = BSP descent to a leaf → subsector → sector. Replaces
    `checkSector`'s convex containment walk.
@@ -379,10 +378,10 @@ courtyard and back without leaking through a wall or falling through a floor.
 |---|---|---|---|
 | 1 | ~~REU DMA is slow *and* doesn't scale with turbo~~ | Phase 1's benchmark | **Closed.** 1 byte/µs flat, no setup penalty, so per-subsector streaming needs no batching (§10). ~1.3 KB/frame = ~1.3 ms |
 | 2 | ~~No clean way to get a `.reu` image onto real hardware~~ | Phase 1.2 | **Closed the hard way.** REU Preload does not deliver on firmware 1.1.0; `src/reuload.asm` + `machine:writemem` does, and verifies every chunk (§11) |
-| 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | Re-add node bbox rejection (the 16 B/node dropped in §4); it is the designed-in escape hatch |
-| 4 | `$D000-$DFFF` banking interacts badly with the converter or `flip` | Phase 2.3, caught by `make debug` | Fall back to streaming nodes from REU like segs — costs a DMA per node visit |
-| 5 | Flat shading over 85 sectors of real geometry looks like undifferentiated mush | First E1M1 frame | Ramp assignment is a Python table (Phase 3.3) — cheap to iterate. Distance-based intensity falloff is already free in the byte format |
-| 6 | The existing projection math has range bugs that three hand-built sectors never exercised | Phase 4.4's test map, then E1M1 | `make debug` catches the memory-safety half; the bounds table in `pipeline.md` §13.2 is the checklist |
+| 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | **Arrived.** E1M1 costs 3.2x the test map per frame (§12). Response as designed — node bbox rejection — but *streamed*, 4 B/node, not resident: there is no RAM for it |
+| 4 | ~~`$D000-$DFFF` banking interacts badly with the converter or `flip`~~ | Phase 2.3, caught by `make debug` | **Closed.** The BSP walk banks RAM in and out per node and per sector read; `make debug` stays clean |
+| 5 | Flat shading over 85 sectors of real geometry looks like undifferentiated mush | First E1M1 frame | **Arrived, twice.** The start room's floor and ceiling landed on the same byte (fixed in the Python table, §12), and distance falloff turned out never to have worked at all (`sta` sets no flags — §12) |
+| 6 | The existing projection math has range bugs that three hand-built sectors never exercised | Phase 4.4's test map, then E1M1 | **Not seen.** `make debug` is clean on E1M1 and the projected rows match the arithmetic to the pixel (§12) |
 
 ---
 
@@ -731,4 +730,124 @@ Everything it needs exists. `build/testmap.reu` is the input to bring the BSP
 walk up on before E1M1, `pointOnSide` is `checkSector`'s existing sign-only
 cross product with the wall delta swapped for the node delta, and MAPINFO
 carries a precomputed spawn subsector for the engine's first descent to check
-itself against.
+itself against. *(Done — §12.)*
+
+---
+
+## 12. Session log — 2026-08-09, Phases 4 and 5
+
+Phase 4 in full, plus the parts of Phase 5 that deleting `testmap.asm` forces:
+with the hand-built map gone, `checkSector` has no arrays to walk and the
+spawn constants have nothing to mean.
+
+**The engine renders and walks E1M1.** `make check` is green, and the frame is
+the start room — ceiling, floor, the wall band, and the opening through it.
+
+### What landed
+
+| File | Change |
+|---|---|
+| `src/render/bsp.asm` | **new.** `renderFrame` (column reset + trig + the descent), `renderSsec`, `ssecFetch`, `secFront`/`secBack`, `setEyeZ`, `nodeStep`/`sideOf`, `bspFindSsec` |
+| `src/render/walls.asm` | `renderFrame`/`renderSector` deleted; `doWall` reads `SEGBUF` instead of the assembled wall arrays; the `[zXL,zXR]` window became a clamp to `[0,159]`; `openCols` accounting; the portal push at the end is gone |
+| `src/input.asm` | `checkSector` → `checkMove`: subsector segs, step/headroom test, `segNear`/`padClass` |
+| `src/main.asm` | spawns from `MAPINFO`; a rejected image is now fatal (`mapHalt`, `mapErr` in the border) |
+| `src/testmap.asm` | **deleted.** Its geometry lives in `wad2reu.py`'s `TEST` map and reaches the engine as a `.reu` like any other |
+| `tools/wad2reu.py` | ceilings darkened `CEIL_DARKEN` steps below floors |
+| `Makefile` | `REUIMG` is overridable, so `make shot REUIMG=build/testmap.reu` runs the whole engine on the 3-sector map |
+
+### Bringing it up on the test map first was worth it twice
+
+Phase 4.4 (`IMPLEMENTATION_PLAN.md` §7 called it the highest-leverage item in
+this plan) found both bugs before E1M1's 732 segs could hide them. The
+3-sector map through the BSP pipeline renders exactly what the arithmetic
+predicts, column for column:
+
+```
+col  10: 0-21:02  21-100:68  100-176:45      ceiling / east wall / moss floor
+col  80: 0-21:02  21-54:68  54-71:12  71-90:22  90-93:13  93-100:68 100-176:45
+```
+
+Column 80 is the doorway: room A's wall above the opening, corridor B's
+ceiling, room C's far wall, corridor B's floor, room A's wall below. Rows 21
+and 100 are where `88 - dz*160/ry` puts them for `ry = 513`, which is the
+distance to the east wall.
+
+### Three bugs, one of them years old
+
+1. **Depth shading has never worked.** `walls.asm` computed `(ry0+ry1)>>7`
+   into `A:zNum`, stored `A`, and branched on the result — but `sta` sets no
+   flags, so the `bne` was testing the last `ror zNum` instead. Every wall
+   beyond 128 units took the "too far" path and came out at the minimum
+   intensity. It is a one-instruction fix (`tax`) and it is the difference
+   between a flat frame and a lit one. This predates Phase 4 entirely.
+
+2. **Collinear segs broke collision.** Containment across a *line* is not the
+   same as crossing a *seg*, and a subsector whose boundary contains two
+   collinear segs blocks on whichever comes first in the slot. E1M1's start
+   room exit is exactly that shape: subsector 105's edge at `y = -3104` is a
+   two-sided seg from `x` 928 to 1184 and a solid one from 1184 to 1216, the
+   solid one is listed first, and the player walks into it from 250 units
+   away and stops in an open doorway. `segNear` fixes it with a bounding-box
+   test inflated by the player radius — exact for an axis-aligned seg, which
+   is nearly all of them, conservative for a diagonal.
+
+3. **Ceiling and floor rendered identically** in the start room: both flats
+   land on the stone ramp at intensity 9, so the room read as one grey field
+   with a wall floating in it. That is risk #5 arriving on schedule. Fixed in
+   the Python table, where the plan said it would be.
+
+### Frame time: risk #3 has arrived
+
+Measured in VICE at 1 MHz, which is the only comparison available without the
+hardware in front of you:
+
+| Map | Frame time at 1 MHz | Relative |
+|---|---|---|
+| Test map (3 sectors, 16 segs) | 1.25 s | 1.0 |
+| E1M1 spawn view | 4.0 s | **3.2** |
+
+The test map runs vsync-locked at 50.01 fps on the U64 (§9), so it has unknown
+headroom; E1M1 at 3.2x its cost extrapolates to roughly **12-16 fps** against
+the 25 fps target in `pipeline.md` §12. **This wants measuring on hardware
+with `make u64-fps` before anything is optimised** — the extrapolation assumes
+the cost scales with the turbo clock, and REU DMA does not.
+
+An occlusion early-out was added to `doWall`: before the twelve divisions that
+projection and `lineSetup` cost, scan `[zC0,zC1]` and return if every column is
+already closed. It measured no gain in the spawn view (4.0 s either way), which
+says the cost is *upstream* of it — in the two `transformPoint` calls and two
+`projSX` divisions every seg pays before its column range is even known, times
+however many subsectors the walk visits before `openCols` hits zero.
+
+So the answer is the one risk #3 named: **reject nodes by bounding box**. The
+twist is that the plan assumed the bbox would have to be resident, and there
+are only 384 free bytes under the I/O space against the 944 that 236 quantised
+boxes need. It should be *streamed* instead — 4 bytes fetched per node visit,
+in a new block. At 1 byte/µs that is under a millisecond per frame, and it is
+the same two-transfer pattern `ssecFetch` already uses.
+
+### What Phase 5 still owes
+
+- **No sliding along walls.** A blocked move is undone whole, as M1 specifies,
+  and in E1M1 that means walking into a wall at a shallow angle stops you dead
+  rather than sliding along it. It is the single biggest thing between "walks"
+  and "walks *well*".
+- **One boundary per frame.** `pipeline.md` §5.3's limitation, inherited
+  unchanged: a frame's motion crossing two subsector boundaries is only tested
+  against the first. The fix is the same loop-with-a-cap it always was.
+
+### How the walk was tested
+
+`checkMove` only runs when a movement key is down, and `readInput` rebuilds
+`zInput` from the CIA every frame, so a host cannot simply poke the camera and
+learn anything. The scratch harness sets a checkpoint at `movePlayer`, waits
+for the monitor's stop message, writes `zInput`, and resumes — which drives the
+real input path. Waiting for the stop message rather than sleeping matters:
+with a sleep, nine injections in ten land while the CPU is still running and
+are overwritten by the next `readInput`.
+
+From the spawn, forward: sector 38 → 37 → 39 → 38, eye height 41 → 33 → 25 →
+41 as the floor steps down and back up, and a hard stop at `y = -2888`, which
+is the solid part of the wall at `y = -2880`; the opening in that wall is at
+`x` 1216-1344 and the player was at 1056. That is the collision model working,
+not failing.

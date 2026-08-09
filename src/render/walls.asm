@@ -1,9 +1,15 @@
 //============================================================
-//  walls.asm — portal wall renderer into the chunky MATRIX
+//  walls.asm — seg renderer into the chunky MATRIX
 //
-//  Convex sectors, clockwise winding (interior on the right of
-//  each directed wall). Front-to-back portal traversal with
-//  per-column clip windows colTop/colBot.
+//  One seg of one subsector, drawn into the per-column clip
+//  windows colTop/colBot. The traversal that decides which
+//  subsectors get here, and in what order, is bsp.asm; this file
+//  is what it calls per seg.
+//
+//  Winding is clockwise, front sector on the right of each
+//  directed seg -- Doom's own convention and the test map's, so
+//  the backface test is still the single signed compare sx0 < sx1
+//  (docs/reu-format.md §5.1).
 //
 //  Camera space: ry = forward, rx = rightward.
 //    sx  = 80 + rx*HFOCAL/ry          (HFOCAL = 80, 90 deg FOV)
@@ -11,6 +17,13 @@
 //
 //  Screen y lines (wall top/bottom edges) are linear in screen x,
 //  so per-column work is pure 24-bit accumulator stepping.
+//
+//  Occlusion: a column is closed when colTop[x] >= colBot[x]. A
+//  one-sided seg closes every column it covers; a two-sided one
+//  narrows them to its opening. openCols counts the columns still
+//  open and is what ends the frame early -- there are no inherited
+//  [xL,xR] windows any more, because with BSP order there is no
+//  portal to inherit one through.
 //============================================================
 
 // 24-bit acc += sign-extended 16-bit step
@@ -34,118 +47,26 @@ done:   sta acc+2
 .pc = WALLSCODE "walls code"
 
 //------------------------------------------------------------
-renderFrame:
-        // open all column windows. NOTE: 160 columns means X ranges
-        // 159..0, and 128..159 all have bit 7 set -- a bpl-terminated
-        // countdown from #159 stops after one iteration (159->158 is
-        // still "negative"), leaving colTop/colBot stale for columns
-        // 1..159 every frame. Count 160..1 instead and test via cpx/bne,
-        // which doesn't care about the sign bit.
-        ldx #160
-        lda #0
-!:      dex
-        sta colTop,x
-        cpx #0
-        bne !-
-        ldx #160
-        lda #176
-!:      dex
-        sta colBot,x
-        cpx #0
-        bne !-
-        ldy camA                    // camera trig
-        lda sinLo,y
-        sta camSin
-        lda sinHi,y
-        sta camSin+1
-        tya
-        clc
-        adc #64                     // cos(a) = sin(a+64), 8-bit wrap
-        tay
-        lda sinLo,y
-        sta camCos
-        lda sinHi,y
-        sta camCos+1
-        ldx #NUMSEC-1               // clear per-frame visited flags
-        lda #0
-!:      sta visitedSec,x
-        dex
-        bpl !-
-        lda camSec                  // seed traversal with camera sector
-        sta pStkSec
-        tax
-        lda #1
-        sta visitedSec,x            // never re-enter the start sector
-        sta stackN
-        lda #0
-        sta pStkXL
-        lda #159
-        sta pStkXR
-popLoop:
-!pop:   dec stackN
-        ldx stackN
-        lda pStkSec,x
-        sta zSecId
-        lda pStkXL,x
-        sta zXL
-        lda pStkXR,x
-        sta zXR
-        jsr renderSector
-        lda stackN
-        bne !pop-
-        rts
-
-//------------------------------------------------------------
-renderSector:
-        ldy zSecId
-        lda secCeilLo,y             // dzC = ceil - eyeZ
-        sec
-        sbc camZ
-        sta zDzC
-        lda secCeilHi,y
-        sbc camZ+1
-        sta zDzC+1
-        lda secFloorLo,y            // dzF = floor - eyeZ
-        sec
-        sbc camZ
-        sta zDzF
-        lda secFloorHi,y
-        sbc camZ+1
-        sta zDzF+1
-        lda secCByte,y
-        sta zCeilByte
-        lda secFByte,y
-        sta zFloorByte
-        lda secWFirst,y
-        sta zWIdx
-        lda secWCount,y
-        sta zWCnt
-wallLoopHead:
-!walls: ldx zWIdx
-        jsr doWall
-        inc zWIdx
-        dec zWCnt
-        bne !walls-
-        rts
-
-//------------------------------------------------------------
-// doWall: render wall X within window [zXL, zXR]
+// doWall: render the seg at byte offset X in SEGBUF.
+//
+// X is an offset, not an index: seg records are 10 bytes, so the
+// alternative is a multiply per seg to save nothing.
 //------------------------------------------------------------
 doWall:
         stx zWIdx2
         // ---- endpoint 0 -> camera space
-        lda wX0Lo,x
+        lda sgX0,x
         sec
         sbc camX
         sta zTx
-        lda wX0Hi,x
+        lda sgX0+1,x
         sbc camX+1
         sta zTx+1
-        lda wY0Lo,x
+        lda sgY0,x
         sec
         sbc camY
         sta zTy
-        lda wY0Hi,x
+        lda sgY0+1,x
         sbc camY+1
         sta zTy+1
         jsr transformPoint
@@ -159,18 +80,18 @@ doWall:
         sta zRY0+1
         // ---- endpoint 1 -> camera space
         ldx zWIdx2
-        lda wX1Lo,x
+        lda sgX1,x
         sec
         sbc camX
         sta zTx
-        lda wX1Hi,x
+        lda sgX1+1,x
         sbc camX+1
         sta zTx+1
-        lda wY1Lo,x
+        lda sgY1,x
         sec
         sbc camY
         sta zTy
-        lda wY1Hi,x
+        lda sgY1+1,x
         sbc camY+1
         sta zTy+1
         jsr transformPoint
@@ -314,34 +235,55 @@ doWall:
         bvc !+
         eor #$80
 !:      bpl !reject2+               // sx0 >= sx1 -> back-facing
-        // ---- clamp to column range [zXL, zXR]
-        lda zSXW0+1
-        bmi !useXL+                 // sx0 < 0
+        // ---- clamp to the screen, [0, 159]. Under BSP order there is no
+        // inherited window to clamp against: what a nearer subsector already
+        // covered is recorded per column in colTop/colBot, not in an x range.
+        lda zSXW0+1                 // c0 = max(sx0, 0)
+        bmi !c0zero+                // sx0 < 0
         bne !reject2+               // sx0 > 255 -> fully right of screen
         lda zSXW0
-        cmp zXL
-        bcs !+
-!useXL: lda zXL
-!:      cmp zXR                     // clamp down to zXR too: sx0 may be
-        bcc !+                      // 160..255, inside the byte but past
-        lda zXR                     // the column-window's right edge
-!:      sta zC0
-        lda zSXW1+1                 // c1 = min(sx1-1, zXR)
-        bmi !reject2+               // sx1 <= 0 -> fully left
-        bne !useXR+                 // sx1 > 255 -> use right edge
+        cmp #160
+        bcs !reject2+
+        jmp !c0set+
+!c0zero:
+        lda #0
+!c0set: sta zC0
+        lda zSXW1+1                 // c1 = min(sx1-1, 159)
+        bmi !reject2+               // sx1 <= 0 -> fully left of screen
+        bne !c1max+                 // sx1 > 255
         ldy zSXW1
         beq !reject2+               // sx1 == 0
         dey
         tya
-        cmp zXR
-        bcc !+
-!useXR: lda zXR
-!:      sta zC1
+        cmp #160
+        bcc !c1set+
+!c1max: lda #159
+!c1set: sta zC1
         cmp zC0
         bcs !cols+
 !reject2:
         rts
 !cols:
+        // ---- is any column in [zC0, zC1] still open?
+        //
+        // Everything below this point -- the shading, four projRow calls, up
+        // to four more for the back sector, and four lineSetup slope
+        // divisions -- is a dozen 16-bit divisions, and all of it is wasted
+        // if a nearer subsector has already closed every column this seg
+        // covers. Under BSP order that is the common case on real geometry:
+        // E1M1's walk reaches most of its segs after the near ones have
+        // closed the screen. The scan costs about ten cycles per column
+        // against roughly six hundred per division skipped.
+        ldx zC0
+!scan:  lda colTop,x
+        cmp colBot,x
+        bcc !visible+               // colTop < colBot -> still open
+        inx
+        cpx zC1
+        bcc !scan-
+        beq !scan-
+        rts
+!visible:
         // ---- wall shading byte from mid distance: light = (ry0+ry1)>>7
         lda zRY0
         clc
@@ -363,7 +305,12 @@ doWall:
         ror zNum
         lsr
         ror zNum
-        sta zNum+1
+        // A is now the high byte of (ry0+ry1)>>7 and zNum the low one. Test A
+        // with tax, not with the `sta` this used to do: sta sets no flags, so
+        // the bne was reading the last `ror zNum` instead and every wall past
+        // 128 units came out at minimum intensity. Depth shading has never
+        // actually been visible until now.
+        tax
         bne !dark+
         lda #15
         sec
@@ -374,7 +321,7 @@ doWall:
         bcs !+
         lda #2                      // minimum visibility
 !:      ldx zWIdx2
-        ora wRamp,x
+        ora sgRamp,x
         sta zWallByte
         // ---- rows at both ends: top (ceil) and bot (floor) lines
         lda zDzC
@@ -417,55 +364,43 @@ doWall:
         lda zSXW1+1
         sbc zSXW0+1
         sta zDX+1
-        // ---- portal back-sector lines (before lineSetup: fills zBTop/zBBot)
+        // ---- two-sided seg: the opening's lines (before lineSetup, which
+        // reads zBTop/zBBot). secBack banks the sector table in and out once
+        // for both heights -- see bsp.asm.
         ldx zWIdx2
-        lda wBack,x
+        lda sgBack,x
         sta zBack
         cmp #$ff
         beq !solidSetup+
         tay
-        lda secCeilLo,y             // back dzC -> zNum
-        sec
-        sbc camZ
-        sta zNum
-        lda secCeilHi,y
-        sbc camZ+1
-        sta zNum+1
-        lda zNum
+        jsr secBack                 // -> zBackC, zBackF, eye-relative
+        lda zBackC
         sta zA
-        lda zNum+1
+        lda zBackC+1
         sta zA+1
         jsr useRY0
         jsr projRow
         sta zBTop0
         sty zBTop0+1
-        lda zNum
+        lda zBackC
         sta zA
-        lda zNum+1
+        lda zBackC+1
         sta zA+1
         jsr useRY1
         jsr projRow
         sta zBTop1
         sty zBTop1+1
-        ldy zBack
-        lda secFloorLo,y            // back dzF -> zNum
-        sec
-        sbc camZ
-        sta zNum
-        lda secFloorHi,y
-        sbc camZ+1
-        sta zNum+1
-        lda zNum
+        lda zBackF
         sta zA
-        lda zNum+1
+        lda zBackF+1
         sta zA+1
         jsr useRY0
         jsr projRow
         sta zBBot0
         sty zBBot0+1
-        lda zNum
+        lda zBackF
         sta zA
-        lda zNum+1
+        lda zBackF+1
         sta zA+1
         jsr useRY1
         jsr projRow
@@ -529,10 +464,11 @@ colLoopHead:
         sta zSCol
         jsr spanFill
         ldx zSX
-        lda #176                    // close column
+        lda #176                    // close the column for good
         sta colTop,x
         lda #0
         sta colBot,x
+        dec openCols                // it was open on entry, so this is exact
         jmp !advance+
 !portal:
         lda zTW                     // clamp portal lines into [zTW, zBW]
@@ -540,12 +476,15 @@ colLoopHead:
         lda zBW
         sta zWB
         ldy #6
-        jsr clampAcc                // portal opening top -> zBT
+        jsr clampAcc                // opening top -> zBT
         sta zBT
         sta zWT
         ldy #9
-        jsr clampAcc                // portal opening bottom -> zBB
-        sta zBB
+        jsr clampAcc                // opening bottom -> zBB
+        cmp zBT                     // a closed door has none: back ceiling at
+        bcs !+                      // or below back floor. Collapse the
+        lda zBT                     // opening rather than let the two spans
+!:      sta zBB                     // below overlap in reverse order.
         lda zTW                     // upper wall [zTW, zBT)
         sta zSY0
         lda zBT
@@ -561,10 +500,13 @@ colLoopHead:
         sta zSCol
         jsr spanFill
         ldx zSX
-        lda zBT                     // narrow window to the opening
+        lda zBT                     // narrow the window to the opening
         sta colTop,x
         lda zBB
         sta colBot,x
+        cmp zBT                     // an empty opening closes the column
+        bne !advance+
+        dec openCols
 !advance:
 colAdvance:
         :AddStep(accTop, stepTop)
@@ -580,27 +522,10 @@ colAdvance:
         inx
         jmp !col-
 !colsDone:
-        lda zBack                   // portal: queue back sector
-        cmp #$ff
-        beq !done+
-        tay
-        lda visitedSec,y            // once per frame only
-        bne !done+
-        lda #1
-        sta visitedSec,y
-        ldx stackN
-        cpx #PSTKMAX
-        bcs !done+
-        tya
-        sta pStkSec,x
-        lda zC0
-        sta pStkXL,x
-        lda zC1
-        sta pStkXR,x
-        inc stackN
-!done:  rts
+        rts                         // nothing to queue: bsp.asm owns the order
 
-.errorif * > $d000, "walls main code overflows into IO"
+// bsp.asm's traversal starts at BSPCODE, immediately after this.
+.errorif * > BSPCODE, "doWall overflows into the BSP traversal"
 
 //------------------------------------------------------------
 // helper routines live in the gap after the math code
@@ -926,7 +851,5 @@ projRow:
         tay
         pla
         rts
-
-// size check moved to main.asm
 
 .errorif * > BITMAP0, "walls helpers overflow into BITMAP0"

@@ -167,6 +167,11 @@ def light_to_intensity(light: int) -> int:
     return 2 + int(round(max(0, min(255, light)) / 255.0 * 13))
 
 
+# How many intensity steps a ceiling sits below its sector's floor. See where
+# it is applied for why this exists at all.
+CEIL_DARKEN = 4
+
+
 # ----------------------------------------------------------------------------
 # WAD reading
 # ----------------------------------------------------------------------------
@@ -318,7 +323,15 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
         inten = light_to_intensity(light)
         fr = pick_ramp(txt(ftex), FLAT_RAMPS, m.ramp_misses)
         cr = pick_ramp(txt(ctex), FLAT_RAMPS, m.ramp_misses)
-        m.sectors.append(Sector(floor, ceil, (fr << 4) | inten, (cr << 4) | inten))
+        # Ceilings are darkened a fixed step below floors. Not a lighting
+        # model -- it is what keeps a room readable when both flats land on
+        # the same ramp, which the E1M1 start room does (both STONE at
+        # intensity 9), and which renders as one undifferentiated grey field
+        # with the walls floating in it. This is the M1 art knob
+        # IMPLEMENTATION_PLAN.md risk #5 points at, and it costs nothing at
+        # runtime because the nibble had to hold something either way.
+        m.sectors.append(Sector(floor, ceil, (fr << 4) | inten,
+                                (cr << 4) | max(2, inten - CEIL_DARKEN)))
 
     def side_sector(idx):
         return None if idx == 0xFFFF else sides[idx][5]

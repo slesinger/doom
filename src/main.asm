@@ -1,24 +1,25 @@
 //============================================================
 //  main.asm — Doom C64U entry point
 //
-//  Milestone 1: walkable 3D demo — portal renderer into the
-//  chunky MATRIX, chunky2mc conversion, double buffering.
+//  Milestone 1: walkable 3D demo — BSP renderer into the chunky
+//  MATRIX, chunky2mc conversion, double buffering.
 //
 //  Memory map:
 //    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0DC6  main / input / map loader / test map
+//    $0810-$0DB1  main / input / map loader
 //    $0E00-$0E1F  MAPINFO            $0E20-$0E5F  MAPHDR
-//    $0F00-$0F48  portal stack, visitedSec, frameCnt, reu/map status
+//    $0E60-$0E61  SSECHDR            $0E70-$0EEE  collision helpers
+//    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
-//    $9740-$97BF  SEGBUF             $97C0-$98FF free (TABLES_FREE tail)
+//    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
 //    $9900-$9FFF  converter + math/span code
 //    $A000-$BF3F  BITMAP0            (VIC bank 2)
 //    $C000-$C3FF  SCREEN1            (VIC bank 3)
 //    $C400-$CA2F  math tables (sqr, sin, rowCell)
-//    $CA30-$CFFF  walls renderer code
+//    $CA30-$CE0F  doWall             $CE10-$CFC2  bsp traversal
 //    $D000-$DB3F  NODES              $DC00-$DE3F  SECTORS   (under I/O)
 //    $E000-$FF3F  BITMAP1
 //============================================================
@@ -48,43 +49,61 @@ main:
         sta $d021
         sta backBuf
         jsr clearHudRows
-        lda #<START_X               // player spawn
-        sta camX
-        lda #>START_X
-        sta camX+1
-        lda #<START_Y
-        sta camY
-        lda #>START_Y
-        sta camY+1
-        lda #START_A
-        sta camA
-        lda #START_SEC
-        sta camSec
-        ldy #START_SEC
-        lda secFloorLo,y
-        clc
-        adc #EYE
-        sta camZ
-        lda secFloorHi,y
-        adc #0
-        sta camZ+1
         lda #0
         sta frameCnt
         sta frameCnt+1
-        // Record whether there is an REU. Not fatal: nothing reads the
-        // REU yet, so refusing to run would only make the engine useless
-        // on machines it currently works on. This becomes a hard failure
-        // in Phase 4, when the map lives there and a missing REU means
-        // there is nothing to draw.
+        // Is there an REU? This used to be advisory. The map now lives in it
+        // and there is nothing else to draw, so both this and the load below
+        // are fatal -- see mapHalt.
         jsr reuProbe
         lda #0
         rol                         // carry -> bit 0
         sta reuOK
-        // Load the resident map blocks (nodes, sectors, MAPINFO) out of the
-        // REU image. Nothing reads them yet -- the renderer is still on
-        // testmap.asm -- so a failure is recorded in mapOK/mapErr rather than
-        // halting; `make check` asserts mapOK through tools/vicedbg/probe.py.
+        // Load the resident map blocks (MAPINFO, nodes, sectors) out of the
+        // REU image. mapErr says why not; `make check` asserts mapOK through
+        // tools/vicedbg/probe.py, and mapHalt makes it visible on a machine.
         jsr mapLoad
+        bcc mapHalt
+        lda miSpawnX                // spawn from the map's own THINGS entry
+        sta camX
+        lda miSpawnX+1
+        sta camX+1
+        lda miSpawnY
+        sta camY
+        lda miSpawnY+1
+        sta camY+1
+        lda miSpawnA
+        sta camA
+        lda miSpawnSec
+        sta camSec
+        jsr setEyeZ
+        // The engine's own descent must agree with the one wad2reu.py did
+        // offline. It is checked rather than trusted because a sign flip in
+        // pointOnSide mirrors the world, and a mirrored world still renders
+        // (docs/reu-format.md §4.1).
+        jsr bspFindSsec
+        lda zChild
+        sta camSsec
+        lda zChild+1
+        sta camSsec+1
+        cmp miSpawnSsec+1
+        bne !mismatch+
+        lda zChild
+        cmp miSpawnSsec
+        beq mainLoop
+!mismatch:
+        lda #MERR_SPAWN
+        sta mapErr
+        lda #0
+        sta mapOK
+        // fall through
+mapHalt:
+        // Nothing can be drawn. Hold the machine with the reason in the
+        // border, which is the only output left: 1 no REU, 2 bad magic,
+        // 3 wrong version, ... 9 the spawn descent disagreed (mapload.asm).
+        lda mapErr
+        sta $d020
+        jmp mapHalt
 mainLoop:
         jsr readInput
         jsr movePlayer
@@ -144,15 +163,11 @@ clearHudRows:
 #import "input.asm"
 #import "reu.asm"
 #import "mapload.asm"
-#import "testmap.asm"
-// MAPINFO is the first fixed allocation above the code, so it -- not the
-// portal stack at $0f00 -- is what the main segment now has to clear.
-// Before the stack was moved to $0f00 the margin here was three bytes, and
-// nothing would have said so. Headroom as of the map loader landing: 58 B.
-// Phase 4 gets ~250 B back by deleting testmap.asm and the portal stack.
+// MAPINFO is the first fixed allocation above the code, so it -- not the BSP
+// stack at $0f00 -- is what the main segment has to clear. Before the stack
+// moved to $0f00 the margin here was three bytes, and nothing would have said
+// so. Deleting testmap.asm bought about 190 B of this back.
 .errorif * > MAPINFO, "main code overflows into MAPINFO"
-.errorif * > pStkSec, "main code overflows into the portal stack"
-.errorif * > MATRIX, "main code overflows into MATRIX"
 
 #import "render/chunky2mc.asm"
 .errorif * > MATHCODE, "converter code overflows into math code"
@@ -162,3 +177,4 @@ clearHudRows:
 .errorif * > BITMAP0, "math code overflows into BITMAP0"
 
 #import "render/walls.asm"
+#import "render/bsp.asm"
