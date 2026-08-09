@@ -130,16 +130,49 @@ Two more things had to be fixed before any of the above could even be
 self-modifying code regions — i.e. it's confirmed the renderer actually ran a
 full frame, not just that nothing crashed.
 
-## Known issue: most of the frame is undrawn (separate bug, not yet fixed)
+## Fixed: most of the frame was undrawn (root cause found and fixed)
 
-`build/shot.png` shows a clean wall band on the left of the screen; the rest
-is black instead of the portal opening and the second solid wall segment.
-This is a **different bug from the JAM**. A structured, hypothesis-by-
-hypothesis investigation lives in `debug-notes/` (start at
-`debug-notes/00-index.md`) — read that before re-investigating, it records
-several ruled-out theories so a future session doesn't re-test them. Two
-findings from the session before this one, plus this session's narrowing
-and a tooling-reliability lesson, below.
+**Root cause: `renderFrame`'s per-frame `colTop`/`colBot` init loops
+(`walls.asm`, top of `renderFrame`) never actually cleared the arrays.**
+Both loops used the classic 6502 `ldx #159 / ... / dex / bpl loop`
+countdown idiom, but `colTop`/`colBot` have **160** columns (indices
+0-159), and `BPL` branches on the sign bit (bit 7). `159` and every value
+from `128`-`159` already has bit 7 set, so the very first `dex`
+(159→158) leaves the sign bit set and `BPL` fails to branch — the loop
+body runs **exactly once**, writing only column 159, then falls straight
+through. Columns 0-158 of `colTop`/`colBot` were left holding whatever was
+in memory from the *previous* frame's rendering (including mid-frame
+garbage from cell-boundary spanFill writes) instead of the intended
+open-window state `(colTop=0, colBot=176)`. Every downstream symptom
+chased across two sessions — the B→C portal's opening "collapsing" to
+`(0,0)`, wall 2's own columns reading `(0,0)`, the byte-identical
+"garbage" at columns 130-144 — was this same stale/leftover data being
+read back as if it were real per-column window state; none of the wall
+math, portal clamping, or accumulator stepping was ever at fault.
+
+**Fix** (`walls.asm`, `renderFrame`): count `160 → 1` instead of
+`159 → 0`, and terminate with `cpx #0 / bne` instead of `bpl`, which
+doesn't care about the sign bit:
+
+```
+ldx #160
+lda #0
+!:      dex
+        sta colTop,x
+        cpx #0
+        bne !-
+```
+(and the equivalent for `colBot`, `lda #176`). Verified: `make shot` now
+renders ceiling texture, floor, and a real portal opening instead of two
+thin bands + black; `make debug`'s live-vs-PRG diff still reports zero
+unexpected writes, and `MATRIX`/`BITMAP0` non-zero byte counts roughly
+quadrupled (consistent with far more of the frame actually being drawn).
+
+The investigation that led here (several refuted hypotheses about portal
+clamp math, stack corruption, map data, etc. — all correctly refuted,
+since none of them were the bug) is preserved in `debug-notes/` (start at
+`debug-notes/00-index.md`) for the record. Below is that investigation's
+history, kept for context.
 
 **1. Confirmed and isolated: the B→C portal (wall 8) computes a collapsed
 (zero-height) opening.** Per-wall instrumentation logging `(zWIdx2, zC0, zC1)`

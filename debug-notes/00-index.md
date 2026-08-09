@@ -1,5 +1,43 @@
 # Debug log index — "most of the frame is undrawn"
 
+## RESOLVED
+
+**Root cause**: `renderFrame`'s `colTop`/`colBot` init loops (`walls.asm`)
+used `ldx #159 / ... / dex / bpl loop` to clear 160 columns. `BPL` branches
+on the sign bit; 159 and 158 both have bit 7 set, so the loop ran **once**
+(column 159 only) and fell through, leaving columns 0-158 holding stale
+data from the previous frame every single frame. Every symptom below
+(wall 8's portal "collapsing", wall 2's own columns reading `(0,0)`, the
+columns-130-144 "garbage") was real per-column state read back correctly —
+it just was never the *current* frame's state. None of hypotheses A-F was
+ever going to find a real bug in the wall/portal/clamp math, because that
+math was never actually the problem.
+
+**Fix**: count `160 → 1`, terminate with `cpx #0 / bne` (doesn't depend on
+the sign bit). See `IMPLEMENTATION_PLAN.md`'s "Fixed" section for the full
+diff and verification (`make shot` / `make debug`).
+
+**How it was finally found**: single-step tooling was added to
+`tools/vicedbg/vicemon.py` (`advance_instructions`, wrapping VICE binary
+monitor's `MON_CMD_ADVANCE_INSTRUCTIONS`), which sidesteps the checkpoint/
+`-warp` race documented below. A live trace (`tools/vicedbg/wall3trace.py`,
+`tools/vicedbg/coldump.py`, `tools/vicedbg/precheck.py`) showed wall 3
+(the A→B portal, believed the innocent party) writing `(0,0)` to *every*
+column in its own range unconditionally — then traced that back one level
+further to find `colTop[61]`/`colBot[61]` already `(0,0)` at the very
+first `doWall` call of the frame, before any wall had run. A checkpoint
+placed right after `renderFrame`'s init loops (`$ca44`) caught the CPU
+mid-loop with `X=158` — one iteration in — confirming the `BPL` bug
+directly via register readback.
+
+**Everything below this point is the investigation history that led here.**
+It's preserved because every hypothesis was legitimately, correctly ruled
+out — the map data, the portal stack, the clamp addressing, the sign
+extension were all fine. The bug was one loop, two instructions away from
+where all of it was looking.
+
+---
+
 Investigation plan: `/home/honza/.claude/plans/tender-cuddling-wilkes.md`
 (kept outside the repo; this index is the durable, repo-tracked record).
 

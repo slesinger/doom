@@ -1,5 +1,12 @@
 # Hypothesis A — front wall's own clamped body already (0,0)
 
+**Resolved in a later session: see `00-index.md`.** The root cause was
+`renderFrame`'s init loops never clearing `colTop`/`colBot` (a `bpl`
+countdown loop from 159, broken for a 160-entry range). Everything below
+was a real, correctly-observed symptom of *that* bug, not of anything in
+`doWall`'s own clamp math — this hypothesis's "inconclusive" verdict was
+right to stay open rather than force a conclusion from unreliable tooling.
+
 **Prediction**: `zTW`/`zBW` (the front wall's own clamped top/bottom,
 `walls.asm:491-497`) are already `(0,0)` before the portal clamp runs for
 wall 8, meaning the defect is in the wall's *own* `zTop0`/`zBot0`/

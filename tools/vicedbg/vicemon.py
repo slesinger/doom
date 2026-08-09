@@ -106,6 +106,20 @@ class Mon:
             raise RuntimeError(f"checkpoint failed, err={err}")
         return struct.unpack("<I", b[:4])[0]
 
+    def advance_instructions(self, count=1, step_over=False, memspace=0):
+        """MON_CMD_ADVANCE_INSTRUCTIONS (0x71): single-step the CPU by
+        `count` instructions and block until VICE reports the stop. Unlike
+        exec/store checkpoints, this is synchronous by construction (VICE
+        can't get ahead of us) so it doesn't suffer the notification-vs-
+        query race seen with checkpoints under -warp. Returns the stopped
+        registers dict, same shape as regs().
+        """
+        body = struct.pack("<BH", int(step_over), count)
+        _, err, _ = self.cmd(0x71, body)
+        if err:
+            raise RuntimeError(f"advance_instructions failed, err={err}")
+        return self.regs(memspace)
+
     def autostart(self, path, run=True, index=0):
         name = path.encode()
         body = struct.pack("<BHB", int(run), index, len(name)) + name
