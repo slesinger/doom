@@ -43,6 +43,105 @@
 .const PSTKMAX = 12
 
 //------------------------------------------------------------
+// map residency — where build/assets.reu lands in the machine.
+//
+// The layout, the block ids and the packed record formats are frozen in
+// docs/reu-format.md; tools/wad2reu.py writes the other half of that contract.
+// The image carries each resident block's load address as well, and mapload.asm
+// checks the two agree, so a stale assets.reu is caught at boot rather than
+// rendering as garbage.
+//
+// Everything resident lives under the I/O space, which is 4 KB of RAM nothing
+// else claims. That keeps the whole $0BC6-$0DFF free block available for the
+// BSP stack, and it is why the capacities below are 240/96 rather than E1M1's
+// exact 236/85: the two blocks then end at $DEFF, one page short of the REU
+// registers at $DF00.
+//------------------------------------------------------------
+.const MAXNODES = 240               // capacity of the resident node arrays
+.const MAXSEC   = 96                // capacity of the resident sector arrays
+
+.const NODETAB  = $d000             // 12 SoA arrays of MAXNODES bytes
+.const ndPxLo     = NODETAB +  0*MAXNODES
+.const ndPxHi     = NODETAB +  1*MAXNODES
+.const ndPyLo     = NODETAB +  2*MAXNODES
+.const ndPyHi     = NODETAB +  3*MAXNODES
+.const ndDxLo     = NODETAB +  4*MAXNODES
+.const ndDxHi     = NODETAB +  5*MAXNODES
+.const ndDyLo     = NODETAB +  6*MAXNODES
+.const ndDyHi     = NODETAB +  7*MAXNODES
+.const ndRightLo  = NODETAB +  8*MAXNODES
+.const ndRightHi  = NODETAB +  9*MAXNODES
+.const ndLeftLo   = NODETAB + 10*MAXNODES
+.const ndLeftHi   = NODETAB + 11*MAXNODES
+.const NODETAB_END = NODETAB + 12*MAXNODES      // $db40
+
+.const SECTAB   = $dc00             // 6 SoA arrays of MAXSEC bytes
+.const mapSecFloorLo = SECTAB + 0*MAXSEC
+.const mapSecFloorHi = SECTAB + 1*MAXSEC
+.const mapSecCeilLo  = SECTAB + 2*MAXSEC
+.const mapSecCeilHi  = SECTAB + 3*MAXSEC
+.const mapSecFByte   = SECTAB + 4*MAXSEC
+.const mapSecCByte   = SECTAB + 5*MAXSEC
+.const SECTAB_END = SECTAB + 6*MAXSEC           // $de40
+
+.errorif SECTAB < NODETAB_END, "node table overruns the sector table"
+.errorif SECTAB_END > $df00, "resident map tables overrun the REU registers"
+
+// $0e00-$0e5f. MAPINFO's page alignment is load-bearing: a block descriptor
+// carries only the high byte of its load address (docs/reu-format.md §2).
+// $0e60-$0eff is free.
+.const MAPINFO  = $0e00             // 32 B, resident block 0
+.const MAPHDR   = $0e20             // 64 B, the image header, kept after boot
+                                    // so a rejected image can be read back
+
+// One subsector's segs, DMA'd per visit. In TABLES_FREE rather than in the
+// $0e00 page because the main segment now ends at $0dc6 and everything below
+// MAPINFO is code headroom -- see main.asm's .errorif.
+.const SEGBUF   = TABLES_FREE       // 128 B, $9740-$97bf
+.const SEGBUFSZ = 128
+.errorif SEGBUF + SEGBUFSZ > TABLES_FREE_END, "SEGBUF overruns TABLES_FREE"
+
+// MAPINFO field offsets — docs/reu-format.md §4.1
+.const miNumNodes   = MAPINFO + 0
+.const miNumSsec    = MAPINFO + 2
+.const miNumSec     = MAPINFO + 4
+.const miSsecShift  = MAPINFO + 5
+.const miSsecBase   = MAPINFO + 6   // 24-bit REU offset
+.const miRoot       = MAPINFO + 9
+.const miSpawnX     = MAPINFO + 11
+.const miSpawnY     = MAPINFO + 13
+.const miSpawnA     = MAPINFO + 15
+.const miSpawnSsec  = MAPINFO + 16
+.const miSpawnSec   = MAPINFO + 18
+.const miNumSegs    = MAPINFO + 19
+.const miMapId      = MAPINFO + 21
+
+// image header field offsets — docs/reu-format.md §2
+.const MAPFMT_VERSION = 1
+.const hdrMagic     = MAPHDR + 0    // "D64U"
+.const hdrVersion   = MAPHDR + 4
+.const hdrBlocks    = MAPHDR + 5
+.const hdrDescs     = MAPHDR + 8    // blockCount x 8 bytes
+.const HDRSIZE      = 64
+
+// block descriptor field offsets, relative to a descriptor base
+.const bdId     = 0
+.const bdFlags  = 1                 // bit 0 = resident
+.const bdReuOfs = 2                 // 3 bytes: lo, hi, bank
+.const bdLen    = 5                 // 2 bytes
+.const bdLoadHi = 7                 // high byte of the C64 load address
+
+//------------------------------------------------------------
+// $01 banking. $d000-$dfff is RAM only when the low three bits are %100.
+// Both states keep RAM at $a000 and $e000, where BITMAP0/BITMAP1 live, so
+// switching never changes what a bitmap write does. See docs/reu-format.md
+// §6.1 -- and note this is only safe because interrupts are masked for the
+// whole run: main.asm opens with `sei` and never clears it.
+//------------------------------------------------------------
+.const BANK_IO  = $35               // I/O at $d000  -- the default state
+.const BANK_RAM = $34               // RAM at $d000  -- node/sector reads
+
+//------------------------------------------------------------
 // engine constants
 //------------------------------------------------------------
 .const NEAR    = 16
@@ -91,6 +190,24 @@
 .const REU_FETCH   = $91            // REU -> C64
 .const REU_STASH   = $90            // C64 -> REU
 .const REU_COMPARE = $93            // compare, result in the status register
+
+// Where reuProbe round-trips its signature. It must not be REU address 0:
+// that is the map image's header, and the probe runs before the load, so a
+// scratch write there destroys the magic the loader is about to check --
+// which is exactly what happened the first time this was wired up, and it
+// reported "bad magic" rather than "you overwrote it".
+//
+// Bank 0, $f000: the top of the first 64 KB, past any image wad2reu.py will
+// produce (it asserts the used region stays below this) and present on every
+// REU down to the smallest 1700 at 128 KB.
+//
+// It deliberately does NOT use the bank register. Bank 1 was tried first and
+// the C64 Ultimate wrote to REU address $000000 anyway -- the stash lands at
+// offset 0 with $df06 = 1, which VICE does not do. Whatever the Ultimate's
+// $df06 semantics are, nothing here needs them: 64 KB of REU is reachable with
+// the two address bytes alone, and the map image is 34 KB.
+.const REU_PROBE_ADDR = $f000
+.const REU_PROBE_BANK = 0
 
 //------------------------------------------------------------
 // zInput bits. Keyboard and joystick merge with a single `ora`, so the
@@ -212,6 +329,17 @@
 .const zCosT   = $70        // MOVE_SPEED * cos >> 14  (the forward basis, scaled)
 .const zSinT   = $72        // MOVE_SPEED * sin >> 14
 
+// boot-time map loader scratch. Same reuse argument as the movement scratch
+// above, taken further: mapLoad runs once, before the first frame, so every
+// renderer accumulator is dead. Nothing here may be touched after boot.
+.const zMLSrc  = $68        // copy source pointer
+.const zMLDst  = $6a        // copy destination pointer
+.const zMLLen  = $6c        // bytes remaining
+.const zMLDesc = $6e        // pointer to the current block descriptor
+.const zMLCnt  = $70        // descriptors left to walk
+.const zMLSum  = $72        // 16-bit sum of the block being copied
+.const zMLId   = $74        // block id x 2, i.e. its offset into mapSum
+
 //------------------------------------------------------------
 // player spawn (test map)
 //------------------------------------------------------------
@@ -234,3 +362,12 @@
 // up in tools/vicedbg/probe.py's live-RAM diff as an unexplained difference.
 .const reuScratch     = $0f42      // 4 bytes, round-tripped by reuProbe
 .const reuOK          = $0f46      // 1 = an REU answered at boot
+.const mapOK          = $0f47      // 1 = assets.reu loaded and verified
+.const mapErr         = $0f48      // why not, when mapOK is 0 (see mapload.asm)
+
+// 16-bit sum of each resident block's bytes, indexed by block id x 2, written
+// by mapload.asm as it copies. This is the only way a host can check that the
+// blocks under the I/O space arrived: machine:readmem on the Ultimate DMAs the
+// bus as the engine has it banked, so $d000 reads back the registers, not the
+// node table. The engine reads that RAM itself, so it can add it up.
+.const mapSum         = $0f49      // 4 blocks x 2 bytes, $0f49-$0f50

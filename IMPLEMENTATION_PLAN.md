@@ -42,10 +42,15 @@ The docs that still said "does not reach a visible frame" — the README,
 
 ### What does not exist at all
 
-- **No REU code.** Not one write to `$DF00`. 16 MB sits unused.
-- **No `tools/wad2reu.py`** — the `make assets` target references a file that
-  was never written.
-- **No real map.** `testmap.asm` is three hand-built convex sectors.
+*(This list is from the start of the session. Everything in it has since
+landed — see §11. What is left is Phase 4's BSP renderer and Phase 5's player.)*
+
+- ~~**No REU code.**~~ `src/reu.asm`, `src/mapload.asm`, `src/reuload.asm`.
+- ~~**No `tools/wad2reu.py`.**~~ Written; `make assets` produces E1M1 and the
+  test map through the same packers.
+- **The renderer still draws `testmap.asm`.** E1M1's geometry is in the REU and
+  its nodes and sectors are resident in RAM, but nothing reads them yet. That
+  is Phase 4.
 
 ---
 
@@ -149,23 +154,39 @@ code.
    buffer, the BSP node/side stack and the collision scratch go — none of which
    may live in `$0200-$03FF` (see `pipeline.md` §13.4).
 
-**Proposed residency:**
+**Residency, as built** (frozen in `docs/reu-format.md`, which is authoritative):
 
 | Data | Packed form | Size | Lives at |
 |---|---|---|---|
-| NODES | px,py,dx,dy (8 B) + 2 child words (4 B) = **12 B** | 2832 B | `$D000` under I/O |
-| SECTORS | floor, ceil (16-bit) + floorByte + ceilByte = **6 B** | 510 B | `$0B60` |
-| SSECTORS | firstSeg (16-bit, count implied by next) = **2 B** | 474 B | `$0D60`-ish |
-| SEGS | x0,y0,x1,y1, backSector, rampByte = **10 B** | 7320 B | **REU**, streamed per subsector |
-| Collision linedefs + BLOCKMAP | packed | ~10 KB | **REU**, streamed on move |
+| NODES | 12 SoA arrays of 240 | 2880 B | `$D000` under I/O |
+| SECTORS | 6 SoA arrays of 96 | 576 B | `$DC00` under I/O |
+| MAPINFO | counts, root, spawn, SSECDATA base | 32 B | `$0E00` |
+| SSECDATA | `[segCount, sectorId, segs…]` in a 128 B slot per subsector | 30336 B | **REU**, streamed per subsector |
 
-Node bounding boxes are dropped at M1 (16 B/node saved). Without them the walk
-visits every node, relying on column occlusion for rejection — correct, just
-not maximally culled. Add them back in M2 if profiling says so.
+Three changes from what this section originally proposed, all of them
+simplifications:
 
-Per frame the engine DMAs one seg block per visited subsector: average 3 segs
-= 30 bytes, times maybe 40 visible subsectors = **~1.2 KB/frame**. Whether that
-is free or expensive is the question Phase 1 answers.
+- **There is no resident SSECTORS table.** It was to be 237 entries × 4 arrays
+  = 948 B of RAM plus a 16-bit multiply per subsector visit. Instead each
+  subsector owns a fixed 128-byte REU slot at `ssecReuBase + (i << 7)` holding
+  its seg count, its sector id and its segs. One shift, no multiply, no table —
+  30 KB of REU (which is free) traded for 948 B of RAM (which is not).
+- **Everything resident fits under `$D000`.** With SSECTORS gone, nodes and
+  sectors together are 3456 B of the 4 KB there, so the whole `$0BC6-$0DFF`
+  free block stays available for Phase 4's BSP stack. `MAXNODES = 240` and
+  `MAXSEC = 96` are round numbers chosen so the two blocks end at `$DEFF`,
+  one page short of the REU registers.
+- **BLOCKMAP and the collision linedefs are gone entirely** — see Phase 5.
+
+Node bounding boxes are still dropped at M1 (16 B/node saved). Without them the
+walk visits every node, relying on column occlusion for rejection — correct,
+just not maximally culled. Add them back in M2 if profiling says so.
+
+Per frame the engine DMAs one subsector slot per visit, in two transfers: 2
+bytes of header, then `segCount × 10`. At E1M1's mean of 3.09 segs that is 33
+bytes rather than the 82 a fixed-size slot fetch would cost, so ~40 visible
+subsectors is **~1.3 KB/frame ≈ 1.3 ms** of halted CPU at the measured
+1 byte/µs.
 
 ---
 
@@ -225,7 +246,7 @@ layout in §4 rests on an assumption nobody has measured.
 bytes-per-millisecond table and a real FPS number. — **FPS met; the
 bytes-per-millisecond table is item 3 and moves to Phase 2.**
 
-### Phase 2 — The REU layer — PARTLY DONE (2026-08-09)
+### Phase 2 — The REU layer ✅ DONE (2026-08-09)
 
 1. ✅ **`src/reu.asm`** — the `reuSet` macro fills `$DF02-$DF08`, a store to
    `$DF01` fires the transfer, and `reuProbe` round-trips a signature through
@@ -235,23 +256,34 @@ bytes-per-millisecond table is item 3 and moves to Phase 2.**
    in Phase 4, when the map lives there.
    `make check` now **asserts** `reuOK == 1` — see §10 for why that assertion
    is not paranoia.
-2. ⬜ **Boot-time resident load**: header block → nodes, sectors, ssectors
-   into their §4 homes. Blocked on Phase 3: there is no image to load. The
-   transfer primitive it needs is done.
-3. ⬜ **I/O banking discipline**: `renderFrame` runs with RAM visible at
-   `$D000`; `flip`, `readInput` and `reuFetch` bank I/O in. Deferred to
-   Phase 4 on purpose — with nothing yet stored under `$D000` it would add a
-   banking hazard to every frame in exchange for nothing, and it cannot be
-   verified until the node table is actually there.
+2. ✅ **Boot-time resident load** — `src/mapload.asm`. Reads the 64-byte
+   header from REU offset 0, checks magic and version, then walks the block
+   descriptors and copies each resident block to its home. It checks the load
+   address in the image against `defs.asm` and the length against the space
+   reserved, and sums each block into `mapSum` as it copies.
+   Blocks cannot be DMA'd straight to `$D000` — with I/O banked in the transfer
+   would hit the registers, with it banked out `$DF01` is unreachable — so each
+   one is staged through MATRIX and block-copied under `BANK_RAM`.
+3. ✅ **I/O banking discipline** — `$01 = $35` is the engine's default state,
+   set once at boot; `$34` is entered only to touch the node and sector tables
+   and always restored. Both keep RAM at `$A000`/`$E000` where the bitmaps
+   live, so a bank switch never changes what a bitmap write does. Safe only
+   because interrupts are masked for the whole run. `docs/reu-format.md` §6.1.
+4. ✅ **Delivery to real hardware**, which turned out to be the hard part —
+   REU Preload does not work. See §11.
 
 *Done when:* the PRG loads a signature block from REU at boot, verifies its
-magic, and `make debug` is still clean. — **the signature round-trip is done
-and checked; the real block waits on Phase 3.**
+magic, and `make debug` is still clean. — **met, and then some**: all three
+resident blocks are verified byte-for-byte in VICE and by checksum on real
+hardware, `make check` asserts it, and `make u64-map` is the hardware
+equivalent.
 
-### Phase 3 — `tools/wad2reu.py`
+### Phase 3 — `tools/wad2reu.py` ✅ DONE (2026-08-09)
 
 The offline half. Emits `build/assets.reu` in the §4 layout, with a header
-carrying magic, version, and each block's REU offset and length.
+carrying magic, version, and each block's REU offset and length. All five items
+below landed; the format is frozen in `docs/reu-format.md` and §11 has the
+numbers.
 
 1. Parse `VERTEXES`, `LINEDEFS`, `SIDEDEFS`, `SECTORS`, `SEGS`, `SSECTORS`,
    `NODES`, `THINGS`, `BLOCKMAP` for E1M1.
@@ -269,7 +301,10 @@ carrying magic, version, and each block's REU offset and length.
    contiguous); byte-exact round-trip test.
 
 *Done when:* `make assets` produces a `.reu` whose top-down render is
-recognisably E1M1, with the validator green.
+recognisably E1M1, with the validator green. — **met.** `build/assets-map.png`
+is unmistakably E1M1. `make assets` also emits `build/testmap.reu`, the
+3-sector map of `testmap.asm` run through a BSP builder in the same tool, which
+is Phase 4.4's input.
 
 ### Phase 4 — The BSP renderer
 
@@ -300,10 +335,25 @@ the courtyard through the door opening), `make check` is green, and a scripted
 
 1. **Sector lookup** = BSP descent to a leaf → subsector → sector. Replaces
    `checkSector`'s convex containment walk.
-2. **Collision** via BLOCKMAP: fetch the destination cell's linedef list from
-   REU, test the move against each. Blocking = one-sided line, or two-sided
-   with a floor step > 24 units or headroom < 56. Keep the existing
+2. **Collision against the destination subsector's segs, not BLOCKMAP.**
+   Descend the BSP with the destination point to find its subsector, then test
+   the move against that subsector's segs — which the renderer already streams,
+   in the format it already uses. Blocking = a one-sided seg, or a two-sided
+   one with a floor step > 24 units or headroom < 56. Keep the existing
    undo-the-move response for M1 (no sliding).
+
+   This drops BLOCKMAP, LINEDEFS and SIDEDEFS from the image entirely — about
+   10 KB and a whole second geometry format to keep in sync — and it makes
+   `checkSector` a generalisation of what it already does rather than a rewrite:
+   subsectors are convex, so the existing sign-only cross product works
+   unchanged.
+
+   The one thing to get right: a subsector's boundary includes edges along BSP
+   partition lines that are **not** in `SEGS`, because those are interior
+   boundaries between subsectors, not walls. Not blocking there is the correct
+   behaviour, not a gap. What this shares with the current code is the
+   limitation in `pipeline.md` §5.3 — a single frame's motion crossing two
+   boundaries — and it wants the same fix, looping with an iteration cap.
 3. **Spawn** from `THINGS` type 1 (player 1 start) — position and angle —
    instead of the `START_*` constants.
 4. **Eye height follows the floor**, including step up/down.
@@ -327,8 +377,8 @@ courtyard and back without leaking through a wall or falling through a floor.
 
 | # | Risk | Early warning | Response |
 |---|---|---|---|
-| 1 | REU DMA is slow *and* doesn't scale with turbo, making per-subsector streaming too expensive | Phase 1's benchmark | Batch seg fetches per node subtree; or prefetch a whole region on sector change |
-| 2 | No clean way to get a `.reu` image onto real hardware | Phase 1.2 | Have the PRG load its data from disk into REU itself at boot |
+| 1 | ~~REU DMA is slow *and* doesn't scale with turbo~~ | Phase 1's benchmark | **Closed.** 1 byte/µs flat, no setup penalty, so per-subsector streaming needs no batching (§10). ~1.3 KB/frame = ~1.3 ms |
+| 2 | ~~No clean way to get a `.reu` image onto real hardware~~ | Phase 1.2 | **Closed the hard way.** REU Preload does not deliver on firmware 1.1.0; `src/reuload.asm` + `machine:writemem` does, and verifies every chunk (§11) |
 | 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | Re-add node bbox rejection (the 16 B/node dropped in §4); it is the designed-in escape hatch |
 | 4 | `$D000-$DFFF` banking interacts badly with the converter or `flip` | Phase 2.3, caught by `make debug` | Fall back to streaming nodes from REU like segs — costs a DMA per node visit |
 | 5 | Flat shading over 85 sectors of real geometry looks like undifferentiated mush | First E1M1 frame | Ramp assignment is a Python table (Phase 3.3) — cheap to iterate. Distance-based intensity falloff is already free in the byte format |
@@ -556,3 +606,129 @@ verifiable by its own top-down PNG render, and needs no hardware.
 
 Phase 2's remaining two items (resident load, `$D000` banking) are blocked
 behind it and should follow immediately after.
+
+---
+
+## 11. Session log — 2026-08-09, Phases 3 and 2 (completed)
+
+Phase 3 in full, then Phase 2's two blocked items, then the hardware
+verification that the whole delivery path actually works. `make check` is green
+and `make u64-map` passes on the C64 Ultimate.
+
+### What was decided before any code
+
+Four questions, answered up front because each one changes what gets built:
+
+| Question | Answer |
+|---|---|
+| Freeze the format first? | Yes — `docs/reu-format.md`, written before either half |
+| Emit the test map through the same pipeline? | Yes — `make assets` produces `build/testmap.reu` too |
+| Collision: BLOCKMAP or the BSP's own segs? | **Segs.** Drops ~10 KB and a second geometry format (Phase 5.2) |
+| Who picks the texture → ramp mapping? | Proposed in `RAMPS` at the top of `wad2reu.py`, yours to tweak |
+
+### `tools/wad2reu.py`
+
+E1M1, measured: 467 vertices, 475 linedefs, 85 sectors, 732 segs, 237
+subsectors, 236 nodes (root 235). Subsector seg ranges are contiguous and in
+order; the largest subsector has 8 segs; coordinates span x −768…3808,
+y −4864…−2048, so nothing needs rescaling and the projection math in
+`pipeline.md` §8 carries over untouched. Spawn is `(1056, −3616)` facing 90°,
+which is `camA = 64` in the engine's 8-bit angle space, in subsector 103 of
+sector 38.
+
+All 32 of E1M1's wall textures and all 24 flats are mapped to ramps by name
+family; nothing falls through to the default. Flat intensity comes from the
+sector's WAD light level mapped to 2…15 — a deliberate small step past M1's
+"no lighting from WAD light levels" exclusion, because the intensity nibble has
+to hold *something* and a constant flattens all 85 sectors into one brightness.
+
+The test map goes through a BSP builder in the same file: 14 linedefs → 16 segs
+→ 3 subsectors, 2 nodes, no splits. That the three convex sectors come out as
+exactly three leaves is the expected answer and a useful sanity check on the
+builder.
+
+Validation re-parses the finished image with a reader that shares no code with
+the packers, and checks the descent the engine will do against the one Python
+does. `build/assets-map.png` is a top-down render of the *decoded* blocks — it
+is unmistakably E1M1, which is the check that no structural assertion can make.
+
+### Three silent failures, found in a row
+
+Each one lets every REU read "succeed" and return the wrong bytes. That shape is
+now familiar enough to be the design assumption: **nothing on this path may be
+believed without an assertion.**
+
+1. **`reuProbe` was overwriting the header it was about to verify.** It
+   round-trips a signature through REU address 0, which is where the image's
+   magic lives, and it runs first. Moved to `$00F000`; `wad2reu.py` asserts the
+   image stays below that.
+
+   Bank 1 offset 0 was the first fix and had to be abandoned: with `$DF06 = 1`
+   the Ultimate stashed to REU `$000000` anyway, which VICE does not do.
+
+2. **VICE silently ignores a `-reuimage` whose size is not exactly the emulated
+   REU size.** It prints one line to stderr and boots with a zeroed REU. Images
+   are now padded to 128 KB and the Makefile runs `-reusize 128`; raise the two
+   together or neither. `+reuimagerw` also stops VICE writing the image back on
+   exit and stamping runtime state into a build artifact.
+
+3. **The Ultimate's REU Preload does not deliver the image** on firmware 1.1.0 /
+   FPGA 122 / core 1.49. The file uploads over FTP at the right size, all three
+   settings arm and read back correct, and REU offset 0 keeps whatever a running
+   program last wrote there, across any number of resets. Tried and did not
+   help: re-running with the setting already armed, `save_config_to_flash` plus
+   an explicit reset, toggling `RAM Expansion Unit` off and on, toggling
+   `REU Preload` off and on, and matching `REU Size` to the image size in case
+   preload wants an exact fit the way VICE does.
+
+   This is the answer to Phase 1.2's caveat — *"that the bytes land in REU RAM
+   cannot be confirmed until Phase 2 has code that reads `$DF00`"* — and the
+   answer is that they did not.
+
+### `src/reuload.asm` — the delivery that does work
+
+A standalone PRG with an 8-byte mailbox at `$0340`. The host DMAs a chunk into
+C64 RAM with `machine:writemem` and writes the mailbox in one call; the trigger
+byte is **last** in the mailbox, so the stub cannot see it before the parameters
+it describes. `tools/u64push.py` drives it in 16 KB chunks and reads every chunk
+back with a matching REU fetch before moving on. E1M1's 34688 used bytes take
+three chunks and a few seconds.
+
+The REU itself was never the problem — writes from the C64 persist across
+resets, which is exactly how the stale bytes were identified.
+
+### Verification, on both machines
+
+| | VICE (`make check`) | Ultimate (`make u64-map`) |
+|---|---|---|
+| MAPINFO `$0E00` +32 | byte-exact | byte-exact, sum `$06D2` |
+| NODES `$D000` +2880 | byte-exact | sum `$44FA` |
+| SECTORS `$DC00` +576 | byte-exact | sum `$9F92` |
+
+The two blocks under `$D000` cannot be read back from a host at all: the
+Ultimate's `machine:readmem` DMAs the bus as the engine has it banked, so a read
+of `$D000` returns the I/O registers. `mapload.asm` therefore sums each block
+into `mapSum` while it copies, under `BANK_RAM`, which is the only view of that
+RAM anything outside the engine can get. The sums agree with the image on both
+machines and with each other.
+
+`make u64-fps` still reports **50.01 fps**, so none of this costs a frame.
+
+### Two things to know before touching this again
+
+- **The main segment now ends at `$0DC6`, 58 bytes below `MAPINFO`.**
+  `main.asm`'s `.errorif` was checking against the portal stack at `$0F00`,
+  which no longer bounds anything; it checks `MAPINFO` now. Phase 4 gets about
+  250 B back by deleting `testmap.asm` and the portal stack.
+- **The memory map now has four independent copies**: `defs.asm`, the image's
+  own load-address bytes, `probe.py`'s allowed-region table, and
+  `docs/reu-format.md`. The first two are cross-checked at boot and the third
+  fails `make check` when it drifts. The document is the one nothing enforces.
+
+### Next session: Phase 4
+
+Everything it needs exists. `build/testmap.reu` is the input to bring the BSP
+walk up on before E1M1, `pointOnSide` is `checkSector`'s existing sign-only
+cross product with the wall delta swapped for the node delta, and MAPINFO
+carries a precomputed spawn subsector for the engine's first descent to check
+itself against.

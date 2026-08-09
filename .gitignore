@@ -6,7 +6,7 @@ build/*.sym
 build/*.vs
 build/*.png
 build/*.bin
-build/assets.reu
+build/*.reu
 build/debug.log
 
 # KickAssembler is not vendored; see IMPLEMENTATION_PLAN.md
@@ -16,4 +16,5 @@ __pycache__/
 *.pyc
 src/.source.txt
 src/render/.source.txt
-src/build/main.sym
+src/build/
+build/main.vs

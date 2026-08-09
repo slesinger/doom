@@ -1321,14 +1321,19 @@ Three things worth knowing about this map:
   will silently overrun into executable code unless `WALLSCODE` moves first.
   `main.asm` carries `.errorif` guards for the other segment boundaries; this
   one has none.
-- **`$9740-$98FF` (448 B) is free and named `TABLES_FREE`.** 352 of it was the
+- **`$9740-$98FF` (448 B) was free and named `TABLES_FREE`.** 352 of it was the
   dead scanline-major `rowLo`/`rowHi` pair from `3d-renderer-design.md`, deleted
   now that `spanFill` is confirmed to use the cell-major `rowCell` pair instead;
   `main.asm` has an `.errorif` keeping the dither tables from growing back into
-  it. With `$0B60-$0FFF` (1184 B) and `$CED4-$CFFF` (300 B) that is under 2 KB
-  of contiguous free RAM in the whole machine — which is why
-  `IMPLEMENTATION_PLAN.md` §4 puts E1M1's node table in the 4 KB of RAM hiding
-  under the I/O space at `$D000` and streams the rest from the REU.
+  it. The first 128 B are now `SEGBUF`.
+- **`$D000-$DEFF` is where E1M1 lives.** 4 KB of RAM hides under the I/O space,
+  and nothing else claims it, so E1M1's 236 BSP nodes and 85 sectors are
+  resident there; everything else streams from the REU one subsector at a time.
+  The engine runs with `$01 = $35` (I/O visible) and switches to `$34` only to
+  read those two tables. Both states keep RAM at `$A000`/`$E000` where the
+  bitmaps live, so a bank switch never changes what a bitmap write does — and
+  it is only safe at all because interrupts are masked for the whole run.
+  `docs/reu-format.md` is the authority on that layout.
 
 ### 12.3 Frame pacing — and what hardware actually does
 

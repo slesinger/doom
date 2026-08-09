@@ -7,18 +7,20 @@
 //  Memory map:
 //    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0EFF  main / input / test map
-//    $0F00-$0F41  portal stack, visitedSec, frameCnt
+//    $0810-$0DC6  main / input / map loader / test map
+//    $0E00-$0E1F  MAPINFO            $0E20-$0E5F  MAPHDR
+//    $0F00-$0F48  portal stack, visitedSec, frameCnt, reu/map status
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
-//    $9740-$98FF  free (448 B, TABLES_FREE)
+//    $9740-$97BF  SEGBUF             $97C0-$98FF free (TABLES_FREE tail)
 //    $9900-$9FFF  converter + math/span code
 //    $A000-$BF3F  BITMAP0            (VIC bank 2)
 //    $C000-$C3FF  SCREEN1            (VIC bank 3)
 //    $C400-$CA2F  math tables (sqr, sin, rowCell)
 //    $CA30-$CFFF  walls renderer code
-//    $E000-$FF3F  BITMAP1 (under Kernal ROM — write-only)
+//    $D000-$DB3F  NODES              $DC00-$DE3F  SECTORS   (under I/O)
+//    $E000-$FF3F  BITMAP1
 //============================================================
 
 #import "defs.asm"
@@ -29,6 +31,13 @@
 .pc = $0810 "main code"
 main:
         sei
+        // RAM at $a000 and $e000, I/O at $d000. This is the engine's default
+        // banking state and the one every routine may assume; mapload.asm and
+        // the BSP walk flip to BANK_RAM briefly and always restore it. See
+        // docs/reu-format.md §6.1. Safe because nothing calls the KERNAL after
+        // this point and interrupts stay masked for the whole run.
+        lda #BANK_IO
+        sta $01
         jsr turboOn
         lda #$3b                    // bitmap mode on
         sta $d011
@@ -71,6 +80,11 @@ main:
         lda #0
         rol                         // carry -> bit 0
         sta reuOK
+        // Load the resident map blocks (nodes, sectors, MAPINFO) out of the
+        // REU image. Nothing reads them yet -- the renderer is still on
+        // testmap.asm -- so a failure is recorded in mapOK/mapErr rather than
+        // halting; `make check` asserts mapOK through tools/vicedbg/probe.py.
+        jsr mapLoad
 mainLoop:
         jsr readInput
         jsr movePlayer
@@ -129,10 +143,14 @@ clearHudRows:
 
 #import "input.asm"
 #import "reu.asm"
+#import "mapload.asm"
 #import "testmap.asm"
-// The portal stack and its neighbours sit in the same free block, just
-// above the code. Before they were moved to $0f00 the margin here was
-// three bytes, and nothing would have said so.
+// MAPINFO is the first fixed allocation above the code, so it -- not the
+// portal stack at $0f00 -- is what the main segment now has to clear.
+// Before the stack was moved to $0f00 the margin here was three bytes, and
+// nothing would have said so. Headroom as of the map loader landing: 58 B.
+// Phase 4 gets ~250 B back by deleting testmap.asm and the portal stack.
+.errorif * > MAPINFO, "main code overflows into MAPINFO"
 .errorif * > pStkSec, "main code overflows into the portal stack"
 .errorif * > MATRIX, "main code overflows into MATRIX"
 

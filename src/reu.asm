@@ -69,14 +69,16 @@ reuInit:
 //------------------------------------------------------------
 // reuProbe — is there an REU?  carry set = yes.
 //
-// Round-trips a signature through REU address 0 rather than
+// Round-trips a signature through REU RAM rather than
 // trusting the status register: with no REU present the $DFxx
 // stores go nowhere and the reads return $FF, so the fetch is a
 // no-op and the cleared buffer stays cleared. That is a positive
 // test for a working data path, which reading $DF00 is not.
 //
-// Clobbers the first 4 bytes of REU bank 0, and reuScratch. Call
-// it before loading anything.
+// Clobbers 4 bytes at REU_PROBE_ADDR/REU_PROBE_BANK (defs.asm) and
+// reuScratch. That address is deliberately outside the map image --
+// probing at REU address 0 would overwrite the header mapload.asm is
+// about to verify.
 //------------------------------------------------------------
 reuProbe:
         jsr reuInit
@@ -85,7 +87,7 @@ reuProbe:
         sta reuScratch,x
         dex
         bpl !-
-        :reuSet(reuScratch, $0000, 0, 4)
+        :reuSet(reuScratch, REU_PROBE_ADDR, REU_PROBE_BANK, 4)
         lda #REU_STASH
         sta REU_COMMAND
         lda #0                      // wipe it, so a dead fetch is visible
@@ -93,7 +95,7 @@ reuProbe:
 !:      sta reuScratch,x
         dex
         bpl !-
-        :reuSet(reuScratch, $0000, 0, 4)
+        :reuSet(reuScratch, REU_PROBE_ADDR, REU_PROBE_BANK, 4)
         lda #REU_FETCH
         sta REU_COMMAND
         ldx #3

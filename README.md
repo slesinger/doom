@@ -6,11 +6,17 @@ up to 64 MHz with 16 MB of REU, 64 KB of main RAM, and a VIC-II painting
 fixed-point throughout, table-driven wherever a table is cheaper than a
 computation.
 
-**Current state: the test-map renderer reaches a visible frame and `make check`
-is green** — floor, dithered ceiling and a lit far room through a portal, with
-zero writes outside the engine's own buffers. Milestone 1 (walk around real
-E1M1 on Ultimate 64 hardware) is not there yet: there is no REU code, no WAD
-converter and no BSP traversal. See
+**Current state: the test-map renderer runs at 50.0 fps on real C64 Ultimate
+hardware, PAL vsync-locked, and `make check` is green** — floor, dithered
+ceiling and a lit far room through a portal, with zero writes outside the
+engine's own buffers.
+
+**E1M1's geometry is now on the machine.** `tools/wad2reu.py` packs it out of
+`DOOM1.WAD` into an REU image, and the engine loads its BSP nodes and sector
+table into the 4 KB of RAM hiding under the I/O space at boot — verified
+byte-for-byte in VICE and by checksum on hardware. What is left for Milestone 1
+(walk around E1M1) is the BSP traversal that reads them and the player
+collision that goes with it. See
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the phase plan and what
 each phase has to prove.
 
@@ -27,6 +33,7 @@ The five documents divide along one axis: **what we intend to build** versus
 |---|---|
 | **[`pipeline.md`](pipeline.md)** | **The end-to-end compute path**, from a key press to pixels in VIC-II memory — as built, with formulas, cycle counts, a fully worked frame, and the reasoning behind each optimization. If you read one document, read this one. |
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | What is built, what is missing, and the phase-by-phase route to Milestone 1 — with the session log of what each pass changed. |
+| [`docs/reu-format.md`](docs/reu-format.md) | The frozen `assets.reu` map-image format: header, block layouts, the subsector slots streamed per frame, where it all lands in the machine, and how the image gets there on each of the two targets. |
 
 ### Target architecture
 
@@ -62,6 +69,8 @@ src/math.asm              mul8 (quarter-square), umul16, smulTrig, ssmul32,
                           udiv, sdiv, spanFill
 src/input.asm             WASD + QE strafe + joystick 2, convex-sector containment
 src/reu.asm               REU DMA primitives + boot-time presence probe
+src/mapload.asm           boot-time load of the resident map blocks from the REU
+src/reuload.asm           standalone PRG: host-driven REU image upload
 src/reubench.asm          standalone REU DMA throughput benchmark
 src/testmap.asm           3 sectors, 16 walls, 2 portals (SoA layout)
 src/render/walls.asm      portal traversal, near-plane clip, projection,
@@ -72,7 +81,8 @@ tools/vicedbg/            VICE binary-monitor client + live-RAM diff probe
 tools/checkshot.py        screenshot content assertion (coverage + colour count)
 tools/u64.py              Ultimate REST + FTP client (stdlib only)
 tools/u64config.py        applies the turbo settings the engine requires
-tools/u64push.py          push + run on hardware, REU preload, fps measurement
+tools/wad2reu.py          DOOM1.WAD -> build/assets.reu, with validator + map PNG
+tools/u64push.py          push + run on hardware, REU upload, map + fps checks
 tools/u64shot.py          DMA the chunky framebuffer off hardware, render a PNG
 tools/reubench.py         run the REU benchmark and print the throughput table
 tools/setup-dev-env.sh    VICE + C64 ROM setup
@@ -102,7 +112,8 @@ mainLoop:
 ```sh
 sh tools/setup-dev-env.sh          # VICE + C64 ROMs
 make                               # -> build/doom.prg   (needs KickAssembler)
-make run                           # VICE with a 16 MB REU
+make assets                        # DOOM1.WAD -> build/assets.reu (+ testmap.reu)
+make run                           # VICE with the map image attached
 make check VICEWRAP='xvfb-run -a'  # THE regression gate: build + shot + debug
 make shot  VICEWRAP='xvfb-run -a'  # headless run, screenshot to build/shot.png
 make debug VICEWRAP='xvfb-run -a'  # live-RAM vs PRG diff
@@ -114,6 +125,7 @@ make debug VICEWRAP='xvfb-run -a'  # live-RAM vs PRG diff
 make u64-config                    # apply the required turbo settings
 make run-u64                       # push over the network and run
 make u64-fps                       # ... and measure the real frame rate
+make u64-map                       # ... and verify the map image reached REU RAM
 python3 tools/u64shot.py $HOST out.png --cam 512,512,0 --scale 2
 ```
 
@@ -142,6 +154,7 @@ catches what the others cannot:
 | `tools/checkshot.py` on `build/shot.png` | the viewport is not black and not a flat fill — i.e. the engine reached a *frame*, not merely the end of a frame loop |
 | `tools/vicedbg/probe.py diff` | **zero** unexpected differences between live RAM and the loaded PRG — a stray pointer is caught on the frame it happens, not three frames later when the screen has already gone black |
 | `reuOK == 1` in the same pass | the emulator actually attached an REU. A missing REU is invisible from inside the C64 — `$DFxx` reads back `$00` and every DMA silently succeeds while moving nothing — and it stayed missing for the whole life of the project because `-default` sat after `-reu` on VICE's command line |
+| `mapOK == 1`, and every resident block compared against `build/assets.reu` | the map image reached REU RAM *and* the right bytes landed at the right addresses. Three separate silent failures have already been found on this path, each one letting every read "succeed" and return the wrong thing — `docs/reu-format.md` §9 lists them |
 
 `make shot` deliberately ignores VICE's exit status: `-limitcycles` always ends
 the run non-zero, so the artifact is the evidence, not the status code. Its
