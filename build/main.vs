@@ -1,4 +1,3 @@
-al C:96b0 .rowHi
 al C:9c07 .negB
 al C:9a41 .pageDone
 al C:9bf9 .negA
@@ -6,7 +5,6 @@ al C:acd .wX1Hi
 al C:851 .mainLoop
 al C:a74 .secCByte
 al C:abd .wX1Lo
-al C:9600 .rowLo
 al C:863 .clearHudRows
 al C:810 .main
 al C:9900 .convert
@@ -36,6 +34,7 @@ al C:ce62 .done__1
 al C:ce84 .done__2
 al C:cea0 .done__3
 al C:9f41 .projRow
+al C:9740 .tablesEnd
 al C:a77 .secWFirst
 al C:9d1a .spanCells
 al C:ce2c .colAdvance
@@ -51,13 +50,13 @@ al C:a7d .wX0Lo
 al C:ca00 .rowCellLo
 al C:9b60 .mul8
 al C:9d80 .useRY0
-al C:9760 .xOfsLo
+al C:9600 .xOfsLo
 al C:9b85 .umul16
 al C:9d89 .useRY1
 al C:80b .upstartEnd
 al C:9c4a .udiv
 al C:9500 .colTab
-al C:9800 .xOfsHi
+al C:96a0 .xOfsHi
 al C:9a0 .moveDone
 al C:cd80 .colLoopHead
 al C:afd .wBack

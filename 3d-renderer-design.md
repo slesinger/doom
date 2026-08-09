@@ -63,9 +63,9 @@ Rasterizer consequence, as implemented in `spanFill` (`src/math.asm`): spans are
 crossing to the next cell row — and because $500 has a zero low byte, that crossing
 only touches the pointer's high byte. Fills are structured head-pixels /
 whole-cells-of-8 / tail-pixels. Pixel address is `rowCellLo/Hi[y>>3] + xOfsLo/Hi[x]`
-plus an in-cell `(y&7)*4` offset; the scanline-major `rowLo`/`rowHi` tables in
-`chunky2mc.asm` are a leftover from this document's original horizontal-span
-assumption and are unused. No frame clear needed if the scene always overdraws
+plus an in-cell `(y&7)*4` offset. (The scanline-major `rowLo`/`rowHi` tables this
+document originally specified assumed horizontal spans, were never read, and have
+been deleted from `chunky2mc.asm`.) No frame clear needed if the scene overdraws
 (floor + ceiling/sky polygons) — the implemented renderer guarantees this, saving
 ~170k cycles a frame. See `pipeline.md` §9.3.
 
@@ -94,8 +94,9 @@ Memory map (converter's view — the full map is in `pipeline.md` §12.2, and
 $0400-$07E7  COLBUF (color-RAM staging, 880 B + 120 B HUD rows)
 $1000-$7DFF  MATRIX (28160 B, 110 pages)
 $8000-$83FF  SCREEN0            (VIC bank 2)
-$8400-$989F  tables (dither 4KB + attr 512B + row/column helpers)
-$9900-$9B5F  converter code
+$8400-$973F  tables (dither 4KB + attr 512B + column helpers)
+$9740-$98FF  free (448 B, TABLES_FREE)
+$9900-$9B4A  converter code
 $A000-$BF3F  BITMAP0            (VIC bank 2)
 $C000-$C3FF  SCREEN1            (VIC bank 3)
 $E000-$FF3F  BITMAP1 (under Kernal ROM — write-only, fine)
@@ -138,17 +139,18 @@ What the source contains, in order:
 |---|---|
 | `ditherTabs` | 16 x 256 B — intensity + Bayer position -> pre-shifted 2-bit code |
 | `scrTab`, `colTab` | ramp id -> screen-RAM byte (`c1<<4\|c2`) and color-RAM byte (`c3`) |
-| `rowLo`/`rowHi`, `xOfsLo`/`xOfsHi` | MATRIX addressing helpers |
+| `xOfsLo`/`xOfsHi` | MATRIX column-offset helpers (the `rowCell` pair in `math.asm` supplies the row half) |
 | `convert` | the 880-cell packing loop, ~411 cy/cell |
 | `patchMatrixPage`, `bumpBmpPage`, `initFrame` | self-modifying-code operand patching |
 | `flip` | vblank wait, `$DD00`/`$D018` bank swap, COLBUF -> `$D800` burst |
 
 Three notes on reading it:
 
-- **`rowLo`/`rowHi` are dead** (352 bytes at `$9600`). They are the
-  scanline-major pixel-address helpers from this document's original design;
-  the rasterizer settled on the cell-major `rowCell` pair in `src/math.asm`
-  instead. They are the obvious place to reclaim space.
+- **`rowLo`/`rowHi` are gone.** The scanline-major pixel-address helpers from
+  this document's original design were never read — the rasterizer settled on
+  the cell-major `rowCell` pair in `src/math.asm` — so their 352 bytes have been
+  reclaimed. `$9740-$98FF` (448 B, `TABLES_FREE` in `src/defs.asm`) is the free
+  space that leaves at the tail of the segment.
 - **All `.const`s now live in `src/defs.asm`**, so the memory map is declared
   once for every module.
 - **`flip` preserves the CIA2 upper bits** by reading `$DD00`, masking and

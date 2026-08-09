@@ -46,12 +46,14 @@ ditherTabs:                 // 16 x 256B: [px 0-3][bayer row 0-3]
 scrTab: .fill 256, ramps.get(i>>4).get(0)*16 + ramps.get(i>>4).get(1)
 colTab: .fill 256, ramps.get(i>>4).get(2)
 
-// rasterizer helpers: pixel(x,y) = rowLo/Hi[y] + xOfsLo/Hi[x]
+// rasterizer helpers: pixel(x,y) = rowCell[y>>3] + xOfsLo/Hi[x] + (y&7)*4
 // (stepping x by 1: +1, except every 4th pixel: +29)
-rowLo:  .fill 176, <[MATRIX + floor(i/8)*1280 + mod(i,8)*4]
-rowHi:  .fill 176, >[MATRIX + floor(i/8)*1280 + mod(i,8)*4]
+// The scanline-major rowLo/rowHi pair from 3d-renderer-design.md lived here
+// and was never read — spanFill uses the cell-major rowCell pair in math.asm.
+// Reclaimed; the 352 B it held are now part of TABLES_FREE (see defs.asm).
 xOfsLo: .fill 160, <[floor(i/4)*32 + mod(i,4)]
 xOfsHi: .fill 160, >[floor(i/4)*32 + mod(i,4)]
+tablesEnd:
 
 //------------------------------------------------------------
 // Converter: ~415 cycles/cell, ~380k cycles total

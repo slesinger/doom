@@ -10,7 +10,8 @@
 //    $0810-$0FFF  main / input / test map
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
-//    $8400-$98FF  converter tables
+//    $8400-$973F  converter tables
+//    $9740-$98FF  free (448 B, TABLES_FREE)
 //    $9900-$9FFF  converter + math/span code
 //    $A000-$BF3F  BITMAP0            (VIC bank 2)
 //    $C000-$C3FF  SCREEN1            (VIC bank 3)
@@ -96,6 +97,7 @@ clearHudRows:
 
 #import "render/chunky2mc.asm"
 .errorif * > MATHCODE, "converter code overflows into math code"
+.errorif tablesEnd > TABLES_FREE, "converter tables overflow into TABLES_FREE"
 
 #import "math.asm"
 .errorif * > BITMAP0, "math code overflows into BITMAP0"

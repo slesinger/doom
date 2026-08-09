@@ -15,6 +15,14 @@
 .const COLBUF  = $0400
 
 .const CONVERTER_CODE = $9900
+
+// Free RAM at the tail of the TABLES segment: 448 B, $9740-$98FF. 352 of them
+// came from deleting the dead scanline-major rowLo/rowHi pair (the rasterizer
+// uses the cell-major rowCell tables in math.asm); the rest was always slack.
+// Unclaimed — the first candidate for the E1M1 resident blocks. main.asm's
+// .errorif keeps the converter tables from growing back into it.
+.const TABLES_FREE     = $9740
+.const TABLES_FREE_END = $98ff
 .const MATHCODE       = $9b60      // follows converter code
 .const MATHTAB        = $c400
 .const WALLSCODE      = $ca30

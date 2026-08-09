@@ -6,13 +6,17 @@
 >
 > For the pipeline **as actually implemented** — with real formulas, real cycle
 > counts and a frame traced end to end — see **[`pipeline.md`](pipeline.md)**.
-> For what is built versus broken, see
+> For what is built and what is next, see
 > [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
 >
-> Milestone 1 implements a subset of what follows: portal traversal, per-column
+> What exists today renders a visible frame from a 3-sector test map: per-column
 > clip windows, flat-shaded walls/floors/ceilings and the multicolor converter.
 > It does **not** yet implement REU streaming, PVS visibility, textures, sprites,
-> audio or quality scaling. Where the implementation deliberately diverges from
+> audio or quality scaling. One decision below has already been overtaken by the
+> code: traversal. This document's portal-graph-of-convex-sectors model is what
+> `src/render/walls.asm` implements, but it cannot express real Doom geometry, so
+> Milestone 1 replaces it with a **front-to-back BSP walk** over the WAD's own
+> `NODES` — see `IMPLEMENTATION_PLAN.md` §3 for the reasoning. Where the implementation deliberately diverges from
 > this document — notably in the numeric formats, see the *Implementation note*
 > in the Preface below — `pipeline.md` §2 and §14 record the difference and the
 > reason.

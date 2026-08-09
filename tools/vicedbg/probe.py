@@ -133,6 +133,24 @@ def cmd_diff(m, prg_path, settle):
     return 1
 
 
+def connect(port, wait=30.0):
+    """Wait for the monitor socket to come up, then connect.
+
+    x64sc opens the binary-monitor port some way into its startup, and how long
+    that takes varies with the machine, whether xvfb is in the way, and whether
+    the ROMs load on the first try. A fixed `sleep` in the Makefile therefore
+    either raced (ConnectionRefused) or wasted seconds on every run.
+    """
+    deadline = time.time() + wait
+    while True:
+        try:
+            return Mon(port=port)
+        except (ConnectionRefusedError, OSError):
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("dump", "diff"):
         print(__doc__)
@@ -142,7 +160,11 @@ def main():
     port = int(sys.argv[3]) if len(sys.argv) > 3 else 6510
     settle = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
 
-    m = Mon(port=port)
+    try:
+        m = connect(port)
+    except OSError as e:
+        print(f"probe: no VICE binary monitor on port {port} ({e})")
+        return 2
     try:
         return cmd_dump(m, prg, settle) if action == "dump" else cmd_diff(m, prg, settle)
     finally:

@@ -487,8 +487,8 @@ not apply yet: there is one tier, and everything is in it.
 | `rowCellLo` / `rowCellHi` | 44 B | `$CA00` | §3.3 — MATRIX cell-row bases |
 | `ditherTabs` | 4096 B | `$8400` | §3.4 `light_to_pattern` — 16 pre-shifted Bayer tables |
 | `scrTab` / `colTab` | 512 B | `$9400` | §3.5 multicolor packing LUTs |
-| `xOfsLo` / `xOfsHi` | 320 B | `$9760` | §3.3 — MATRIX column offsets |
-| `rowLo` / `rowHi` | 352 B | `$9600` | **dead** — scanline-major helpers, unused |
+| `xOfsLo` / `xOfsHi` | 320 B | `$9600` | §3.3 — MATRIX column offsets |
+| *(free)* | 448 B | `$9740` | `TABLES_FREE` — reclaimed from the dead `rowLo`/`rowHi` pair plus segment slack |
 
 Notable gaps against §3: there is **no reciprocal LUT** (§3.2) — projection
 divides at runtime via `udiv`, ~880 cycles a time — **no column ray table**

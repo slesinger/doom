@@ -19,11 +19,16 @@ deliberately differs from the target architecture in the design documents, the
 difference is called out in a *Deviation* note. Sections marked **(planned)**
 describe stages that do not exist yet.
 
-> **Status caveat.** Milestone 1 is written but does not yet run to a visible
-> frame — see [§13](#13-known-defects-and-unenforced-invariants) and
-> `IMPLEMENTATION_PLAN.md`. The math in this document has been hand-traced and
-> agrees with values captured from the live machine (§11), but the cycle counts
-> in §12 are static instruction counts, not measurements.
+> **Status caveat.** The test-map renderer runs to a visible frame and
+> `make check` is green — see [§13](#13-known-defects-and-unenforced-invariants)
+> for the defects that were fixed to get there and the invariants that are still
+> unenforced. What this document describes is the *portal* renderer; Milestone 1
+> replaces portal traversal with a BSP walk over real E1M1 geometry
+> (`IMPLEMENTATION_PLAN.md` §3), which changes §7 and §9.1 and leaves §8, §10
+> and §12 intact. The math here has been hand-traced and agrees with values
+> captured from the live machine (§11), but the cycle counts in §12 are static
+> instruction counts, not measurements — **no frame has yet been timed on real
+> hardware.**
 
 ---
 
@@ -227,9 +232,10 @@ so "held" is the only state that matters and the matrix read *is* the debounce.
 > (`input.asm:60-73`). But the camera basis is `forward = (cos θ, sin θ)` with
 > θ increasing counter-clockwise, and `rx` is the *rightward* axis, so
 > **increasing `camA` turns left**. The two keys therefore appear to be
-> swapped. This has not been confirmed on hardware because the build does not
-> yet reach a visible frame; verify before "fixing", since flipping the sign of
-> `rx` in `transformPoint` would also resolve it in the opposite direction.
+> swapped. Still unconfirmed — the build renders now, so this is *testable*: hold
+> `A` in `make run` and see which way the wall moves. Verify before "fixing",
+> since flipping the sign of `rx` in `transformPoint` would also resolve it in
+> the opposite direction.
 
 ---
 
@@ -1234,21 +1240,24 @@ spans until the column is finally closed — `algorithm.md`'s
 ```
 $0002-$008F  zero page: math / renderer / converter / camera / span / accumulators
 $0100-$01FF  6510 stack
-$0200-$029F  colTop[160]      renderer clip window, first open row
-$0300-$039F  colBot[160]      renderer clip window, first closed row
-$03A0-$03DF  portal stack (pStkSec/XL/XR, 12 each) + visitedSec
+$0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
+$0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0FFF  main + input + testmap code and data
+$0810-$0B1C  main + input + testmap code and data
+$0B20-$0B5F  portal stack (pStkSec/XL/XR, 12 each) + visitedSec
+$0B60-$0FFF  free             1184 B
 $1000-$7DFF  MATRIX           28160 B = 110 pages, cell-major chunky buffer
 $8000-$83FF  SCREEN0          (VIC bank 2)
-$8400-$989F  converter tables dither 4 KB, scrTab/colTab 512 B, row/xOfs 672 B
-$9900-$9B5F  converter code
-$9B60-$9D5F  math + spanFill code
-$9D60-$9FFF  walls helper routines
+$8400-$973F  converter tables dither 4 KB, scrTab/colTab 512 B, xOfs 320 B
+$9740-$98FF  free             448 B (TABLES_FREE)
+$9900-$9B4A  converter code
+$9B60-$9D6B  math + spanFill code
+$9D80-$9F8D  walls helper routines
 $A000-$BF3F  BITMAP0          (VIC bank 2)
 $C000-$C3FF  SCREEN1          (VIC bank 3)
 $C400-$CA2B  math tables      sqr 1024 B, sin 512 B, rowCell 44 B
-$CA30-$CFFF  walls renderer code
+$CA30-$CED3  walls renderer code
+$CED4-$CFFF  free             300 B
 $E000-$FF3F  BITMAP1          (VIC bank 3, under Kernal ROM -- write-only)
 ```
 
@@ -1259,10 +1268,14 @@ Two things worth knowing about this map:
   will silently overrun into executable code unless `WALLSCODE` moves first.
   `main.asm` carries `.errorif` guards for the other segment boundaries; this
   one has none.
-- **`rowLo`/`rowHi` (352 bytes at `$9600`) are dead.** They were the scanline-
-  major addressing helpers from `3d-renderer-design.md`; `spanFill` uses the
-  cell-major `rowCell` pair instead. They are the obvious place to reclaim
-  space from.
+- **`$9740-$98FF` (448 B) is free and named `TABLES_FREE`.** 352 of it was the
+  dead scanline-major `rowLo`/`rowHi` pair from `3d-renderer-design.md`, deleted
+  now that `spanFill` is confirmed to use the cell-major `rowCell` pair instead;
+  `main.asm` has an `.errorif` keeping the dither tables from growing back into
+  it. With `$0B60-$0FFF` (1184 B) and `$CED4-$CFFF` (300 B) that is under 2 KB
+  of contiguous free RAM in the whole machine — which is why
+  `IMPLEMENTATION_PLAN.md` §4 puts E1M1's node table in the 4 KB of RAM hiding
+  under the I/O space at `$D000` and streams the rest from the REU.
 
 ### 12.3 Frame pacing
 
@@ -1281,51 +1294,67 @@ overrun, not after. That mechanism does not exist yet.
 
 ## 13. Known defects and unenforced invariants
 
-Milestone 1 does not currently reach a visible frame. `IMPLEMENTATION_PLAN.md`
-has the full diagnosis; what follows is the *pipeline* view — which stage's
-contract is being violated, and what each stage assumes but does not check.
+The renderer reaches a visible frame and `make check` is green. What follows is
+the *pipeline* view of how it got there — which stage guarantees what, which
+guarantees are now checked at the point of use, and which are still resting on
+an argument rather than on an instruction. The forensics live in
+[`debug-notes/`](debug-notes/00-index.md).
 
-### 13.1 The failure
+### 13.1 The failure that is fixed
 
-The program hangs with a CPU JAM at `$CDD7` — the second operand byte of
-`sta colTop,x`, reached because execution landed mid-instruction. `spanFill` is
+The program used to hang with a CPU JAM at `$CDD7` — the second operand byte of
+`sta colTop,x`, reached because execution landed mid-instruction. `spanFill` was
 writing outside MATRIX: 317 corrupted bytes, all holding `$45` or `$02`
 (sector A's floor and ceiling bytes), in 29-byte runs at stride 4, repeating
-every `$500`. That signature is unmistakably `spanFill`'s unrolled cell loop
-plus `spanNextCell`.
+every `$500` — unmistakably `spanFill`'s unrolled cell loop plus
+`spanNextCell`. The three fixes in §13.5 closed it, and a separate bug (an
+init loop whose `BPL` never ran, so `colTop`/`colBot` started as garbage) was
+what kept the screen black afterwards.
+
+The lesson worth keeping: **every one of these presented as a dead or black
+machine, not as a glitchy frame**, because the corruption fed back into the
+geometry that produced it. That is what `make check` exists to catch on the
+frame it happens.
 
 ### 13.2 The bounds contract, stage by stage
 
-`spanFill` computes `zSPtr = xOfs[zSX] + rowCell[zSY0>>3]` and **checks
-neither index**. `xOfs` has 160 entries; `rowCell` has 22. The pipeline is
-supposed to guarantee both are in range:
+`spanFill` computes `zSPtr = xOfs[zSX] + rowCell[zSY0>>3]`. `xOfs` has 160
+entries; `rowCell` has 22. This is the invariant list — and it stays the
+checklist for the BSP renderer, which changes who *establishes* each row but not
+what has to hold:
 
-| Invariant | Established by | Enforced? |
+| Invariant | Established by | Enforced at use? |
 |---|---|---|
-| `zSX ∈ [0, 159]` | `zC0`/`zC1` clamped to `[xL, xR] ⊆ [0,159]` (§8.5) | ✗ not re-checked in `spanFill` |
-| `zSY0 ∈ [0, 175]` | `clampAcc` bounds every row into `[colTop, colBot]` | ✗ not re-checked in `spanFill` |
-| `colTop[x] ≤ colBot[x] ≤ 176` | window only ever narrows (§9.1) | ✗ |
-| `zC0 ≤ zC1` | final `cmp zC0 / bcs` guard (§8.5) | ✓ but see below |
+| `zSX ∈ [0, 159]` | `zC0`/`zC1` clamped to `[xL, xR] ⊆ [0,159]` (§8.5) | ✓ `cpx #160 / bcs spanEnd` (`src/math.asm:267`) |
+| `zSY0 ∈ [0, 175]` | `clampAcc` bounds every row into `[colTop, colBot]` | ✓ `zSY0>>3` checked against `#22` (`src/math.asm:274`) |
+| `zSY1 ≤ 176` | same | ✓ clamped on entry (`src/math.asm:254`) |
+| `colTop[x] ≤ colBot[x] ≤ 176` | initialised per frame, window only ever narrows (§9.1) | ✗ argument only |
+| `zC0 ≤ zC1` | final `cmp zC0 / bcs` guard (§8.5) | ✓ |
 
-Once *any* of these is violated by one stray write, the corruption is
-self-amplifying: stray writes land in the map wall table and in `checkSector`'s
-own code, which produces worse geometry, which produces a worse index. That is
-why it presents as a dead machine rather than a glitchy frame.
+The two index checks cost a handful of cycles on a path that already does a
+16-bit add, and they convert the entire class of bug above from a memory stomp
+into a dropped span. **Keep them.** The row that is still unenforced —
+`colTop ≤ colBot` — is the one the BSP rewrite touches directly
+(`IMPLEMENTATION_PLAN.md` §5, Phase 4.2 replaces the narrowing-window argument
+with a per-column closed test), so it is worth re-deriving rather than
+inheriting.
 
-### 13.3 Fragile-but-currently-correct: the `zC0` clamp
+### 13.3 The `zC0` clamp: now explicit
 
-`zC0` is clamped *up* to `zXL` but never *down* to `zXR`, so a wall with
-`sx0 ∈ [160, 255]` stores an out-of-range `zC0`. It is caught only by the
-subsequent `cmp zC0 / bcs !cols` — which does work, because `zC1 ≤ 159 < zC0`
-always fails the unsigned compare.
+`zC0` used to be clamped *up* to `zXL` but never *down* to `zXR`, so a wall with
+`sx0 ∈ [160, 255]` stored an out-of-range `zC0`, caught only by the subsequent
+`cmp zC0 / bcs !cols` — which did work (`zC1 ≤ 159 < zC0` always fails the
+unsigned compare), but meant a single-instruction change anywhere in that guard
+would turn a rejected wall into a 160-column overrun.
 
 **§11.2 shows this firing on real data**: wall 5 at spawn produces
-`c0 = 160, c1 = 159` and is rejected solely by that final guard. The rejection
-is correct, but it means a single-instruction change anywhere in that guard
-turns a rejected wall into a 160-column overrun. It should be clamped
-explicitly.
+`c0 = 160, c1 = 159`. It is now clamped down to `zXR` explicitly
+(`src/render/walls.asm:325`), so the final guard is a backstop rather than the
+only line of defence.
 
-### 13.4 Aliasing that turns a bad index into a dead machine
+### 13.4 Aliasing that turned a bad index into a dead machine
+
+The clip windows used to share page `$0300` with the portal stack:
 
 ```
 colBot     = $0300      ; indexed 0..159 -> $0300-$039F
@@ -1335,28 +1364,39 @@ pStkXR     = $03C0
 visitedSec = $03D0
 ```
 
-`sta colBot,x` with `x ≥ 160` writes straight into the portal traversal stack —
-converting an off-by-a-few column index into corrupted sector IDs and window
-bounds, which then feed the geometry that produced the bad index in the first
-place. Giving `colTop`/`colBot` private pages breaks that feedback loop.
+`sta colBot,x` with `x ≥ 160` wrote straight into the traversal stack, turning
+an off-by-a-few column index into corrupted sector IDs and window bounds, which
+then fed the geometry that produced the bad index. `colTop`/`colBot` now own a
+private page each and the stack lives at `$0B20` (§12.2), which breaks the
+feedback loop structurally instead of relying on the bounds checks alone.
 
-### 13.5 The fixes, in dependency order
+**This is a layout rule, not a one-off fix**: anything the renderer indexes with
+a column number gets a page to itself. The BSP node/side stack of Phase 4 is the
+next thing to place, and it must not land inside `$0200-$03FF`.
 
-1. **Bound both lookups in `spanFill`** (`src/math.asm:253`): reject
-   `zSX ≥ 160` and `zSY0 ≥ 176` before the table reads. A handful of cycles on
-   a path that already does a 16-bit add, and a memory stomp becomes a dropped
-   span.
-2. **Clamp `zC0` down to `zXR`** in `doWall` (`src/render/walls.asm:309`).
-3. **Move the portal stack and `visitedSec`** out of page `$0300` into the free
-   space below MATRIX (`$0B20-$0FFF`, already covered by `main.asm`'s
-   `.errorif * > MATRIX` guard).
-4. Rebuild and re-run `make debug` — a healthy run reports **zero** unexpected
-   differences between live RAM and the loaded PRG.
+### 13.5 What checks this, and what it cannot see
 
-`make debug` (`tools/vicedbg/probe.py`) is the regression test for this entire
-class of bug, and it is a better one than any screenshot: it catches a stray
-pointer on the frame it happens, not three frames later when the display has
-already gone black.
+```sh
+make check VICEWRAP='xvfb-run -a'
+```
+
+1. **Build** — the `.errorif` guards in `main.asm` catch a segment growing into
+   its neighbour. Note the gap the guards *don't* cover: the math tables end at
+   `$CA2C` and `WALLSCODE` begins at `$CA30`, four bytes apart (§12.2).
+2. **`tools/checkshot.py build/shot.png`** — the 320×176 viewport must be under
+   70% black and contain at least 3 distinct colours. Catches the black-screen
+   class, and the flat-fill class in the other direction. The known-good
+   test-map frame measures 64% coverage in 4 colours.
+3. **`tools/vicedbg/probe.py diff`** — zero bytes differing from the loaded PRG
+   outside the regions the engine is allowed to write. Catches a stray pointer
+   on the frame it happens, not three frames later when the display has already
+   gone black.
+
+The two runtime checks are blind in complementary ways, which is why both are in
+the gate: `probe.py` cannot see a correct-but-black frame (nothing was written
+out of bounds), and `checkshot.py` cannot see a stray write that has not
+corrupted anything visible *yet*. Neither can see wrong-but-plausible geometry —
+that still needs an eye on `build/shot.png`.
 
 ---
 
@@ -1399,9 +1439,11 @@ they are choices rather than omissions:
 
 The next milestones, in dependency order:
 
-1. Fix §13 — get to a visible frame, with `make debug` clean.
-2. `tools/wad2reu.py` → REU DMA streaming → real WAD geometry replacing
-   `testmap.asm`.
+1. ✅ Done: §13's defects are fixed, `make check` is green.
+2. **Milestone 1** (`IMPLEMENTATION_PLAN.md`): `tools/u64push.py` and an REU
+   throughput measurement on real hardware → `src/reu.asm` → `tools/wad2reu.py`
+   → a **BSP walk over real E1M1 geometry** replacing both `testmap.asm` and the
+   portal traversal of §7.
 3. Textured walls: adds a `u` coordinate through the near-plane clip (§8.2),
    per-column `u/v` steps from the depth-bucket LUTs of
    `data_structures.md` §3.6, and turns `spanFill` into a texture-sampling
