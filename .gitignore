@@ -13,3 +13,5 @@ tools/kickass/
 
 __pycache__/
 *.pyc
+src/.source.txt
+src/render/.source.txt
