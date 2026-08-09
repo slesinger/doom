@@ -130,16 +130,60 @@ Two more things had to be fixed before any of the above could even be
 self-modifying code regions — i.e. it's confirmed the renderer actually ran a
 full frame, not just that nothing crashed.
 
-## Known issues in the rendered frame
+## Known issue: most of the frame is undrawn (separate bug, not yet fixed)
 
-`build/shot.png` shows a dithered ceiling band and vertical wall columns with
-a gap (the portal opening), matching the expected geometry — but only for
-roughly the left half/two-thirds of the screen; the right portion of the frame
-is black instead of showing more wall/floor, and there is a thin stray
-vertical line further right. Floor is also not rendering with the expected
-moss color. Not yet root-caused — worth `vicedbg`-tracing per-column
-`colTop`/`colBot` state after a frame the same way the original JAM was
-diagnosed, before touching movement/input.
+`build/shot.png` shows a clean wall band on the left of the screen; the rest
+is black instead of the portal opening and the second solid wall segment.
+This is a **different bug from the JAM** — traced partway, not fixed.
+
+Hand-computing the expected screen columns for the three front-facing walls
+at the spawn position (camera at (512,512), facing east into sector A) gives:
+
+    wall 2 (solid)      sx  0 ..  60
+    wall 3 (portal->B)  sx 60 .. 100
+    wall 4 (solid)      sx 100 .. 160
+
+Instrumenting `doWall` with an exec breakpoint at the `zC0` store (`$cc45` in
+the current build; use `tools/vicedbg` + a checkpoint, see below) confirms
+each wall's *own* projected screen range matches this almost exactly (0/61,
+61/99, 99/160) — the trig, projection and division math are computing the
+right numbers.
+
+But dumping `colTop`/`colBot` for all 160 columns after a frame shows wall 2
+does **not** cleanly close columns 0-60 to its solid-wall value: a handful of
+columns inside its own range (12-15, 19, and everything from ~52 on) are
+`(0, 0)` instead of `(176, 0)`. `(0, 0)` is not the frame-start state (that's
+`(0, 176)`) and not the solid-close state (`(176, 0)`) — it's the value the
+*portal* narrowing path (`clampAcc` into `[zBT, zBB]`) writes when the
+opening it computes has collapsed to zero height. Wall 2's own back pointer
+is solid (`wBack = -1`), so this path should be structurally unreachable for
+it. Column 61+ (past wall 2's own `zC1 = 60`) showing the same `(0, 0)`
+before wall 3 has even run rules out "wall 3 just computes a bad range" as
+the sole explanation — something is making wall 2's column loop behave as if
+some columns beyond its own bound are part of a degenerate portal, or is
+touching columns past where it should stop.
+
+Not yet isolated further: an exec breakpoint placed at the portal-branch
+entry (`$cde6`, i.e. `!portal:` in `walls.asm`) to catch this live never
+fired in a few minutes of `-warp` runtime, which is itself confusing given
+wall 3 *is* a real portal and should hit that branch constantly — worth
+double-checking the breakpoint/`-warp` interaction (or the target address)
+before trusting that negative result. This needs a fresh, dedicated pass:
+probably stepping one full column-loop iteration under the monitor rather
+than free-running with exec checkpoints, to see which branch each column
+actually takes and why the portal-narrow path executes for a wall whose
+`zBack` should read `$ff` throughout.
+
+Useful commands for that pass:
+
+    x64sc -reu -reusize 16384 -default +confirmonexit -autostartprgmode 1 \
+        +sound -warp -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6510 \
+        -autostart build/doom.prg &
+    python3 tools/vicedbg/probe.py dump build/doom.prg   # colTop/colBot occupancy
+
+(`Mon.quit()` in `vicemon.py` sends the VICE *quit emulator* command, not
+"close this monitor connection" — close the socket directly instead, or the
+next probe call will find nothing listening.)
 
 ## Next steps
 
