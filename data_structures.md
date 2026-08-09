@@ -1,5 +1,14 @@
 # Doom C64U Data Structures
 
+> **What this document is.** The *target* data formats: the compiled map
+> container, the full LUT bank taxonomy, sprite assets, and the REU/RAM
+> residency model. It describes the engine once WAD content and streaming exist.
+>
+> Milestone 1 ships a hand-built test map with no container, no REU and no
+> sprites. **§8 below** records what is actually in memory today and how it maps
+> onto the structures here; **[`pipeline.md`](pipeline.md)** §2 gives the numeric
+> formats the code really uses, and §12.2 the authoritative memory map.
+
 This document defines how map content, lookup tables, and sprite/billboard assets are represented for a C64 Ultimate target (6510-compatible CPU, up to 64 MHz, 16 MB REU, 64 KB main RAM).
 
 Design goals:
@@ -418,4 +427,113 @@ The data compiler should emit:
 - `validation_report.txt` with cap checks (`MAX_ACTIVE_SECTORS`, `MAX_ACTIVE_EDGES`, sprite cap, worst-case DMA volume).
 
 The compiler should emit diagnostics if worst-case estimates exceed frame budgets under configured quality tiers.
+
+## 8. As Implemented (Milestone 1)
+
+Everything above is offline-compiled and REU-resident by design. Milestone 1 has
+neither a compiler nor REU access: the map is assembled directly into the PRG by
+`src/testmap.asm`, and every table is built at assembly time by KickAssembler
+expressions. The SoA discipline of §2.3 is honoured throughout; the container,
+sectioning, streaming and versioning of §2.1-2.2 are not present at all.
+
+### 8.1 Map data — `src/testmap.asm`
+
+Three convex sectors, sixteen walls, two portals, authored as KickAssembler
+lists and emitted as parallel byte arrays. `SectorWindow` and `EdgeWindow`
+(§2.3) collapse to these:
+
+```
+sector SoA (NUMSEC = 3)          wall SoA (NUMWALLS = 16)
+  secFloorLo/Hi   int16            wX0Lo/Hi, wY0Lo/Hi   int16  start vertex
+  secCeilLo/Hi    int16            wX1Lo/Hi, wY1Lo/Hi   int16  end vertex
+  secFByte        u8  ramp|int     wBack                u8     $FF = solid,
+  secCByte        u8  ramp|int                                 else sector id
+  secWFirst       u8                wRamp               u8     ramp << 4
+  secWCount       u8
+```
+
+Differences from §2.3 worth noting:
+
+- **Coordinates are 16-bit integers, not 16.16.** See `pipeline.md` §2.
+- **A wall carries its own endpoints**, rather than indexing a shared vertex
+  table. Every vertex in the test map is duplicated across two walls. A vertex
+  table would halve the storage *and* let `transformPoint` be cached per vertex
+  — currently the single most expensive step per wall (`pipeline.md` §8.1).
+- **`wBack` doubles as the portal link and the solid flag** (`$FF`), replacing
+  both `back_sector` and the portal `flags` byte. There is no `PortalEntry`
+  structure and no `portal_start`/`portal_count` span: portals are discovered by
+  walking the sector's walls.
+- **No `preclip_class`, no supersectors, no PVS.** Rejection is entirely
+  runtime: near plane, then backface, then window clamp.
+- **Materials are a single byte per surface** (`ramp<<4 | intensity`) instead of
+  `tex_upper`/`tex_mid`/`tex_lower` plus `light_band` and `material_group`. The
+  ramp/intensity encoding of `3d-renderer-design.md` makes shading a bitwise
+  `ora` — see `pipeline.md` §8.6.
+
+Sector convexity with clockwise winding is an unchecked *invariant* of this
+format, and it is load-bearing: it is what makes containment testing an
+early-exit sign test, removes wall sorting entirely, and guarantees one
+top/bottom line pair per wall.
+
+### 8.2 Lookup tables — assembled, all RAM-resident
+
+The §3 bank taxonomy (`LUT_HOT_RAM` / `LUT_WARM_RAM` / `LUT_REU_STREAM`) does
+not apply yet: there is one tier, and everything is in it.
+
+| Table | Size | Where | §3 counterpart |
+|---|---:|---|---|
+| `sqrLo` / `sqrHi` | 1024 B | `$C400` | *(new)* quarter-square multiply, `pipeline.md` §4.4 |
+| `sinLo` / `sinHi` | 512 B | `$C800` | §3.2 Trig LUT — 256 steps, signed 2.14 |
+| `rowCellLo` / `rowCellHi` | 44 B | `$CA00` | §3.3 — MATRIX cell-row bases |
+| `ditherTabs` | 4096 B | `$8400` | §3.4 `light_to_pattern` — 16 pre-shifted Bayer tables |
+| `scrTab` / `colTab` | 512 B | `$9400` | §3.5 multicolor packing LUTs |
+| `xOfsLo` / `xOfsHi` | 320 B | `$9760` | §3.3 — MATRIX column offsets |
+| `rowLo` / `rowHi` | 352 B | `$9600` | **dead** — scanline-major helpers, unused |
+
+Notable gaps against §3: there is **no reciprocal LUT** (§3.2) — projection
+divides at runtime via `udiv`, ~880 cycles a time — **no column ray table**
+(§3.3, `ColumnRayLut`), and **no texture step LUTs** (§3.6), because there are
+no textures.
+
+The trig table is 256 entries where §3.2 specifies 2048; that follows from the
+8-bit angle rather than from any storage pressure, and `cos` is read from it at
+a +64 offset rather than stored separately.
+
+### 8.3 Frame working sets — `src/defs.asm`
+
+§5.1's `FrameVisibilityState` exists, split across two pages and zero page:
+
+```
+colTop[160]   $0200    first open row per column
+colBot[160]   $0300    first closed row below
+pStkSec[12]   $03A0    portal traversal stack (sector, xL, xR as three arrays)
+pStkXL[12]    $03B0
+pStkXR[12]    $03C0
+visitedSec[]  $03D0    one byte per sector, cleared each frame
+accTop..accBB  $68     four 24-bit line accumulators (16.8)
+stepTop..stepBB $74    four 16-bit line steps (8.8)
+```
+
+Two cautions, both detailed in `pipeline.md` §13:
+
+- **`colBot` and the portal stack share page `$0300`.** `sta colBot,x` with
+  `x >= 160` writes into `pStkSec`. Giving the clip arrays private pages is on
+  the fix list.
+- **The zero-page layout of the line variables is load-bearing.** `zTop0`,
+  `zBot0`, `zBTop0`, `zBBot0` must stay at a stride of 4, their accumulators at
+  a stride of 3 and their steps at a stride of 2, because `lineSetup` and
+  `clampAcc` index them arithmetically instead of branching. Reordering those
+  `.const`s breaks the renderer silently.
+
+There is no `DmaRequest` ring, no resident page table and no replacement policy
+(§5.2), because nothing streams.
+
+### 8.4 Not present
+
+`SEC_*` sections and the `MAPBIN` container (§2.1-2.2), supersectors and PVS
+(§2.5), the collision grid and `ThingSpawn` table (§2.6), the entire sprite
+catalog and billboard encoding (§4), and every build-pipeline output of §7
+(`map.bin`, `lut.bin`, `sprite.bin`, `stream_plan.bin`, `validation_report.txt`).
+`tools/wad2reu.py` — the first step toward all of it — has not been written;
+`assets/DOOM1.WAD` is committed but unused.
 

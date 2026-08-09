@@ -1,8 +1,10 @@
 # Doom C64U — implementation status and plan
 
-The other four documents in this repo (`design.md`, `algorithm.md`,
-`data_structures.md`, `3d-renderer-design.md`) describe the intended architecture.
-This one tracks what is actually built, what is broken, and what happens next.
+Four documents in this repo (`design.md`, `algorithm.md`, `data_structures.md`,
+`3d-renderer-design.md`) describe the intended architecture;
+[`pipeline.md`](pipeline.md) traces the compute path **as built**, from a key
+press to pixels in VIC-II memory. This one tracks what is actually built, what
+is broken, and what happens next. [`README.md`](README.md) indexes all of them.
 
 ## Status
 
@@ -97,9 +99,17 @@ Two facts worth recording:
    band, metal wall band broken by the brighter corridor opening around columns
    60-99, moss floor below.
 
+The bounds contract each pipeline stage is supposed to establish — and which of
+them are actually enforced — is tabulated in `pipeline.md` §13.2. Worked
+evidence for step 2 is in `pipeline.md` §11.2: at the spawn position, wall 5 of
+sector A really does produce `c0 = 160, c1 = 159` and is rejected *solely* by
+the final `cmp zC0 / bcs` guard.
+
 Beyond Milestone 1, in dependency order: `tools/wad2reu.py` → REU DMA streaming →
 real map geometry replacing `testmap.asm` → textured walls → floors/ceilings →
 sprites → music. `tools/u64push.py` is independent of all of it.
+`pipeline.md` §12.1 gives the current frame budget (~52% at 48 MHz) and §14 the
+full stage-by-stage gap list against the target architecture.
 
 ## Building and testing
 
