@@ -26,7 +26,9 @@ ALLOWED = [
     (0x0200, 0x02FF, "colTop"),
     (0x0300, 0x03FF, "colBot"),
     (0x0400, 0x07FF, "COLBUF"),
-    (0x0B20, 0x0B5F, "portal-stack/visitedSec"),
+    (0x0F00, 0x0F3F, "portal-stack/visitedSec"),
+    (0x0F40, 0x0F41, "frameCnt"),
+    (0x0F42, 0x0F46, "reuScratch/reuOK"),
     (0x1000, 0x7DFF, "MATRIX"),
     (0x8000, 0x83FF, "SCREEN0"),
     (0xA000, 0xBF3F, "BITMAP0"),
@@ -96,6 +98,33 @@ def cmd_dump(m, prg_path, settle):
         print("  !! backBuf still 0 -- flip() has never completed a frame")
 
 
+REU_OK = 0x0F46          # `.const reuOK` in src/defs.asm
+
+
+def check_reu(m):
+    """Assert that the emulator actually gave the engine an REU.
+
+    reuProbe round-trips a signature through REU address 0 at boot and
+    leaves the verdict here. This is checked rather than assumed because
+    the failure is completely silent from inside the C64: with no REU
+    attached the $DFxx stores go nowhere, reads return $00, and every
+    transfer is a no-op that reports success.
+
+    It is an easy thing to lose by accident -- it was lost for the whole
+    life of the project by `-default` sitting after `-reu` on VICE's
+    command line, which resets the REU enable back off.
+    """
+    ok = m.mem_get(REU_OK, REU_OK, bank=1)[0]
+    m.exit_mon()
+    if ok == 1:
+        print("\nREU: present and round-tripping")
+        return 0
+    print("\nREU: *** ABSENT *** -- reuProbe found no REU.\n"
+          "  The engine ran, but any DMA it issues is a silent no-op.\n"
+          "  Check that -reu comes AFTER -default on VICE's command line.")
+    return 1
+
+
 def cmd_diff(m, prg_path, settle):
     load, img = load_prg(prg_path)
     m.exit_mon()
@@ -116,11 +145,13 @@ def cmd_diff(m, prg_path, settle):
     for name, n in counts.most_common():
         print(f"  {n:7d}  {name}")
 
+    rc = check_reu(m)
+
     bad = [d for d in diffs if region(d[0]).startswith("***")]
     print(f"\nunexpected differences: {len(bad)}")
     if not bad:
         print("  clean -- no writes outside the engine's own buffers")
-        return 0
+        return rc
 
     runs = []
     for addr, was, now in bad:

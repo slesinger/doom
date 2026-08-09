@@ -60,7 +60,9 @@ src/main.asm              VIC setup, spawn, main loop, HUD blanking
 src/defs.asm              memory map + zero-page allocation (all .const live here)
 src/math.asm              mul8 (quarter-square), umul16, smulTrig, ssmul32,
                           udiv, sdiv, spanFill
-src/input.asm             WASD + joystick 2, convex-sector containment
+src/input.asm             WASD + QE strafe + joystick 2, convex-sector containment
+src/reu.asm               REU DMA primitives + boot-time presence probe
+src/reubench.asm          standalone REU DMA throughput benchmark
 src/testmap.asm           3 sectors, 16 walls, 2 portals (SoA layout)
 src/render/walls.asm      portal traversal, near-plane clip, projection,
                           line interpolators, column spans
@@ -68,8 +70,16 @@ src/render/chunky2mc.asm  Bayer-dithered chunky -> multicolor converter,
                           double buffering, flip
 tools/vicedbg/            VICE binary-monitor client + live-RAM diff probe
 tools/checkshot.py        screenshot content assertion (coverage + colour count)
+tools/u64.py              Ultimate REST + FTP client (stdlib only)
+tools/u64config.py        applies the turbo settings the engine requires
+tools/u64push.py          push + run on hardware, REU preload, fps measurement
+tools/u64shot.py          DMA the chunky framebuffer off hardware, render a PNG
+tools/reubench.py         run the REU benchmark and print the throughput table
 tools/setup-dev-env.sh    VICE + C64 ROM setup
 ```
+
+**Controls:** `W`/`S` walk, `A`/`D` turn, `Q`/`E` strafe; joystick 2 walks and
+turns.
 
 The frame loop is `main.asm:59`:
 
@@ -98,6 +108,24 @@ make shot  VICEWRAP='xvfb-run -a'  # headless run, screenshot to build/shot.png
 make debug VICEWRAP='xvfb-run -a'  # live-RAM vs PRG diff
 ```
 
+### On real hardware
+
+```sh
+make u64-config                    # apply the required turbo settings
+make run-u64                       # push over the network and run
+make u64-fps                       # ... and measure the real frame rate
+python3 tools/u64shot.py $HOST out.png --cam 512,512,0 --scale 2
+```
+
+`U64_HOST` defaults to the address of the machine on this LAN; override it with
+`make run-u64 U64_HOST=1.2.3.4`.
+
+**`u64-config` is not optional.** The engine selects its CPU speed by writing
+`$D031`, and that register only exists when the Ultimate's *Turbo Control* is
+set to `C64U Turbo Registers`. In any other mode the write is silently
+discarded and the engine runs at 1 MHz — about 0.8 fps — with nothing on screen
+to say so. `run-u64` and `u64-fps` therefore depend on it.
+
 **KickAssembler** is only distributed from `theweb.dk` and is not vendored
 here. Put `KickAss.jar` in `tools/kickass/` or set `KICKASS_JAR`.
 
@@ -113,6 +141,7 @@ catches what the others cannot:
 | the `.errorif` guards in `main.asm` | no segment has grown into its neighbour |
 | `tools/checkshot.py` on `build/shot.png` | the viewport is not black and not a flat fill — i.e. the engine reached a *frame*, not merely the end of a frame loop |
 | `tools/vicedbg/probe.py diff` | **zero** unexpected differences between live RAM and the loaded PRG — a stray pointer is caught on the frame it happens, not three frames later when the screen has already gone black |
+| `reuOK == 1` in the same pass | the emulator actually attached an REU. A missing REU is invisible from inside the C64 — `$DFxx` reads back `$00` and every DMA silently succeeds while moving nothing — and it stayed missing for the whole life of the project because `-default` sat after `-reu` on VICE's command line |
 
 `make shot` deliberately ignores VICE's exit status: `-limitcycles` always ends
 the run non-zero, so the artifact is the evidence, not the status code. Its

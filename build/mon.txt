@@ -1,4 +1,2 @@
-break cd76 if .X > $a0
-x
-s "/tmp/claude-1000/-home-honza-projects-c64-projects-doom/b1592c26-fe48-4b03-b630-e5f95cbb9297/scratchpad/hit_colwrap.bin" 0 0000 0001
-x
+m 0f40 0f47
+quit

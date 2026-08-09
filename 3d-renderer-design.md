@@ -114,8 +114,19 @@ are blanked once at startup by `clearHudRows` in `src/main.asm`.
 
 - Textures stored as 3 pre-shaded variants (lit/standard/dark = intensity remap,
   optionally hue-shifted); DMA in the set for the current zone at load time.
-- **Open item:** verify whether U64 REU DMA speed scales with CPU turbo or stays at
-  ~1 byte/µs before relying on DMA in any per-frame path.
+- ~~**Open item:** verify whether U64 REU DMA speed scales with CPU turbo or stays at
+  ~1 byte/µs before relying on DMA in any per-frame path.~~
+  **Answered 2026-08-09 on a C64 Ultimate** (`make reubench`,
+  `IMPLEMENTATION_PLAN.md` §10): **exactly 1 byte/µs, flat across 32 B / 256 B /
+  4 KB transfers, and identical at 1 MHz and 64 MHz.** DMA does not scale with
+  the CPU clock. Two consequences for anything per-frame:
+  - **Cost is linear in bytes with no per-transfer setup penalty**, so small
+    fine-grained transfers are as efficient as large ones. Streaming a
+    subsector's ~30 bytes of segs on demand is fine.
+  - **DMA is ~6× slower than the CPU at moving bytes** once turbo is on
+    (0.17 µs/byte for an `sta` at 64 MHz against 1.00 µs/byte for DMA), and it
+    halts the CPU while it runs. Use it to reach data that is *only* in REU —
+    never as a faster memcpy or memset within main RAM.
 
 ## Tuning knobs (assembly-time data, no code changes)
 

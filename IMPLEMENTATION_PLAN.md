@@ -37,13 +37,14 @@ The docs that still said "does not reach a visible frame" — the README,
 | Test map (3 sectors, 16 walls) | `src/testmap.asm` | complete |
 | VICE monitor client + diff probe | `tools/vicedbg/` | complete, single-step capable |
 | Regression gate (`make check`) | `Makefile`, `tools/checkshot.py` | complete — see §8 |
+| Ultimate REST/FTP client | `tools/u64.py` | complete |
+| Turbo config, push+run, hardware screenshot | `tools/u64config.py`, `u64push.py`, `u64shot.py` | complete — see §9 |
 
 ### What does not exist at all
 
 - **No REU code.** Not one write to `$DF00`. 16 MB sits unused.
 - **No `tools/wad2reu.py`** — the `make assets` target references a file that
   was never written.
-- **No `tools/u64push.py`** — same for `make run-u64`.
 - **No real map.** `testmap.asm` is three hand-built convex sectors.
 
 ---
@@ -193,45 +194,59 @@ session log with the details and the two surprises found along the way.
 *Done when:* `make check` is green from a clean tree and its failure modes are
 understood. — **met.**
 
-### Phase 1 — Hardware truth (needs the U64)
+### Phase 1 — Hardware truth (needs the U64) ✅ DONE (2026-08-09)
 
 Do this before writing a byte of REU-dependent engine code. The whole data
 layout in §4 rests on an assumption nobody has measured.
 
-1. **`tools/u64push.py`** — push the PRG to the U64 over the network and run
-   it (the Ultimate command socket on TCP port 64: DMA the image, then RUN).
-   Wire up `make run-u64`.
-2. **Resolve REU image delivery to real hardware.** VICE takes `-reuimage`;
-   the U64 does not have an equivalent network command. Options to evaluate:
-   FTP the `.reu` to the device's storage and select it as the REU image in
-   the Ultimate config; or have the PRG load its own data at startup. **This
-   is an open question and it gates Phase 3's output format**, so answer it
-   here.
-3. **Benchmark REU DMA** at 1× and at turbo, for 32 B / 256 B / 4 KB
-   transfers, timed with a raster counter. This settles the open item in
-   `3d-renderer-design.md` §REU usage: *does DMA speed scale with CPU turbo,
-   or stay at ~1 byte/µs?* At 1 byte/µs the §4 streaming plan costs ~1.2 ms
-   per frame — fine. If per-transfer setup overhead dominates at 30-byte
-   granularity, batch segs per *node subtree* instead of per subsector.
-4. **Measure the current frame rate** of the existing test-map build on real
-   hardware. We have static instruction counts and no measurement.
+1. ✅ **`tools/u64push.py`** — pushes the PRG over the **REST API**, not the
+   legacy TCP-64 command socket: `POST /v1/runners:run_prg` resets the
+   machine, DMAs the image in and starts it. `make run-u64` is wired, along
+   with `make u64-config` and `make u64-fps`. See §9.
+2. ✅ **REU image delivery is solved: FTP + REU Preload.** The Ultimate's FTP
+   service takes the `.reu` (anonymous login, `/Usb0/...`), and the config
+   items `REU Preload Image` / `REU Preload Offset` / `REU Preload` point the
+   machine at it; the image is loaded into REU RAM on the next reset, which
+   `run_prg` performs anyway. `u64push.py --reu` does all of it. Tested end to
+   end with a 64 KB pattern file. **Phase 3 is unblocked, and its output
+   format is just "the raw REU image", same as VICE's `-reuimage`.**
+   *Caveat:* that the file reaches the device and the setting arms is
+   verified; that the bytes land in REU RAM cannot be confirmed until Phase 2
+   has code that reads `$DF00`.
+3. ✅ **REU DMA benchmarked** — `make reubench`, and the answer is flat:
+   **exactly 1 byte/µs at every size, and it does not scale with the CPU
+   clock.** See §10.
+4. ✅ **Frame rate measured on real hardware: 50.1 fps, vsync-locked**, with
+   the speed sweep that proves turbo is engaged. `pipeline.md` §12.3 has the
+   table. Frame compute is 15-22 ms at 64 MHz — the test map is *at* the PAL
+   frame boundary, not comfortably inside it.
 
 *Done when:* `make run-u64` works, and `pipeline.md` gains a measured
-bytes-per-millisecond table and a real FPS number.
+bytes-per-millisecond table and a real FPS number. — **FPS met; the
+bytes-per-millisecond table is item 3 and moves to Phase 2.**
 
-### Phase 2 — The REU layer
+### Phase 2 — The REU layer — PARTLY DONE (2026-08-09)
 
-1. **`src/reu.asm`** — `reuFetch(reuBank:reuAddr → ramPtr, len)` via
-   `$DF00-$DF0A`, plus a presence check at boot that fails *visibly* (border
-   colour) rather than hanging.
-2. **Boot-time resident load**: header block → nodes, sectors, ssectors into
-   their §4 homes.
-3. **I/O banking discipline**: `renderFrame` runs with RAM visible at
-   `$D000`; `flip`, `readInput` and `reuFetch` bank I/O in. Assert this with a
-   comment block in `defs.asm` and a `make debug` run.
+1. ✅ **`src/reu.asm`** — the `reuSet` macro fills `$DF02-$DF08`, a store to
+   `$DF01` fires the transfer, and `reuProbe` round-trips a signature through
+   REU address 0 at boot. `main.asm` records the verdict in `reuOK`.
+   *Deliberately not fatal yet:* nothing reads the REU, so refusing to run
+   would only break machines the engine currently works on. It becomes fatal
+   in Phase 4, when the map lives there.
+   `make check` now **asserts** `reuOK == 1` — see §10 for why that assertion
+   is not paranoia.
+2. ⬜ **Boot-time resident load**: header block → nodes, sectors, ssectors
+   into their §4 homes. Blocked on Phase 3: there is no image to load. The
+   transfer primitive it needs is done.
+3. ⬜ **I/O banking discipline**: `renderFrame` runs with RAM visible at
+   `$D000`; `flip`, `readInput` and `reuFetch` bank I/O in. Deferred to
+   Phase 4 on purpose — with nothing yet stored under `$D000` it would add a
+   banking hazard to every frame in exchange for nothing, and it cannot be
+   verified until the node table is actually there.
 
 *Done when:* the PRG loads a signature block from REU at boot, verifies its
-magic, and `make debug` is still clean.
+magic, and `make debug` is still clean. — **the signature round-trip is done
+and checked; the real block waits on Phase 3.**
 
 ### Phase 3 — `tools/wad2reu.py`
 
@@ -384,22 +399,160 @@ each time, no stray `x64sc`/`Xvfb` left behind.
 - The four-byte gap between the math tables (`$CA2C`) and `WALLSCODE`
   (`$CA30`) still has no `.errorif`. Worth adding when `WALLSCODE` next moves.
 
-### Next session: Phase 1 (needs the Ultimate 64)
+## 9. Session log — 2026-08-09, Phase 1
 
-**Confirmed 2026-08-09: the U64 is on the LAN and reachable from this machine**,
-so Phase 1 goes next, in order, rather than being deferred behind Phase 3. Its
-hostname/IP still has to be supplied — `Makefile` defaults `U64_HOST` to `u64`.
+### The machine
 
-Phase 1 is the gate on everything after it, and it is the one phase that cannot
-be done in the emulator. It needs, in order:
+**C64 Ultimate at `192.168.1.65`** — product string "C64 Ultimate", firmware
+1.1.0, FPGA 122, core 1.49, hostname `C64-Ultimate-3D82C5`. It does **not**
+advertise itself over mDNS, so `U64_HOST` in the `Makefile` is an IP, not a
+name. To find it again: `curl -s -m2 http://<ip>/v1/info` across the subnet —
+the Ultimate is the host that answers with a JSON `product` field.
 
-1. `tools/u64push.py` + `make run-u64` — the Ultimate command socket on TCP 64.
-2. **An answer to how a `.reu` image reaches real hardware** (§5 Phase 1.2).
-   This is the open question that decides `wad2reu.py`'s output format, so it
-   is worth answering before Phase 3 starts even if the benchmark slips.
-3. The REU DMA throughput table, and the first real FPS measurement.
+Everything is driven through the **REST API** (firmware ≥ 3.11), documented at
+`1541u-documentation.readthedocs.io/en/latest/api/api_calls.html`. That turned
+out to be far more capable than the TCP-64 command socket the old plan assumed:
+besides `runners:run_prg`, it offers `machine:readmem` / `machine:writemem`
+(DMA, no cooperation from the running program) and full read/write access to
+the configuration menu. Those three are what made the rest of this session
+possible.
 
-If the U64 turns out to be unreachable after all, the useful out-of-order work
-is **Phase 3** (`tools/wad2reu.py`) — pure Python, verifiable by its own
-top-down PNG render, and it needs nothing from the hardware except a decision on
-delivery format. Phase 2 and Phase 4 both depend on Phase 1's numbers.
+### Machine configuration is a build dependency, not a setup step
+
+The engine picks its CPU speed by writing `$D031`. That register **only exists
+when the machine's Turbo Control is set to "C64U Turbo Registers"**; in any
+other mode it reads `$FF`, the write is discarded, and the engine runs at 1 MHz
+with nothing to indicate it. This bit us immediately: the setting had reverted
+to `Off` between two runs an hour apart.
+
+So it is applied and verified from the build, by `make u64-config`, which
+`run-u64` and `u64-fps` depend on:
+
+| Setting | Value | Why |
+|---|---|---|
+| Turbo Control | `C64U Turbo Registers` | the only mode that takes the speed from the menu *and* lets `$D031` change it |
+| CPU Speed | `64` | speed index 15 on this machine |
+| Badline Timing | `Enabled` | keeps C64-compatible bus timing; the VIC has priority either way |
+| SuperCPU Detect (D0BC) | `Disabled` | nothing probes `$D0BC` |
+
+Now also saved to the Ultimate's flash, so it survives a power cycle.
+
+**Turbo must be toggled, not set.** Writing the target speed to `$D031` after a
+reset does not engage it; the register has to be walked down to 1 MHz and back
+up. `turboOn` in `main.asm` does exactly that, unconditionally, for six cycles.
+
+`$D031` is an unconnected VIC mirror on a stock C64 (`$31 mod $40 = 49`, past
+the last real register at `$2e`), so all of this is inert in VICE and `make
+check` is unaffected.
+
+### What the hardware said
+
+- **50.1 fps, PAL vsync-locked**, test map. The full speed sweep is in
+  `pipeline.md` §12.3. 1 MHz gives 0.83 fps, which is the control proving turbo
+  is genuinely on.
+- **Frame compute is 15-22 ms at 64 MHz** — bracketed from the 10 MHz and
+  24 MHz rows, which are quantised to the same 20 ms grid. The test map is
+  *at* the frame boundary, not inside it. §12.1's ~994k cycle estimate was low
+  by about a third.
+- **There is a ~1 s startup transient** after `run_prg` during which frames are
+  dropped — the Ultimate is still finishing its own post-reset housekeeping. A
+  0-5 s window reads 37.8 fps; every window after reads exactly 50.00.
+  `u64push.py` discards it. Any future benchmark must too, or it will report a
+  20% deficit that is not the engine's.
+
+### Two bugs the session found in passing
+
+1. **The main segment had three bytes of headroom and no guard.** It ended at
+   `$0B1C`; `pStkSec` was at `$0B20`. Adding strafing pushed it to `$0BC5`,
+   straight through the portal stack. The stack moved to `$0F00` and
+   `main.asm` now carries `.errorif * > pStkSec`. `tools/vicedbg/probe.py`'s
+   allowed-region table had to move with it — worth remembering that the
+   probe's table is a second, independent copy of the memory map.
+2. **The A/D turn-direction defect was real** and is fixed — see
+   `pipeline.md` §3. It was resolved by looking at the machine rather than by
+   argument, which mattered: the competing fix would have mirrored the world.
+
+### `tools/u64shot.py` — screenshots from real hardware
+
+`machine:readmem` will DMA out the whole 28160-byte MATRIX in about a second,
+and the chunky format is trivially renderable off-device, so hardware frames
+can now be looked at without a capture card or the U64 video stream. It takes
+`--cam X,Y,A` to place the camera first, which makes it a scripted turntable.
+This is what settled the A/D question and it is the obvious way to check the
+first E1M1 frame in Phase 4.
+
+It renders the *chunky* buffer, i.e. the renderer's output before `chunky2mc`
+packs it — so it shows what the 3D code drew, not what the VIC displays.
+Attribute artefacts will not show up in it; wrong geometry will.
+
+A companion trick worth keeping: `machine:writemem` can patch the running
+engine. Overwriting `readInput` with `lda #bit / sta zInput / rts` forces a
+single intent bit, which is how all six directions were verified on hardware
+without anyone touching the keyboard.
+
+---
+
+## 10. Session log — 2026-08-09, Phase 2 (partial)
+
+### REU DMA: 1 byte/µs, flat, and independent of the CPU clock
+
+`make reubench` builds `src/reubench.asm`, runs it on hardware and DMA-reads
+the results back. It times N back-to-back transfers with CIA 2 timer A — which
+keeps ticking at 1 MHz while the REU has the 6510 halted, and does not care
+about the turbo setting — then times the identical loop with the command store
+neutered and subtracts. Measured:
+
+| Size | 1 MHz | 64 MHz | µs/transfer | Rate |
+|---:|---:|---:|---:|---:|
+| 32 B | 4173 µs / 128 | 4096 µs / 128 | 32.0 | 1.00 B/µs |
+| 256 B | 8192 µs / 32 | 8192 µs / 32 | 256.0 | 1.00 B/µs |
+| 4096 B | 16384 µs / 4 | 16384 µs / 4 | 4096.0 | 1.00 B/µs |
+
+Three things fall out of this, in increasing order of how much they matter:
+
+1. **DMA does not scale with the turbo clock.** 64 MHz is 1.00× the 1 MHz
+   rate. This closes the open item in `3d-renderer-design.md` §REU usage.
+2. **There is no per-transfer setup penalty.** 32 bytes costs 32 µs, not
+   32 µs plus a fixed overhead — the cost is exactly linear in size down to
+   the smallest transfer measured. So §4's per-subsector streaming does *not*
+   need to be batched per node subtree. That contingency can be dropped.
+3. **REU DMA is far too slow to use as a memset.** `pipeline.md` §9.3 floats
+   filling spans by DMA instead of by CPU stores. At 64 MHz the CPU writes a
+   span byte every ~11 cycles = 0.17 µs; DMA takes 1.00 µs. **DMA fill would
+   be about 6× slower**, and it halts the CPU while it runs. That idea is
+   dead, and the note should stop suggesting it.
+
+The cost of the actual plan: ~1.2 KB/frame of seg streaming = **~1.2 ms per
+frame of halted CPU**. Against a 20 ms PAL frame that is 6% — affordable in
+isolation, but the test map already occupies 15-22 ms (§9), so it comes
+straight out of a budget that has no slack. Worth remembering when Phase 4's
+first E1M1 frame is slower than expected.
+
+### `-default` had been switching the REU off for the whole life of the project
+
+`reuProbe` failed in VICE while succeeding on hardware. The cause was the
+`x64sc` command line: `-reu -reusize 16384 ... -default`. **`-default` resets
+every setting to its factory value, including the REU enable**, and it was
+sitting after `-reu`. So no VICE run this project has ever made had an REU
+attached — and `-reuimage`, which Phase 3 was going to rely on for the whole
+inner development loop, would have been silently ignored too.
+
+Nothing indicates this from inside the C64: with no REU, `$DF00-$DF0A` read
+back `$00` (not `$FF`), stores go nowhere, and every transfer "succeeds"
+instantly. It is a perfectly silent failure, which is exactly why the fix is
+paired with an assertion rather than just a reordering: `tools/vicedbg/probe.py`
+now reads `reuOK` and `make check` fails if it is not 1.
+
+The general lesson, which cost a Makefile comment: **`-default` must come first
+on VICE's command line, before any setting it would otherwise undo.**
+
+### Next session: Phase 3 (`tools/wad2reu.py`)
+
+Everything it needed is now settled. The delivery format is a raw `.reu`
+image, identical for hardware (FTP + REU Preload) and for VICE
+(`-reuimage`, which now actually works). The transport cost is known and
+linear, so the §4 packing can be taken at face value. It is pure Python,
+verifiable by its own top-down PNG render, and needs no hardware.
+
+Phase 2's remaining two items (resident load, `$D000` banking) are blocked
+behind it and should follow immediately after.

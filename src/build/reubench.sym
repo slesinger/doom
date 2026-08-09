@@ -1,0 +1,15 @@
+.label timedLoop=$8c8
+.label storeResult=$91e
+.label reps=$935
+.label xferLen=$933
+.label runPass=$877
+.label reuProbe=$943
+.label reuAbsent=$9ba
+.label reuSig=$9bc
+.label reuInit=$93a
+.label bench=$810
+.label done=$86f
+.label measure=$8ae
+.label cmdByte=$936
+.label slot=$939
+.label elapsed=$937

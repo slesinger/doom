@@ -7,7 +7,10 @@
 #   make check      the regression gate: build + shot content + live-RAM diff
 #   make debug      live-RAM vs PRG diff under the VICE binary monitor
 #   make assets     convert DOOM1.WAD -> build/assets.reu (needs WAD in ./assets)
-#   make run-u64    push PRG to Ultimate 64 over the network and run it
+#   make u64-config apply the required turbo settings to the Ultimate
+#   make run-u64    push PRG to the Ultimate over the network and run it
+#   make u64-fps    run on the Ultimate and measure the real frame rate
+#   make reubench   measure REU DMA throughput on the Ultimate
 #   make clean
 
 # KickAssembler is only distributed from theweb.dk; keep the location
@@ -19,15 +22,25 @@ VICE      ?= x64sc
 VICEWRAP  ?=
 PYTHON    := python3
 
-# Ultimate 64 on the LAN — override like: make run-u64 U64_HOST=192.168.1.64
-U64_HOST  ?= u64
+# The C64 Ultimate on the LAN. It does not advertise itself over mDNS, so
+# this is an address, not a name; override like: make run-u64 U64_HOST=1.2.3.4
+# To find it again: curl -s -m2 http://<ip>/v1/info on each host in the subnet
+# — the Ultimate is the one that answers with a JSON "product" field.
+U64_HOST  ?= 192.168.1.65
 
 SRC       := $(wildcard src/*.asm src/render/*.asm)
 PRG       := build/doom.prg
 REUIMG    := build/assets.reu
 WAD       := assets/DOOM1.WAD
 
-# VICE: 16 MB REU; attach the asset image read-only if it exists
+# VICE: 16 MB REU; attach the asset image read-only if it exists.
+#
+# ORDER MATTERS: REUOPTS must come *after* VICEOPTS on every command line,
+# because VICEOPTS leads with `-default`, and `-default` resets every setting
+# to its factory value -- including the REU enable. With `-reu -default` the
+# emulator boots with no REU at all and says nothing about it: $DF00-$DF0A read
+# back as $00, every DMA is a silent no-op, and `-reuimage` is ignored. That is
+# how it was written until 2026-08-09, so no VICE run before then had an REU.
 REUOPTS    = -reu -reusize 16384
 # +confirmexit is not a VICE option (VICE bails out); it is +confirmonexit.
 # -autostartprgmode 1 injects the PRG directly, so no 1541 drive ROMs are
@@ -42,7 +55,7 @@ ifneq ($(wildcard $(REUIMG)),)
 REUOPTS   += -reuimage $(REUIMG)
 endif
 
-.PHONY: all run shot check debug assets run-u64 setup clean
+.PHONY: all run shot check debug assets reubench run-u64 u64-config u64-fps setup clean
 
 # `setup` is defined first for readability but must not be the default goal:
 # a bare `make` has to build, as the README says it does.
@@ -58,7 +71,7 @@ $(PRG): $(SRC)
 	    -symbolfile -vicesymbols
 
 run: $(PRG)
-	$(VICEWRAP) $(VICE) $(REUOPTS) $(VICEOPTS) -autostart $(PRG)
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -autostart $(PRG)
 
 # Headless-ish automated check: run warp for a while, dump a screenshot, exit.
 #
@@ -70,7 +83,7 @@ SHOT_CYCLES ?= 50000000
 SHOT        := build/shot.png
 shot: $(PRG)
 	rm -f $(SHOT)
-	-$(VICEWRAP) $(VICE) $(REUOPTS) $(VICEOPTS) -warp \
+	-$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
 	    -limitcycles $(SHOT_CYCLES) -exitscreenshot $(SHOT) \
 	    -autostart $(PRG)
 	@test -s $(SHOT) || { echo "shot: VICE wrote no $(SHOT)"; exit 1; }
@@ -94,13 +107,37 @@ check: $(PRG)
 	@$(MAKE) --no-print-directory debug
 	@echo "== check: all green"
 
+# The REU DMA throughput benchmark: a standalone PRG that leaves its results
+# in C64 RAM, and a host tool that DMA-reads them back and does the arithmetic.
+# Answers whether DMA speed scales with the CPU turbo clock. (It does not.)
+BENCH := build/reubench.prg
+$(BENCH): src/reubench.asm src/reu.asm src/defs.asm
+	$(KICKASS) src/reubench.asm -odir build -o $(BENCH) -showmem -vicesymbols
+
+reubench: $(BENCH) u64-config
+	$(PYTHON) tools/reubench.py $(U64_HOST) $(BENCH)
+
 assets: $(REUIMG)
 
 $(REUIMG): tools/wad2reu.py $(WAD)
 	$(PYTHON) tools/wad2reu.py $(WAD) -o $(REUIMG)
 
-run-u64: $(PRG)
+# Real hardware. u64-config must run before the PRG: the engine selects its
+# CPU speed by writing $D031, and that register only exists when the machine's
+# Turbo Control is "C64U Turbo Registers". In any other mode the write is
+# ignored and the engine runs at 1 MHz with no indication that it is doing so.
+u64-config:
+	$(PYTHON) tools/u64config.py $(U64_HOST)
+
+run-u64: $(PRG) u64-config
 	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG)
+
+# Measure the real frame rate: run, then read the engine's frame counter
+# twice over U64_FPS_SECONDS of wall clock.
+U64_FPS_SECONDS ?= 10
+u64-fps: $(PRG) u64-config
+	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG) \
+	    --fps $(U64_FPS_SECONDS)
 
 # Run under the binary monitor and diff live RAM against the PRG image; a clean
 # run reports no writes outside the engine's own buffers. See tools/vicedbg.
@@ -126,7 +163,7 @@ endif
 VICELOG := build/debug.log
 debug: $(PRG)
 	@mkdir -p build
-	$(VICEWRAP) $(VICE) $(REUOPTS) $(VICEOPTS) -warp \
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
 	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
@@ -135,4 +172,4 @@ debug: $(PRG)
 	exit $$rc
 
 clean:
-	rm -f build/*.prg build/*.sym build/*.vs build/shot.png build/debug.log
+	rm -f build/*.prg build/*.sym build/*.vs build/shot.png build/hw_*.png build/debug.log

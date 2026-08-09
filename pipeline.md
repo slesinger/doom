@@ -26,9 +26,10 @@ describe stages that do not exist yet.
 > replaces portal traversal with a BSP walk over real E1M1 geometry
 > (`IMPLEMENTATION_PLAN.md` §3), which changes §7 and §9.1 and leaves §8, §10
 > and §12 intact. The math here has been hand-traced and agrees with values
-> captured from the live machine (§11), but the cycle counts in §12 are static
-> instruction counts, not measurements — **no frame has yet been timed on real
-> hardware.**
+> captured from the live machine (§11). The cycle counts in §12 are still
+> static instruction counts, but the frame rate no longer is: the test-map
+> build has now been measured on a real C64 Ultimate at **50.0 fps, PAL
+> vsync-locked** (§12.3), which puts frame compute under 20 ms at 64 MHz.
 
 ---
 
@@ -197,9 +198,11 @@ column bits back from `$DC01`, where a **pressed** key reads as **0**.
 ```
 
 Row 1 holds `3 W A 4 Z S E LSHIFT`, so a single strobe yields W (bit 1),
-A (bit 2) and S (bit 5). D needs row 2 (`5 R D 6 C F T X`, bit 2), so exactly
-**two** matrix strobes cover WASD. `tay` caches the row byte so the three tests
-on row 1 cost one read, not three.
+A (bit 2), S (bit 5) **and E (bit 6)**. D needs row 2 (`5 R D 6 C F T X`,
+bit 2) and Q needs row 7 (`1 <- CTRL 2 SPACE C= Q RUN/STOP`, bit 6), so exactly
+**three** matrix strobes cover all six keys. `tay` caches the row-1 byte so its
+four tests cost one read, not four — the strafe keys were chosen partly for
+that: putting strafe-right on E makes it free.
 
 Joystick port 2 shares `$DC00`. Writing `$FF` releases every keyboard row, and
 reading `$DC00` back gives the joystick directions in bits 0-3, active low:
@@ -214,7 +217,8 @@ reading `$DC00` back gives the joystick directions in bits 0-3, active low:
 ```
 
 The bit layout was chosen so keyboard and joystick **merge with a single
-`ora`** — no translation table, no branch:
+`ora`** — no translation table, no branch. The joystick only reaches the low
+four bits, so strafing is keyboard-only:
 
 | Bit | Meaning | Key | Joystick |
 |---|---|---|---|
@@ -222,20 +226,31 @@ The bit layout was chosen so keyboard and joystick **merge with a single
 | 1 | backward | S | down |
 | 2 | turn left | A | left |
 | 3 | turn right | D | right |
+| 4 | strafe left | Q | — |
+| 5 | strafe right | E | — |
 
 **Optimization approach.** Input is a fixed-cost stage with no data dependency
 on the world, so it is placed first and never revisited. There is no key
 repeat, no edge detection and no debounce: the renderer runs at a fixed rate,
 so "held" is the only state that matters and the matrix read *is* the debounce.
 
-> **Suspected defect.** `A` decrements `camA` and `D` increments it
-> (`input.asm:60-73`). But the camera basis is `forward = (cos θ, sin θ)` with
-> θ increasing counter-clockwise, and `rx` is the *rightward* axis, so
-> **increasing `camA` turns left**. The two keys therefore appear to be
-> swapped. Still unconfirmed — the build renders now, so this is *testable*: hold
-> `A` in `make run` and see which way the wall moves. Verify before "fixing",
-> since flipping the sign of `rx` in `transformPoint` would also resolve it in
-> the opposite direction.
+> **Resolved (was: suspected defect).** `A` used to decrement `camA` and `D`
+> increment it. The camera basis is `forward = (cos θ, sin θ)` with θ increasing
+> counter-clockwise and `rx` the *rightward* axis, so **increasing `camA` turns
+> left** — the keys were backwards, as playing it on hardware confirmed.
+>
+> This was settled by measurement rather than by argument, because the
+> competing fix — flipping the sign of `rx` in `transformPoint` — would have
+> resolved the symptom in the opposite direction and left the world mirrored.
+> `tools/u64shot.py` grabbed the MATRIX off a running C64 Ultimate at
+> `camA = 0`, `+8` and `-8`: at `+8` the portal moves **right** across the
+> screen, which is what turning left looks like. So `camA` increasing is a left
+> turn, and `IN_LEFT` now increments it.
+>
+> The fix is in `movePlayer`, not `readInput`. Both the keys and the joystick
+> feed bits 2 and 3, so correcting the *effect* of those bits fixes the stick at
+> the same time; swapping which key sets which bit would have fixed the keyboard
+> and left the joystick reversed.
 
 ---
 
@@ -274,17 +289,44 @@ at an offset. The `adc #64` wraps in 8 bits for free. This halves the trig
 table from 1024 bytes to 512 and, more importantly, halves the *hot* table
 footprint that must stay resident.
 
-Then displacement, per axis:
+Then the two scaled basis components:
 
 ```
-dx = (MOVE_SPEED * cos) >> 14
-dy = (MOVE_SPEED * sin) >> 14
+zCosT = (MOVE_SPEED * cos) >> 14
+zSinT = (MOVE_SPEED * sin) >> 14
 ```
 
-computed by `smulTrig` (`src/math.asm:97`), and added or subtracted from
-`camX`/`camY` depending on whether bit 1 (backward) is set. Backward motion
-reuses the same product with `sbc` instead of `adc` — no second multiply, no
-negation.
+computed by `smulTrig` (`src/math.asm:97`) — **twice per frame, no matter how
+many direction keys are held.** That is the point of hoisting them out. The
+camera's two axes are
+
+```
+forward = ( cos,  sin)
+right   = ( sin, -cos)
+```
+
+so both are spanned by the same pair of values, and every direction key
+degenerates into a pair of 16-bit adds into a displacement accumulator:
+
+| Intent | `zMvDX` | `zMvDY` |
+|---|---|---|
+| forward (W) | `+= zCosT` | `+= zSinT` |
+| backward (S) | `-= zCosT` | `-= zSinT` |
+| strafe right (E) | `+= zSinT` | `-= zCosT` |
+| strafe left (Q) | `-= zSinT` | `+= zCosT` |
+
+`camX += zMvDX; camY += zMvDY` once, then `checkSector`. Walking and strafing
+together therefore cost what walking alone used to: ~840 cycles of `smulTrig`
+plus ~100 of adds, against ~1680 if each axis re-derived its own product.
+
+Sanity check at `camA = 0` (facing east): `right = (0, -1)` = south, which is
+indeed on your right facing east — and that is what hardware reports, `E`
+moving the player south and `Q` north (`§3`'s resolved note describes the same
+harness).
+
+Diagonals are *not* normalised: holding W and E together moves `√2 ×
+MOVE_SPEED`. Doom did the same thing, and fixing it needs the 16.16 upgrade
+this section's Deviation note already calls for.
 
 ### 4.3 `smulTrig`: the signed 2.14 multiply
 
@@ -351,7 +393,7 @@ speedup on the single hottest primitive in the engine.**
 | Quarter-square `mul8` | ~127 cy per 8×8 multiply |
 | Self-modified table base | a 16-bit add per lookup |
 | `<< 2` + word re-slice for `>> 14` | ~8 shift instructions |
-| Reuse the product for backward motion | one full `smulTrig` (~420 cy) |
+| One basis pair spans both axes (walk + strafe) | two `smulTrig` (~840 cy) |
 | Early-out when no movement bits set | ~900 cy on idle frames |
 
 ---
@@ -887,9 +929,14 @@ a typical span, **~11 cycles per pixel**.
 > This is the pipeline's largest single cost after the converter (§12), and the
 > clearest optimization target. The obvious win is that spans are written with
 > a *constant* byte, so a whole cell row could be filled with a 4-byte pattern
-> rather than 8 individual stores — or, on the U64, by REU DMA fill, if DMA
-> throughput scales with the turbo clock (an open question flagged in
-> `3d-renderer-design.md`).
+> rather than 8 individual stores.
+>
+> **Not by REU DMA, though** — that was the other candidate, and hardware has
+> ruled it out. REU DMA runs at exactly 1 byte/µs and does *not* scale with the
+> turbo clock (`IMPLEMENTATION_PLAN.md` §10). At 64 MHz a CPU store costs
+> ~11 cycles = 0.17 µs per byte, so DMA fill would be **~6× slower**, and it
+> halts the CPU for the duration. The open question in
+> `3d-renderer-design.md` §REU usage is answered, and the answer is no.
 
 ---
 
@@ -1243,9 +1290,10 @@ $0100-$01FF  6510 stack
 $0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
 $0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0B1C  main + input + testmap code and data
-$0B20-$0B5F  portal stack (pStkSec/XL/XR, 12 each) + visitedSec
-$0B60-$0FFF  free             1184 B
+$0810-$0BC5  main + input + testmap code and data
+$0BC6-$0EFF  free             826 B
+$0F00-$0F3F  portal stack (pStkSec/XL/XR, 12 each) + visitedSec
+$0F40-$0F41  frameCnt         host-readable frame counter (tools/u64push.py --fps)
 $1000-$7DFF  MATRIX           28160 B = 110 pages, cell-major chunky buffer
 $8000-$83FF  SCREEN0          (VIC bank 2)
 $8400-$973F  converter tables dither 4 KB, scrTab/colTab 512 B, xOfs 320 B
@@ -1261,8 +1309,13 @@ $CED4-$CFFF  free             300 B
 $E000-$FF3F  BITMAP1          (VIC bank 3, under Kernal ROM -- write-only)
 ```
 
-Two things worth knowing about this map:
+Three things worth knowing about this map:
 
+- **The portal stack sits at `$0F00`, deliberately far above the code.** It
+  used to start at `$0B20`, and adding the strafe handling to `movePlayer` grew
+  the main segment to `$0BC5` — straight through it, silently, because nothing
+  checked. `main.asm` now carries `.errorif * > pStkSec`. The free block below
+  MATRIX is unchanged in total; it is just split either side of the stack now.
 - **The math tables end at `$CA2C` and the walls code begins at `$CA30`.**
   Four bytes of slack. Adding a single table entry to `sqr`, `sin` or `rowCell`
   will silently overrun into executable code unless `WALLSCODE` moves first.
@@ -1277,7 +1330,7 @@ Two things worth knowing about this map:
   `IMPLEMENTATION_PLAN.md` §4 puts E1M1's node table in the 4 KB of RAM hiding
   under the I/O space at `$D000` and streams the rest from the REU.
 
-### 12.3 Frame pacing
+### 12.3 Frame pacing — and what hardware actually does
 
 `flip` waits for raster line 251 (`cmp $d012`), which happens once per PAL
 frame, so the engine is hard-synced to 50 Hz. Effective frame rate is therefore
@@ -1285,10 +1338,34 @@ frame, so the engine is hard-synced to 50 Hz. Effective frame rate is therefore
 16.7 or 12.5 fps, with nothing in between.** A frame that overruns its budget
 by one cycle costs a full 20 ms.
 
-This makes the 52% figure above more comfortable than it looks — there is a
-2× margin before the frame rate drops a step — but it also means quality
-scaling (`algorithm.md`'s `quality.degrade_step`) must react *before* the
-overrun, not after. That mechanism does not exist yet.
+**Measured on a C64 Ultimate** (firmware 1.1.0, core 1.49, PAL, 64 MHz,
+badlines enabled), test map, `make u64-fps`:
+
+| `$D031` | CPU speed | fps | ms/frame |
+|---|---|---:|---:|
+| `$00` | 1 MHz | 0.83 | 1203 |
+| `$06` | 10 MHz | 7.15 | 140 |
+| `$0B` | 24 MHz | 16.78 | 60 |
+| `$0F` | 64 MHz | **50.1** | **20.0** |
+
+At 64 MHz the engine is **vsync-locked**: 50.1 fps is PAL's own 50.125 Hz, so
+`flip` is waiting, and frame compute is *under* 20 ms rather than at it. The
+1 MHz row is the control that proves turbo is genuinely engaged — a 60× spread
+across a 64× clock range, the gap being the VIC's cycle stealing.
+
+The intermediate rows also bound the compute time from the other side. They are
+quantised to the same 20 ms grid, so 24 MHz landing on 3 frames means the work
+takes 40-60 ms there, i.e. **15-22 ms at 64 MHz**. That straddles the vsync
+boundary, which is exactly what a naive measurement showed before the startup
+transient was excluded: windows that catch a slow frame read 40-44 fps instead
+of 50.
+
+So the §12.1 estimate of ~994k cycles was low by roughly a third — 20 ms at
+64 MHz is ~1.28M cycles — but right about where the time goes. The practical
+reading is that **the test map has little headroom left before it drops to
+25 fps**, and E1M1 will not fit in what remains without the §12.1 optimizations.
+Quality scaling (`algorithm.md`'s `quality.degrade_step`) must react *before*
+the overrun, not after; that mechanism still does not exist.
 
 ---
 

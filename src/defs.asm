@@ -34,10 +34,12 @@
 .const colTop  = $0200              // first open row
 .const colBot  = $0300              // first closed row below
 
-// portal traversal stack (free space below MATRIX, see main.asm map)
-.const pStkSec = $0b20              // 12 entries
-.const pStkXL  = $0b30
-.const pStkXR  = $0b40
+// Portal traversal stack + per-frame scratch, in the free RAM below MATRIX.
+// Parked at $0f00 rather than immediately after the code: main code had grown
+// to within three bytes of the old $0b20 base. main.asm asserts the gap.
+.const pStkSec = $0f00              // 12 entries
+.const pStkXL  = $0f10
+.const pStkXR  = $0f20
 .const PSTKMAX = 12
 
 //------------------------------------------------------------
@@ -49,6 +51,58 @@
 .const EYE     = 41                 // eye height above sector floor
 .const MOVE_SPEED = 14              // world units per frame
 .const TURN_SPEED = 3               // angle units (of 256) per frame
+
+//------------------------------------------------------------
+// Ultimate 64 / C64 Ultimate turbo control
+//
+//   $D031  bit 0-3  CPU speed index
+//          bit 7    badline timing, 0 = enabled (C64-compatible)
+//
+// Live only when the machine's "Turbo Control" setting is
+// "C64U Turbo Registers" or "TurboEnable Bit" (tools/u64config.py sets
+// the former). On a stock C64 -- and in VICE -- $D031 is an unconnected
+// VIC mirror ($31 mod $40 = 49 > the last real register at $2e), so the
+// writes read back as $ff and do nothing. Safe everywhere.
+//
+// Speed index 15 is 64 MHz on the C64 Ultimate and U64 Elite-II, 48 MHz
+// on the original U64. Badlines are left ENABLED: the VIC has bus
+// priority regardless, and disabling them buys cycles at the cost of
+// C64-compatible timing we may still want for the raster-synced flip.
+//------------------------------------------------------------
+.const TURBOREG   = $d031
+.const TURBO_1MHZ = $00             // speed index 0, badlines enabled
+.const TURBO_MAX  = $0f             // speed index 15, badlines enabled
+
+//------------------------------------------------------------
+// REU (1750-style RAM expansion) controller. See src/reu.asm for
+// what each register does and how a transfer is issued.
+//------------------------------------------------------------
+.const REU_STATUS  = $df00
+.const REU_COMMAND = $df01
+.const REU_C64ADDR = $df02          // + $df03
+.const REU_REUADDR = $df04          // + $df05
+.const REU_BANK    = $df06
+.const REU_LENGTH  = $df07          // + $df08, 0 means 65536
+.const REU_IRQMASK = $df09
+.const REU_ADDRCTL = $df0a
+
+// Command bytes: execute now (bit 7) with the $FF00 trigger
+// disabled (bit 4), so the transfer runs on the store itself.
+.const REU_FETCH   = $91            // REU -> C64
+.const REU_STASH   = $90            // C64 -> REU
+.const REU_COMPARE = $93            // compare, result in the status register
+
+//------------------------------------------------------------
+// zInput bits. Keyboard and joystick merge with a single `ora`, so the
+// low four bits must keep matching joystick 2's up/down/left/right.
+//------------------------------------------------------------
+.const IN_FWD    = %00000001        // W        / joy up
+.const IN_BACK   = %00000010        // S        / joy down
+.const IN_LEFT   = %00000100        // A        / joy left    -- turn left
+.const IN_RIGHT  = %00001000        // D        / joy right   -- turn right
+.const IN_SLEFT  = %00010000        // Q                      -- strafe left
+.const IN_SRIGHT = %00100000        // E                      -- strafe right
+.const IN_MOVE   = IN_FWD | IN_BACK | IN_SLEFT | IN_SRIGHT
 
 //------------------------------------------------------------
 // zero page — math ($02-$13)
@@ -153,6 +207,10 @@
 // movement scratch (renderer accs are free while moving)
 .const oldX    = $68
 .const oldY    = $6a
+.const zMvDX   = $6c        // this frame's total displacement, 16-bit signed
+.const zMvDY   = $6e
+.const zCosT   = $70        // MOVE_SPEED * cos >> 14  (the forward basis, scaled)
+.const zSinT   = $72        // MOVE_SPEED * sin >> 14
 
 //------------------------------------------------------------
 // player spawn (test map)
@@ -163,4 +221,16 @@
 .const START_SEC = 0
 
 .const WALLS2         = $9d80      // walls helper routines after math code
-.const visitedSec     = $0b50      // per-frame sector visited flags (16 for testmap)
+.const visitedSec     = $0f30      // per-frame sector visited flags (16 for testmap)
+
+// Free-running 16-bit frame counter, incremented once per completed flip.
+// Nothing in the engine reads it; it exists so that a host can DMA-read it
+// twice over a known wall-clock interval and get a real frame rate out of
+// hardware (tools/u64push.py --fps). Fixed address by contract with that tool.
+.const frameCnt       = $0f40
+
+// REU scratch and status. Deliberately *outside* the PRG image: reuProbe
+// writes a signature here, and anything it wrote inside the image would show
+// up in tools/vicedbg/probe.py's live-RAM diff as an unexplained difference.
+.const reuScratch     = $0f42      // 4 bytes, round-tripped by reuProbe
+.const reuOK          = $0f46      // 1 = an REU answered at boot

@@ -5,9 +5,10 @@
 //  chunky MATRIX, chunky2mc conversion, double buffering.
 //
 //  Memory map:
-//    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot + portal stack
+//    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0FFF  main / input / test map
+//    $0810-$0EFF  main / input / test map
+//    $0F00-$0F41  portal stack, visitedSec, frameCnt
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
@@ -28,6 +29,7 @@
 .pc = $0810 "main code"
 main:
         sei
+        jsr turboOn
         lda #$3b                    // bitmap mode on
         sta $d011
         lda #$18                    // multicolor on
@@ -57,13 +59,47 @@ main:
         lda secFloorHi,y
         adc #0
         sta camZ+1
+        lda #0
+        sta frameCnt
+        sta frameCnt+1
+        // Record whether there is an REU. Not fatal: nothing reads the
+        // REU yet, so refusing to run would only make the engine useless
+        // on machines it currently works on. This becomes a hard failure
+        // in Phase 4, when the map lives there and a missing REU means
+        // there is nothing to draw.
+        jsr reuProbe
+        lda #0
+        rol                         // carry -> bit 0
+        sta reuOK
 mainLoop:
         jsr readInput
         jsr movePlayer
         jsr renderFrame             // 3D -> MATRIX
         jsr convert                 // MATRIX -> back buffer
         jsr flip                    // show it
+        inc frameCnt                // host-visible frame counter (defs.asm)
+        bne mainLoop
+        inc frameCnt+1
         jmp mainLoop
+
+//------------------------------------------------------------
+// turboOn — engage the C64 Ultimate's turbo mode.
+//
+// Found on real hardware (C64 Ultimate, firmware 1.1.0, core 1.49):
+// writing the target speed to $D031 on its own does not take effect.
+// The register has to be walked down to 1 MHz first and then up to the
+// wanted speed; only the transition engages the turbo. So: disable,
+// then enable.
+//
+// Harmless on a stock C64 and in VICE, where $D031 is an unconnected
+// VIC mirror -- see the TURBOREG notes in defs.asm.
+//------------------------------------------------------------
+turboOn:
+        lda #TURBO_1MHZ
+        sta TURBOREG
+        lda #TURBO_MAX
+        sta TURBOREG
+        rts
 
 //------------------------------------------------------------
 // The converter only writes cells 0-879 (rows 0-21); rows 22-24
@@ -92,7 +128,12 @@ clearHudRows:
         rts
 
 #import "input.asm"
+#import "reu.asm"
 #import "testmap.asm"
+// The portal stack and its neighbours sit in the same free block, just
+// above the code. Before they were moved to $0f00 the margin here was
+// three bytes, and nothing would have said so.
+.errorif * > pStkSec, "main code overflows into the portal stack"
 .errorif * > MATRIX, "main code overflows into MATRIX"
 
 #import "render/chunky2mc.asm"
