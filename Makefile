@@ -12,6 +12,7 @@
 #   make u64-fps    run on the Ultimate and measure the real frame rate
 #   make u64-map    run on the Ultimate and verify the REU map image landed
 #   make reubench   measure REU DMA throughput on the Ultimate
+#   make audiotest  the two audio-feasibility probes (sidtest + irqtest)
 #   make clean
 
 # KickAssembler is only distributed from theweb.dk; keep the location
@@ -67,7 +68,7 @@ REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
 .PHONY: all run shot check debug stats assets reubench run-u64 u64-config \
-        u64-fps u64-map setup clean
+        u64-fps u64-map sidtest irqtest audiotest setup clean
 
 # `setup` is defined first for readability but must not be the default goal:
 # a bare `make` has to build, as the README says it does.
@@ -135,6 +136,34 @@ $(BENCH): src/reubench.asm src/reu.asm src/defs.asm
 
 reubench: $(BENCH) u64-config
 	$(PYTHON) tools/reubench.py $(U64_HOST) $(BENCH)
+
+# The two audio-feasibility probes. Neither touches the engine; both exist to
+# answer a question that would otherwise be answered by a player that half
+# works. See the headers of src/sidtest.asm and src/irqtest.asm.
+#
+#   sidtest  do SID register writes survive a 64 MHz CPU, including a
+#            25-register burst written back to back?
+#   irqtest  can an interrupt be taken and returned across the $34/$35
+#            banking windows, and what does one cost?
+#
+# Both depend on u64-config for the same reason everything else does: without
+# "C64U Turbo Registers" the machine ignores $d031 and the 64 MHz pass is a
+# 1 MHz pass that says it is not.
+SIDTEST := build/sidtest.prg
+$(SIDTEST): src/sidtest.asm src/defs.asm
+	$(KICKASS) src/sidtest.asm -odir build -o $(SIDTEST) -showmem -vicesymbols
+
+IRQTEST := build/irqtest.prg
+$(IRQTEST): src/irqtest.asm src/defs.asm
+	$(KICKASS) src/irqtest.asm -odir build -o $(IRQTEST) -showmem -vicesymbols
+
+sidtest: $(SIDTEST) u64-config
+	$(PYTHON) tools/sidtest.py $(U64_HOST) $(SIDTEST)
+
+irqtest: $(IRQTEST) u64-config
+	$(PYTHON) tools/irqtest.py $(U64_HOST) $(IRQTEST)
+
+audiotest: sidtest irqtest
 
 # The map images. Both go through the same packers in wad2reu.py; the format
 # they share is frozen in docs/reu-format.md.

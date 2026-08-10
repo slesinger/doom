@@ -1093,3 +1093,114 @@ not 10%, and it is worth more than that in how the game feels.
   items, untouched.
 - **Quality scaling.** The clock the feedback loop needs now exists. Nothing
   reacts to a frame that overran.
+
+---
+
+## 14. Session log — 2026-08-10, the two audio unknowns
+
+Audio is deferred to M2 (§2), but two of its assumptions are *hardware*
+questions, and answering them after a player is written means debugging a
+player and a machine at the same time. Both are now measured. Neither costs
+the engine a byte: `src/sidtest.asm` and `src/irqtest.asm` are standalone
+PRGs, like `reubench.asm`, and `make check` is still green.
+
+**Both answers are yes**, and the interesting part is what the numbers say
+about where the real cost of music is — which is not where the worry was.
+
+### The compute worry was misplaced by two orders of magnitude
+
+| measured on the C64 Ultimate at 64 MHz | |
+|---|---:|
+| interrupt taken and returned, handler saving and restoring `$01` | **1.7 µs** (110 cycles) |
+| the same, plus 25 SID registers written back to back | **9.1 µs** (585 cycles) |
+| two of those per 39.9 ms frame, i.e. a 50 Hz player against 25 fps | **0.018 ms — 0.05% of the frame** |
+
+The 25-register burst costs 475 cycles, about 19 a write. That number is the
+answer to the question behind the question: **the Ultimate does not stall the
+CPU down to the SID's 1 MHz bus.** Had it done so, 25 writes would have cost
+25 µs on their own, and the burst would have been three times the whole
+interrupt.
+
+So a music player is not a frame-budget problem. §13's judder — three frames
+in four making the 39.90 ms boundary and one missing it — is untouched at
+this scale. The blockers for audio are RAM and the memory map, which is an
+M2-shaped project, not a frame-time one.
+
+### Interrupts are safe in the banking scheme, and the test proves it can fail
+
+`defs.asm` warns that the `$34`/`$35` windows are only safe because interrupts
+are masked for the whole run. They are safe with interrupts *unmasked* too,
+provided the handler saves `$01` and restores what it found:
+
+```
+                      mode     irq/s    loops/s  in-window  mismatches
+        0  correct handler      1966      41185        98%           0
+         2  interrupts off         0      41325          -           0
+    3  correct + SID burst      1966      40583        98%           0
+    1  wrong bank restored      1966      39330       100%        3951
+0  correct handler (again)      1966      41186        98%           0
+```
+
+9701 of 9851 interrupts landed *inside* a `BANK_RAM` window and not one
+corrupted a read. The mode-1 row is why that means something: with the
+handler restoring `$35` unconditionally the same run produces 3951 canary
+mismatches in two seconds. Without that positive control, mode 0's zero would
+only have proved the test was blind.
+
+Two things fall out that the plan did not know:
+
+- **`$ff40-$ffff` is 192 bytes of free RAM, and it holds the CPU vectors.**
+  BITMAP1 ends at `$ff3f`; nothing in the memory map claims what follows. Both
+  banking states have HIRAM = 0, so the KERNAL is out and `$fffe` is read from
+  that RAM in both — one write serves the whole engine. This is where an IRQ
+  vector goes.
+- **The handler needs no `sei` fencing around the bank windows.** Saving `$01`
+  is sufficient and costs 110 cycles all-in.
+
+### SID writes survive turbo, including the patterns a player uses
+
+Voice 3's oscillator is readable at `$d41b` while bit 7 of `$d418` keeps it
+out of the audio path, so the chip can be interrogated in silence. Four write
+patterns — spaced, tight, all 25 registers in one run, and eight of those
+bursts back to back — at 1 MHz and again at 64 MHz:
+
+| | step per tick, freq `$0400` | predicted |
+|---|---:|---:|
+| 1 MHz, all four patterns | 15.57 – 15.71 | 15.62 |
+| 64 MHz, all four patterns | 15.57 – 15.71 | 15.62 |
+
+Spread across the four patterns is 0.14 units at both speeds. **A player may
+write the SID at full turbo with no pacing.**
+
+The half- and double-frequency controls (`$0200` and `$0800`, read as 0.495x
+and 2.000x the reference) are what make that a result rather than a
+coincidence: a run in which every write was dropped would show four identical
+rows and be reported as a pass. That failure mode is this project's recurring
+one — §11 found three silent failures in a row on the REU path — and it is
+worth building the control in from the start every time.
+
+### VICE cannot be used for either of these, and fails misleadingly
+
+`$d031` is inert in VICE, so both "speed passes" are 1 MHz passes and the
+question simply goes unasked. Worse, **VICE's `$d41b` does not track the
+frequency register at all**: it reads as a counter advancing one unit per CPU
+cycle whatever is written, which the raw trace shows as three identical ramps
+for `$0200`, `$0400` and `$0800`. A run there looks like a catastrophic
+hardware failure and is an emulation artefact.
+
+`tools/sidtest.py` therefore checks the raw trace *first* and refuses to
+interpret anything if the three frequencies are not in a 1 : 2 : 4 ratio.
+That check cost one iteration to write and saved the whole result from being
+read backwards.
+
+### What this does not answer
+
+- **Where the ~1.5 KB a player and its tune need is going to live.** The free
+  holes total roughly 360 usable bytes (`$ff40-$ffff`, the instrumentation
+  tail, `$0770-$07ff`), and the 384 under the I/O space are unusable for code
+  that has to reach `$d400`. Song data streamed from REU is the obvious shape
+  — 90 KB is free there and the transport is 1 byte/µs — but the player
+  itself has to be resident and there is nowhere to put it yet.
+- **Tempo.** The main loop runs at 25 fps and a player wants 50 Hz. That is
+  what the interrupt is for, and the interrupt is now known to work; nothing
+  has been built on it.
