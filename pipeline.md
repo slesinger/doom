@@ -1291,11 +1291,13 @@ spans until the column is finally closed — `algorithm.md`'s
 $0002-$008F  zero page: math / renderer / converter / camera / span / accumulators
 $0100-$01FF  6510 stack
 $0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
+$02A0-$02AF  frame timer      ftInt/ftComp/ftCMin/ftCMax + the raster histogram
 $0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0C20  main + input + REU code
+$0810-$0C29  main + input + REU code
 $0C30-$0CB2  sphereVisible + sphereTest
 $0D00-$0D31  udiv8            udiv's eight-iteration short path
+$0D40-$0DE7  ftInit / frameStat / frameMark   the per-frame compute timer
 $0E00-$0E1F  MAPINFO          resident block 0
 $0E20-$0E5C  nodeSphere       the per-node sphere fetch
 $0E60-$0E67  SSECHDR          subsector slot header + its bounding sphere
@@ -1314,7 +1316,7 @@ $9900-$9B4A  converter code
 $9B4B-$9B5A  cntBump          the counter helper
 $9B60-$9D7C  math + spanFill code
 $9D80-$9F8D  walls helper routines
-$9F8E-$9FE8  CIA2 ms clock + framePace
+$9F8E-$9FEB  CIA2 ms clock + framePace
 $A000-$BF3F  BITMAP0          (VIC bank 2)
 $C000-$C3FF  SCREEN1          (VIC bank 3)
 $C400-$CA2B  math tables      sqr 1024 B, sin 512 B, rowCell 44 B
@@ -1394,9 +1396,10 @@ of 50.
 So the §12.1 estimate of ~994k cycles was low by roughly a third — 20 ms at
 64 MHz is ~1.28M cycles — but right about where the time goes.
 
-**E1M1 measured 17.6 fps (56.9 ms/frame) on the same machine, and 22.2 fps
-(45.1 ms/frame) after two culling passes.** The VICE column below is what
-predicted it:
+**E1M1 measured 17.6 fps (56.9 ms/frame) on the same machine, 22.2 fps
+(45.1 ms/frame) after two culling passes, and 22.7 fps (44.0 ms/frame) after
+§15's three bit-identical wins.** The VICE column below is what predicted the
+first two, and over-predicted the third:
 
 | Build | VICE ms/frame | E1M1 nodes | subsectors | segs |
 |---|---:|---:|---:|---:|
@@ -1423,9 +1426,26 @@ flip a frame between 25 and 16.7 fps, which reads as judder) and the cheapest
 iteration path through `udiv` for the quotients that fit in a byte, and the
 exact `sqrt(2)·r` frustum test in place of the axis-aligned box, which had been
 demanding 0.59 of a radius more clearance than geometry requires. VICE went
-2551 → 2311 ms/frame, which through the conversion above predicts **~34.3 ms of
-compute, about 5.6 ms clear of the 39.90 ms boundary**. Awaiting confirmation
-by `make u64-fps`.
+2551 → 2311 ms/frame, which through the conversion above predicts ~34.3 ms of
+compute, about 5.6 ms clear of the 39.90 ms boundary.
+
+**Hardware refused that prediction: 22.73 fps, 44.0 ms/frame** (§16). The VICE
+frame came down 9.4%, the hardware frame 2.4%, and the decomposition moved from
+`39.90 x 74% + 59.85 x 26%` to `39.90 x 79% + 59.85 x 21%` — one frame in five
+misses the deadline instead of one in four. At 34.3 ms of compute *every* frame
+would make it and the reading would be 25.00; it is not, so the conversion is
+wrong somewhere it cannot be seen from outside. Two candidates: REU DMA is
+1 byte/µs on both machines and so is a far larger share of the hardware frame
+than of the VICE one, which makes a whole-frame ratio over-credit every
+CPU-side saving; and compute may vary frame to frame on hardware where it does
+not in VICE (the engine's own timer reports a one-tick spread over 203 VICE
+frames with a static camera, which cannot produce a 22.73 reading).
+
+**The engine therefore times itself now** (`src/clock.asm`, §16): compute per
+frame, min and max over a run, and a histogram of how many raster frames each
+one spanned, at `$02a0` for `make u64-fps` to read. The average frame rate
+cannot separate "1 ms over the deadline" from "10 ms over" — `flip` quantises
+both to 59.85 ms — and those two want opposite work.
 
 Worth recording alongside it: a *cheaper* transform for the sphere test
 measured **slower**. Culling accuracy turned out to be worth several times what

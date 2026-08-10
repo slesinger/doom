@@ -34,6 +34,27 @@
 .const colTop  = $0200              // first open row
 .const colBot  = $0300              // first closed row below
 
+// Frame-time statistics, in colTop's unused tail: the renderer touches columns
+// 0-159 only, so $02a0-$02af is free RAM that is *outside* the PRG image, which
+// is what this needs -- runtime writes inside the image show up in
+// tools/vicedbg/probe.py's live-RAM diff as unexplained differences, which is
+// the trade instrument.asm's counters accept and this does not have to.
+//
+// Why the engine has to measure this itself: the host can divide frameCnt by
+// wall-clock seconds and get an average frame time, but `flip` quantises that
+// to a multiple of 19.95 ms, so the average says how many frames missed a
+// deadline and nothing about by how much. Compute time is the number that
+// decides whether more optimisation is worth anything, and only the machine
+// can see it (IMPLEMENTATION_PLAN.md §16).
+//
+// Units are Timer B ticks, 1.015 ms each -- see FPS_CAP_TICKS.
+.const ftInt   = $02a0              // the last flip-to-flip interval
+.const ftComp  = $02a2              // the last frame's compute, flip -> framePace
+.const ftCMin  = $02a4              // compute, min over the run
+.const ftCMax  = $02a6              // compute, max over the run
+.const ftHist  = $02a8              // 4 x 16-bit: frames that cost 1, 2, 3, 4+
+                                    // raster frames. $02a8-$02af
+
 // BSP descent stack, in the free RAM below MATRIX -- the address the portal
 // stack used to occupy. One 16-bit entry (a raw child word, subsector bit and
 // all) per node on the path from the root down to the leaf being rendered, so
@@ -154,7 +175,8 @@
 // build by name.
 //
 //   SPHCODE   $0c30-$0cff  208 B   sphereVisible + sphereTest
-//   UDIV8     $0d00-$0dff  256 B   udiv's short path (math.asm, not a sphere)
+//   UDIV8     $0d00-$0d3f   64 B   udiv's short path (math.asm, not a sphere)
+//   FTCODE    $0d40-$0dff  192 B   frame-time statistics (clock.asm, ditto)
 //   SPHCODE3  $0e20-$0e5f   64 B   nodeSphere: the per-node REU fetch
 //
 // SPHCODE is where mapLoad used to be assembled. Moving boot-only code into
@@ -163,10 +185,11 @@
 // below MATRIX was sixty bytes and the test had to be shaped to fit it.
 //
 // Three blocks are free and are now the largest unclaimed RAM below MATRIX:
-// $0cb3-$0cff and $0d33-$0dff (SPHCODE's and UDIV8's own tails) and
+// $0cb3-$0cff, $0d33-$0d3f (SPHCODE's and UDIV8's own tails) and
 // $0fc4-$0fff (60 B, where sphereVisible used to live).
 .const SPHCODE   = $0c30
 .const UDIV8     = $0d00            // udiv's short path -- math.asm
+.const FTCODE    = $0d40            // frame-time statistics -- clock.asm
 .const SPHEND    = $0e00            // MAPINFO: what the block above must clear
 .const SPHCODE3  = $0e20
 
@@ -419,6 +442,7 @@
 //------------------------------------------------------------
 .const msLast  = $90        // CIA2 Timer B at the last completed frame
 .const msNow   = $92        // scratch for a torn-read-safe timer read
+.const msFrame = $96        // ... at the last completed flip (see ftInt below)
 
 // The bounding sphere's radius, world units, live across the transform.
 .const zRad    = $94

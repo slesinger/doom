@@ -5,10 +5,12 @@
 //  MATRIX, chunky2mc conversion, double buffering.
 //
 //  Memory map:
-//    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
+//    $0200-$029F  colTop (renderer clip)      $0300-$039F colBot
+//    $02A0-$02AF  frame-time statistics (colTop's unused tail)
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0C20  main / input / REU
+//    $0810-$0C29  main / input / REU
 //    $0C30-$0CB2  sphere test        $0D00-$0D31  udiv short path
+//    $0D40-$0DE7  frame-time statistics code
 //    $0E00-$0E1F  MAPINFO
 //    $0E20-$0E5C  node sphere fetch  $0E60-$0E67  SSECHDR + sphere
 //    $0E70-$0EEE  collision helpers
@@ -99,7 +101,13 @@ main:
         bne !mismatch+
         lda zChild
         cmp miSpawnSsec
-        beq mainLoop
+        bne !mismatch+
+        // Seed the frame-time statistics *here*, not next to msInit: their
+        // reference point is the last flip, and before the first one that is
+        // the boot sequence. Seeded up there, frame 1 reports reuProbe and
+        // mapLoad as compute and poisons ftCMax for the whole run.
+        jsr ftInit                  // clock.asm
+        jmp mainLoop
 !mismatch:
         lda #MERR_SPAWN
         sta mapErr
@@ -120,6 +128,8 @@ mainLoop:
         jsr convert                 // MATRIX -> back buffer
         jsr framePace               // hold the rate at 25 fps -- clock.asm
         jsr flip                    // show it
+        jsr frameMark               // close the frame: which raster frame did
+                                    // it land on, and what did it cost
         inc frameCnt                // host-visible frame counter (defs.asm)
         bne mainLoop
         inc frameCnt+1

@@ -19,29 +19,28 @@ it. The hand-built test map is gone — it goes through the same packer now, so
 `make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
 verifiable sectors.
 
-**Frame time.** E1M1 measured **17.6 fps** on a C64 Ultimate at 64 MHz; two
-culling passes — a world-space seg backface test, and bounding-sphere rejection
-of whole BSP subtrees — took it to a measured **22.2 fps**. A frame cap holds
-simple views at 25 rather than letting them run at 50 and move the player twice
-as fast.
+**Frame time: a measured 22.7 fps on a C64 Ultimate at 64 MHz.** E1M1 started
+at 17.6; two culling passes — a world-space seg backface test, and
+bounding-sphere rejection of whole BSP subtrees — took it to 22.2, and a
+further 9.4% off the VICE frame (`spanFill`'s cell step, a short path through
+`udiv`, the exact frustum test in place of the axis-aligned box) took it to
+22.7. A frame cap holds simple views at 25 rather than letting them run at 50
+and move the player twice as fast.
 
 `flip` is raster-synced, so frame time can only be a multiple of 19.95 ms, and
-at 22.2 fps three frames in four made the 25 fps deadline while one in four
-missed it — which is judder, not slowness. A further **9.4%** has since come off
-the frame (`spanFill`'s cell step, a short path through `udiv`, and the exact
-frustum test in place of the axis-aligned box), which should put compute about
-5.6 ms clear of the boundary and lock the game at a solid 25.
+22.7 fps means **four frames in five make the 25 fps deadline and one misses
+it** — which is judder rather than slowness. That last 9.4% was supposed to
+close it and moved it about a fifth as far as projected; the engine now times
+itself per frame so the next attempt starts from a measurement instead of a
+conversion. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §16 has the
+reading and why the projection was wrong.
 
 Every optimization in this project is verified **pixel-identical** against the
 build before it — 0 of 104448 pixels differing — because the rendered frame is
 the only oracle the engine has. See
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12-§15 for the
-measurements, including one change that measured *slower* and was reverted.
-
-**What Milestone 1 still owes:** the hardware confirmation of that last 9.4%.
-`make u64-fps` is the outstanding gate — the numbers above it are VICE
-projections through a conversion §13 established, not a reading off the
-machine.
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12-§16 for the
+measurements, including one change that measured *slower* and was reverted, and
+one projection that hardware refuted.
 
 ---
 
@@ -102,6 +101,8 @@ src/render/walls.asm      one seg: near-plane clip, projection, line
                           interpolators, column spans, occlusion
 src/render/chunky2mc.asm  Bayer-dithered chunky -> multicolor converter,
                           double buffering, flip
+src/clock.asm             CIA2 millisecond clock, the 25 fps cap, and the
+                          per-frame compute timer read by make u64-fps
 tools/vicedbg/            VICE binary-monitor client, live-RAM diff probe,
                           frame/workload stats, and profile.py (per-frame call
                           counts for the hot routines, via VICE checkpoints)
@@ -118,7 +119,7 @@ tools/setup-dev-env.sh    VICE + C64 ROM setup
 **Controls:** `W`/`S` walk, `A`/`D` turn, `Q`/`E` strafe; joystick 2 walks and
 turns.
 
-The frame loop is `main.asm:59`:
+The frame loop is [`main.asm:124`](src/main.asm#L124):
 
 ```
 mainLoop:
@@ -126,11 +127,13 @@ mainLoop:
         jsr movePlayer
         jsr renderFrame     ; 3D -> MATRIX (chunky, 1 byte/pixel)
         jsr convert         ; MATRIX -> back bitmap + screen + COLBUF
+        jsr framePace       ; hold the rate at 25 fps, and time the frame
         jsr flip            ; wait vblank, swap banks, burst COLBUF -> $d800
+        jsr frameMark       ; which raster frame did it land on
         jmp mainLoop
 ```
 
-`pipeline.md` walks every one of those five calls in detail.
+`pipeline.md` walks every one of those calls in detail.
 
 ---
 

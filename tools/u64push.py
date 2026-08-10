@@ -19,6 +19,11 @@ Phase 1.2.
 over a wall-clock interval and reports the real frame rate. It is a DMA
 read over the network, so it does not perturb the running engine beyond
 the few stolen cycles of the DMA itself.
+
+It then reports what the engine timed about itself: compute per frame and
+which raster frame each one landed on. The frame rate alone cannot separate
+"the renderer is 1 ms over the deadline" from "10 ms over" -- `flip`
+quantises both to the same 59.85 ms -- and those two want opposite work.
 """
 
 from __future__ import annotations
@@ -35,10 +40,18 @@ from u64 import Ultimate, U64Error, add_host_args
 FRAMECNT_ADDR = 0x0F40
 CIA2_TBLO = 0xDD06            # `.const CIA2_TBLO` in src/defs.asm
 
+# The engine's own frame timer -- `.const ftInt` in src/defs.asm, 16 bytes:
+# ftInt, ftComp, ftCMin, ftCMax, then four 16-bit histogram buckets.
+FT_ADDR = 0x02A0
+
 # PAL's frame period. The VIC's raster is the only absolutely-known frequency
 # on the machine -- it does not care what the CPU or the turbo are doing -- so
 # it is what calibrates everything else here.
 PAL_FRAME_MS = 19.9504
+
+# One Timer B tick is a Timer A period, i.e. 1000 phi2 cycles at PAL's
+# 985248 Hz. Not a millisecond -- see FPS_CAP_TICKS in src/defs.asm.
+TICK_MS = 1000.0 * 1000.0 / 985248.0
 
 REU_CATEGORY = "C64 and Cartridge Settings"
 
@@ -264,6 +277,7 @@ def wait_for_engine(u: Ultimate, deadline: float = 20.0) -> None:
 
 def measure_fps(u: Ultimate, seconds: float) -> None:
     wait_for_engine(u)
+    reset_frame_stats(u)
     t0 = time.monotonic()
     c0, m0 = read_framecnt(u), read_ms(u)
     time.sleep(seconds)
@@ -281,6 +295,68 @@ def measure_fps(u: Ultimate, seconds: float) -> None:
     print(f"fps: {frames} frames in {elapsed:.2f} s = {fps:.2f} fps "
           f"({1000.0 / fps:.1f} ms/frame)")
     check_cia_timebase(m0, m1, elapsed)
+    report_frame_stats(u)
+
+
+# The accumulators run from boot, and the first second after run_prg is not
+# representative: the Ultimate is still finishing its own post-reset
+# housekeeping and stealing bus cycles (see WARMUP_SECONDS). Clearing them at
+# the top of the window keeps that transient out of ftCMax, which is otherwise
+# the one number it would dominate.
+FT_CLEAR = bytes([0, 0, 0, 0, 0xFF, 0xFF, 0, 0]) + bytes(8)
+
+
+def reset_frame_stats(u: Ultimate) -> None:
+    try:
+        u.writemem(FT_ADDR, FT_CLEAR)
+    except U64Error as e:
+        print(f"frame: could not clear the accumulators ({e}) -- min/max "
+              f"below include everything since boot", file=sys.stderr)
+
+
+def report_frame_stats(u: Ultimate) -> None:
+    """Print what the engine timed about itself.
+
+    The frame rate above is an average of quantised frames: `flip` syncs to
+    raster line 251, so a frame costs a whole number of 19.95 ms periods
+    whatever the work took. That average says how many frames missed the
+    25 fps deadline; it cannot say by how much, and only the machine can.
+    See IMPLEMENTATION_PLAN.md §16.
+    """
+    raw = u.readmem(FT_ADDR, 16)
+    if len(raw) < 16:
+        print(f"frame: readmem returned {len(raw)} bytes, expected 16",
+              file=sys.stderr)
+        return
+    val = [raw[i] | raw[i + 1] << 8 for i in range(0, 16, 2)]
+    _, comp, cmin, cmax, *hist = val
+    if cmin > cmax:                      # cleared, and no frame since
+        print("frame: no compute samples -- the engine has not completed a "
+              "frame since the accumulators were cleared", file=sys.stderr)
+        return
+
+    deadline = 2 * PAL_FRAME_MS
+    print(f"frame: compute {comp * TICK_MS:.1f} ms last, "
+          f"{cmin * TICK_MS:.1f} min, {cmax * TICK_MS:.1f} max "
+          f"(deadline {deadline:.2f} ms)")
+    total = sum(hist) or 1
+    parts = " ".join(f"{n}x{h}" if n < 4 else f"4+x{h}"
+                     for n, h in enumerate(hist, start=1))
+    print(f"frame: raster frames {parts} -- "
+          f"{100.0 * hist[1] / total:.0f}% made the 25 fps deadline")
+
+    if cmax * TICK_MS <= deadline:
+        print("frame: ok -- every frame's compute fits in two raster frames, "
+              "so any miss is pacing, not the renderer")
+    elif cmin * TICK_MS > deadline:
+        print(f"frame: *** every frame overruns by at least "
+              f"{cmin * TICK_MS - deadline:.1f} ms -- the renderer is the "
+              f"whole story, and 25 fps needs that much off it ***")
+    else:
+        print(f"frame: *** compute straddles the deadline: "
+              f"{deadline - cmin * TICK_MS:.1f} ms under it at best, "
+              f"{cmax * TICK_MS - deadline:.1f} ms over it at worst -- "
+              f"the spread is what costs the frames, not the average ***")
 
 
 def check_cia_timebase(m0: int, m1: int, elapsed: float) -> None:
