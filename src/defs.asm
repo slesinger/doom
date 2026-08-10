@@ -102,6 +102,15 @@
 // the bounding-sphere test now occupies -- see SPHCODE3.
 .const MAPHDR   = MATRIX + $4000
 
+// Boot-only code, on the same argument as MAPHDR one line up: mapLoad runs
+// once, before the first frame, and MATRIX is scratch until spanFill writes
+// the first one -- so the loader can live in the buffer it is filling. It sat
+// in the main segment below $0e00 until the frame-time work needed that space
+// for code that runs 150 times a frame, which is the better use of the only
+// RAM the engine has left. Clear of both the staging area (MATRIX..+2880, the
+// largest resident block) and MAPHDR.
+.const BOOTCODE = MATRIX + $4100
+
 // One subsector's segs, DMA'd per visit. In TABLES_FREE rather than in the
 // $0e00 page: everything below MAPINFO is code headroom, and the sphere
 // compares have taken the last of it -- see main.asm's .errorif.
@@ -138,22 +147,44 @@
 // stack and MATRIX. $0f51-$0fc3.
 .const BFACECODE = $0f51
 
-// The bounding-sphere visibility test, in three pieces because the free RAM
-// below MATRIX is in three pieces. Every one is guarded by an .errorif against
-// what follows it, so growing one past its block fails the build by name.
+// The bounding-sphere visibility test, in two pieces: the transform and the
+// compares together, and the per-node REU fetch separately, because that one
+// has to sit where the code that jumps into it can reach it. Both are guarded
+// by an .errorif against what follows, so growing one past its block fails the
+// build by name.
 //
-//   SPHCODE   $0fc4-$0fff   60 B   sphereVisible: decode + transform
-//   SPHCODE2  $0dbc-$0dff   68 B   sphereTest:    the three frustum compares
-//   SPHCODE3  $0e20-$0e5f   64 B   nodeSphere:    the per-node REU fetch
+//   SPHCODE   $0c30-$0cff  208 B   sphereVisible + sphereTest
+//   UDIV8     $0d00-$0dff  256 B   udiv's short path (math.asm, not a sphere)
+//   SPHCODE3  $0e20-$0e5f   64 B   nodeSphere: the per-node REU fetch
 //
-// SPHCODE2 takes what used to be the main segment's headroom and SPHCODE3
-// takes MAPHDR's old home, so both of those are now spent. The next routine
-// that needs low RAM has to find it somewhere else. SPHCODE2 in particular is
-// sized to the byte -- it starts one byte above where the main segment ends,
-// and both ends are asserted.
-.const SPHCODE   = $0fc4
-.const SPHCODE2  = $0dbc
+// SPHCODE is where mapLoad used to be assembled. Moving boot-only code into
+// MATRIX (BOOTCODE, above) freed 411 bytes here, which is what let sphereTest
+// grow from the box test to the exact one -- before that the largest free block
+// below MATRIX was sixty bytes and the test had to be shaped to fit it.
+//
+// Three blocks are free and are now the largest unclaimed RAM below MATRIX:
+// $0cb3-$0cff and $0d33-$0dff (SPHCODE's and UDIV8's own tails) and
+// $0fc4-$0fff (60 B, where sphereVisible used to live).
+.const SPHCODE   = $0c30
+.const UDIV8     = $0d00            // udiv's short path -- math.asm
+.const SPHEND    = $0e00            // MAPINFO: what the block above must clear
 .const SPHCODE3  = $0e20
+
+// $ff40-$fff9, 186 B, is free RAM and deliberately still unclaimed. BITMAP1
+// ends at $ff3f and nothing follows it; code can live there at all because both
+// banking states the engine uses ($34 and $35) have HIRAM = 0, so the KERNAL is
+// out and it is RAM in either window (src/irqtest.asm established that). The
+// six bytes above it, $fffa-$ffff, are the NMI/RESET/IRQ vectors, read from
+// exactly this RAM when an interrupt is taken with HIRAM = 0.
+//
+// Nothing is put there, and that is a decision rather than an oversight.
+// Reaching past $CFDA extends the PRG image over $D000-$DFFF, so loading it
+// writes 4 KB of filler across the I/O space -- harmless under VICE's RAM
+// injection, but it depends on how the loader banks memory, and the U64 path
+// is a DMA whose behaviour there nobody has tested. udiv's short path was
+// assembled here first and moved back down once mapLoad's relocation freed
+// low RAM; the measurement was identical either way. This block is M2's, for
+// the audio interrupt that has to reach $fffe.
 
 // bsp.asm lands in two pieces. The traversal proper follows doWall in the walls segment; the node test
 // and the standalone descent go in the tail of TABLES_FREE. Two pieces
@@ -389,10 +420,9 @@
 .const msLast  = $90        // CIA2 Timer B at the last completed frame
 .const msNow   = $92        // scratch for a torn-read-safe timer read
 
-// The bounding sphere's radius, world units, live across transformPoint.
-// The centre needs no zero page of its own: it goes straight into zTx/zTy,
-// which is what transformPoint reads.
+// The bounding sphere's radius, world units, live across the transform.
 .const zRad    = $94
+
 
 //------------------------------------------------------------
 // zero page — converter ($40-$4a)

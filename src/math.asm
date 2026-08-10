@@ -172,6 +172,20 @@ ssmul32:
 //------------------------------------------------------------
 // udiv: zD (24-bit unsigned) / zV (16-bit, >0) -> zD+0..1 (16-bit)
 // Saturates to $ffff if the quotient would not fit.
+//
+// Two loops, and which one runs is decided by one 16-bit compare. This is the
+// hottest routine in the engine -- profiling the spawn frame counted 512 calls,
+// about 18% of it, from projSX, projRow, clipT and sdiv -- and most of those
+// quotients are small: a screen row or a screen column, not a 16-bit number.
+//
+//   (zD+2:zD+1) < zV   <=>   zD < 256*zV   <=>   quotient < 256
+//
+// and when the quotient's top eight bits are all zero, the first eight
+// iterations of the loop below cannot subtract, so all they do is shift the
+// dividend's top byte into the remainder. Skipping them leaves the remainder at
+// exactly (zD+2:zD+1), which is what udiv8 starts from. It is the same
+// quotient, bit for bit, not an approximation -- see UDIV8 in defs.asm for
+// where the second loop lives.
 //------------------------------------------------------------
 udiv:
         lda zV+1                    // quotient fits iff zD+2 < zV
@@ -183,7 +197,13 @@ udiv:
         sta zD+0
         sta zD+1
         rts
-!ok:    lda zD+2
+!ok:    lda zD+1                    // quotient < 256 -> the short path
+        cmp zV
+        lda zD+2
+        sbc zV+1
+        bcs !long+                  // udiv8 is out of branch range: it is in
+        jmp udiv8                   // the free low RAM, not in this segment
+!long:  lda zD+2
         sta zT                      // remainder lo
         lda #0
         sta zT+1                    // remainder hi
@@ -249,13 +269,27 @@ sdiv:
 // spanFill: vertical run into MATRIX.
 //   column zSX, rows [zSY0, zSY1), color zSCol.
 // Preserves X. No-op when zSY0 >= zSY1.
+//
+// The step to the next cell down is inlined at both of its sites rather than
+// called. It was a subroutine that saved A across itself, which cost 29 cycles
+// -- jsr/rts plus a pha/pla -- against the 64 the eight stores it serves are
+// worth; profiling the spawn frame put the cell loop at about 4600 iterations,
+// so the call alone was ~2.5% of the frame. Inlined it is 10 cycles and needs
+// no pha/pla: both callers reload A from zSCol immediately afterwards anyway.
 //------------------------------------------------------------
+.macro NextCell() {                 // ptr += 1280 ($500): lo unchanged.
+        lda zSPtr+1                 // Clobbers A -- see the note above.
+        clc
+        adc #5
+        sta zSPtr+1
+}
+
 spanFill:
         lda zSY1                    // clamp the run's far end to the last
         cmp #177                    // valid row (176 = 22 cell-rows * 8):
-        bcc !+                      // otherwise the cell loop below walks
-        lda #176                    // spanNextCell past rowCell's 22 entries
-        sta zSY1                    // one full cell at a time, unbounded
+        bcc !+                      // otherwise the cell loop below steps the
+        lda #176                    // pointer past rowCell's 22 entries, one
+        sta zSY1                    // full cell at a time, unbounded
 !:      sec
         sbc zSY0
         beq !nul+
@@ -267,13 +301,14 @@ spanFill:
         pha
         ldx zSX                     // bounds-check before either table lookup:
         cpx #160                    // an out-of-range index would read past
-        bcs spanEnd                 // xOfs/rowCell into whatever follows them
-        lda zSY0
+        bcc !ok+                    // xOfs/rowCell into whatever follows them.
+!bad:   jmp spanEnd                 // spanEnd is out of branch range from here
+!ok:    lda zSY0                    // now that the cell step is inlined below
         lsr
         lsr
         lsr
         cmp #22
-        bcs spanEnd
+        bcs !bad-
         tay                         // Y = cell row of first pixel (bounds-checked)
         lda xOfsLo,x
         clc
@@ -299,7 +334,8 @@ spanFill:
         iny
         cpy #32
         bcc !head-
-        jsr spanNextCell
+        :NextCell()
+        lda zSCol                   // NextCell clobbered the fill byte
 spanCells:                          // full 8-pixel cells
         ldx zSCnt
         cpx #8
@@ -320,8 +356,9 @@ spanCells:                          // full 8-pixel cells
         sta (zSPtr),y
         ldy #28
         sta (zSPtr),y
-        jsr spanNextCell
-        txa
+        :NextCell()                 // A is dead here: the count arithmetic
+        txa                         // below clobbers it and reloads zSCol
+
         sec
         sbc #8
         tax
@@ -345,12 +382,51 @@ spanEnd:
         tax
 spanDone:
         rts
+mathCodeEnd:                        // main.asm asserts on this, not on `*`:
+                                    // the block below assembles into low RAM.
 
-spanNextCell:                       // ptr += 1280 ($500): lo unchanged
-        pha
-        lda zSPtr+1
-        clc
-        adc #5
-        sta zSPtr+1
-        pla
+//------------------------------------------------------------
+//  udiv's short path, in the low RAM mapLoad's relocation freed.
+//
+//  Entered from udiv when (zD+2:zD+1) < zV, i.e. when the quotient is known to
+//  fit in eight bits. The remainder starts at the dividend's top two bytes --
+//  which is where the sixteen-iteration loop would have arrived after eight
+//  shifts and no subtractions -- so this runs the remaining eight and produces
+//  an identical quotient in half the iterations. zD+1, the quotient's high
+//  byte, is zero by construction.
+//
+//  The loop body differs from the long one by a single instruction: there is no
+//  `rol zD+1`, because zD+1 is no longer part of the shift chain. That is also
+//  why the two cannot share a body.
+//------------------------------------------------------------
+.pc = UDIV8 "udiv short path"
+
+udiv8:
+        lda zD+1
+        sta zT                      // remainder = zD >> 8
+        lda zD+2
+        sta zT+1
+        lda #0
+        sta zD+1                    // quotient high byte: zero by construction
+        ldx #8
+!loop:  asl zD+0
+        rol zT
+        rol zT+1
+        bcs !sub+                   // remainder overflowed 16 bits -> subtract
+        lda zT
+        cmp zV
+        lda zT+1
+        sbc zV+1
+        bcc !next+
+!sub:   lda zT
+        sbc zV                      // carry is set on both paths
+        sta zT
+        lda zT+1
+        sbc zV+1
+        sta zT+1
+        inc zD+0                    // bit0 was just shifted in as 0
+!next:  dex
+        bne !loop-
         rts
+
+.errorif * > SPHEND, "udiv's short path overflows into MAPINFO"

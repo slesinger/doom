@@ -52,7 +52,14 @@
 
 //------------------------------------------------------------
 // mapLoad — carry set on success. Sets mapOK/mapErr either way.
+//
+// Assembled into MATRIX, not into the main segment -- see BOOTCODE in
+// defs.asm. This code has one caller, main.asm's boot path, and by the time
+// the first frame has been rendered it no longer exists: spanFill writes over
+// it. Nothing here may be called after boot.
 //------------------------------------------------------------
+.pc = BOOTCODE "boot: map loader"
+
 mapLoad:
         lda #0
         sta mapOK

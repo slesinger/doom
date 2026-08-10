@@ -7,13 +7,15 @@
 //  Memory map:
 //    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0DBA  main / input / map loader
-//    $0DBC-$0DFF  sphere compares    $0E00-$0E1F  MAPINFO
+//    $0810-$0C20  main / input / REU
+//    $0C30-$0CB2  sphere test        $0D00-$0D31  udiv short path
+//    $0E00-$0E1F  MAPINFO
 //    $0E20-$0E5C  node sphere fetch  $0E60-$0E67  SSECHDR + sphere
 //    $0E70-$0EEE  collision helpers
 //    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
-//    $0F51-$0FC3  seg backface test  $0FC4-$0FF1  sphere transform
+//    $0F51-$0FC3  seg backface test
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000
+//                 and the boot-only map loader at $5100 (BOOTCODE)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
 //    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
@@ -170,21 +172,24 @@ clearHudRows:
 
 #import "input.asm"
 #import "reu.asm"
-#import "mapload.asm"
-// SPHCODE2 is the first fixed allocation above the code, so it -- not MAPINFO
+// SPHCODE is the first fixed allocation above the code, so it -- not MAPINFO
 // and not the BSP stack at $0f00 -- is what the main segment has to clear.
 // Deleting testmap.asm bought about 190 B of headroom here and the sphere
 // compares have now spent all but one byte of it, so the next thing that grows
 // in this segment fails the build. That is the intent: the two are competing
 // for the same block, and the assembler should say which one lost.
-.errorif * > SPHCODE2, "main code overflows into the sphere compares"
+.errorif * > SPHCODE, "main code overflows into the sphere test"
+
+// Imported after that assertion, not before it, because it does not belong to
+// the main segment any more: it assembles into MATRIX (BOOTCODE in defs.asm).
+#import "mapload.asm"
 
 #import "render/chunky2mc.asm"
 .errorif * > MATHCODE, "converter code overflows into math code"
 .errorif tablesEnd > TABLES_FREE, "converter tables overflow into TABLES_FREE"
 
 #import "math.asm"
-.errorif * > BITMAP0, "math code overflows into BITMAP0"
+.errorif mathCodeEnd > BITMAP0, "math code overflows into BITMAP0"
 
 #import "render/walls.asm"
 #import "render/bsp.asm"

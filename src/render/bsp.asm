@@ -556,15 +556,13 @@ bspFindSsec:
 //  against a build without it is the test that matters.
 //
 //  It lands in three pieces because the free RAM below MATRIX is in
-//  three pieces (SPHCODE/SPHCODE2/SPHCODE3 in defs.asm), each with
+//  two pieces (SPHCODE/SPHCODE3 in defs.asm), each with
 //  its own .errorif.
 //============================================================
 
-.pc = SPHCODE "sphere test: transform"
-
 //------------------------------------------------------------
-// sphereVisible — is the sphere now in sphCX/sphCY/sphR inside the
-// view frustum?
+// sphereVisible — is the sphere in sphCX/sphCY/sphR inside the view
+// frustum?
 //   carry set   -> possibly visible, go on
 //   carry clear -> certainly outside, reject
 //
@@ -572,9 +570,20 @@ bspFindSsec:
 // seg endpoints, so "camera space" means exactly what it means
 // there: zRYt forward, zRXt rightward.
 //
+// A cheaper transform was tried here and measured *slower* -- see
+// IMPLEMENTATION_PLAN.md §15. The short version: this call is 153 of the
+// frame's 326 transformPoints and an 8x8 version of it does save about
+// 680 cycles a call, but a coarse transform has to inflate the radius to
+// stay conservative, and the frame turns out to be far more sensitive to
+// a sphere's radius than to what the transform costs. 128 units of slop
+// cost 6.7% of the frame; the transform saved 4.4%. Accuracy here is
+// worth more than speed, which is not where the cost model said to look.
+//
 // Clobbers A, X, Y and everything transformPoint does (zA, zB, zP,
 // zT, zSign, zTx, zTy, zRXt, zRYt). Callers reload X.
 //------------------------------------------------------------
+.pc = SPHCODE "sphere test: transform"
+
 sphereVisible:
         lda sphCX
         sec
@@ -597,63 +606,89 @@ sphereVisible:
         jsr transformPoint          // -> zRXt, zRYt  (walls.asm)
         jmp sphereTest
 
-.errorif * > MATRIX, "the sphere transform overflows into MATRIX"
-
 //------------------------------------------------------------
-//  Second piece: the compares themselves.
+//  The compares themselves, in the same block: sphereVisible falls
+//  straight into them and nothing else calls them.
 //------------------------------------------------------------
-.pc = SPHCODE2 "sphere test: compares"
-
 //------------------------------------------------------------
-// sphereTest — the box [zRXt +/- zRad] x [zRYt +/- zRad] against the
-// frustum. Only the far edge in ry matters, so ryMax is computed
-// once and used by all three compares:
+// sphereTest — the sphere at (zRXt, zRYt) of radius zRad against the
+// three frustum planes.
 //
-//   ryMax <  0            -> wholly behind the camera
-//   ryMax <  rxMin        -> wholly right of the plane rx = ry
-//   rxMax + ryMax <  0    -> wholly left of the plane rx = -ry
+//   ry + r      <  0   -> wholly behind the camera
+//   rx - ry     >= k   -> wholly right of the plane rx = ry
+//   rx + ry + k <  0   -> wholly left of the plane rx = -ry
+//
+// where k = r + (r >> 1) = 1.5r.
+//
+// THE 1.5 IS THE POINT. This used to treat the sphere as the axis-
+// aligned box [rx +/- r] x [ry +/- r], which makes the side tests
+// `ry + r < rx - r`, i.e. `rx - ry >= 2r`. The box contains the
+// sphere, so that was conservative -- but loose by 0.59r on both side
+// planes, because the exact distance from the centre to a 45-degree
+// plane is (rx -+ ry)/sqrt(2), and a sphere clears it at sqrt(2)*r
+// rather than at 2r.
+//
+// 1.5 >= sqrt(2) = 1.41421, so the test still never rejects anything
+// visible -- and 1.5r is r plus one shift, where the exact constant
+// would want a multiply. The margin recovered is half a radius on two
+// of the three planes, and IMPLEMENTATION_PLAN.md §15 measured what a
+// sphere's radius is worth: 128 units of slop on E1M1's spheres cost
+// 6.7% of the frame. This is that lever pulled the other way.
+//
+// The plane at ry = 0 is exact already: a sphere is behind the eye
+// exactly when ry < -r. It is tested first and unchanged.
 //
 // The intermediate sums are 16-bit signed. They hold because the
 // camera-relative coordinates transformPoint produces are bounded
 // by the map's own extent (E1M1 fits in about 6000 units) and the
 // largest sphere wad2reu.py will emit has radius 8000 -- the packer
-// raises rather than write one larger.
+// raises rather than write one larger. Worst case here is
+// |rx| + |ry| + 1.5r = 6000 + 6000 + 12000, inside a signed 16.
 //------------------------------------------------------------
 sphereTest:
-        lda zRYt                    // zT = ryMax = ry + r
+        lda zRYt                    // ry + r < 0: entirely behind the eye
         clc
         adc zRad
-        sta zT
         lda zRYt+1
         adc zRad+1
-        sta zT+1
-        bmi !reject+                // ryMax < 0: entirely behind the eye
-        lda zRXt                    // zA = rxMin = rx - r
-        sec
-        sbc zRad
-        sta zA
-        lda zRXt+1
-        sbc zRad+1
+        bmi !reject+
+        lda zRad+1                  // zA = k = r + (r >> 1)
+        lsr
         sta zA+1
-        lda zT                      // ryMax - rxMin < 0 -> off the right edge
+        lda zRad
+        ror
+        clc
+        adc zRad
+        sta zA
+        lda zA+1
+        adc zRad+1
+        sta zA+1
+        lda zRXt                    // zT = rx - ry
+        sec
+        sbc zRYt
+        sta zT
+        lda zRXt+1
+        sbc zRYt+1
+        sta zT+1
+        lda zT                      // rx - ry >= k -> off the right edge
         cmp zA
         lda zT+1
         sbc zA+1
         bvc !+
         eor #$80
-!:      bmi !reject+
-        lda zRXt                    // rxMax = rx + r
+!:      bpl !reject+
+        lda zRXt                    // zT = rx + ry
         clc
-        adc zRad
-        sta zA
+        adc zRYt
+        sta zT
         lda zRXt+1
-        adc zRad+1
-        pha                         // keep the high byte; A is needed for the lo
-        lda zA
+        adc zRYt+1
+        sta zT+1
+        lda zT                      // rx + ry + k < 0 -> off the left edge
         clc
-        adc zT                      // rxMax + ryMax < 0 -> off the left edge
-        pla
-        adc zT+1
+        adc zA
+        lda zT+1
+        adc zA+1
         bmi !reject+
         sec
         rts
@@ -661,7 +696,7 @@ sphereTest:
         clc
         rts
 
-.errorif * > MAPINFO, "the sphere compares overflow into MAPINFO"
+.errorif * > UDIV8, "the sphere test overflows into udiv's short path"
 
 //------------------------------------------------------------
 //  Third piece: the per-node fetch.
