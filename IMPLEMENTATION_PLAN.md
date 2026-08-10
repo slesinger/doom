@@ -1521,3 +1521,149 @@ audio, or anything else, spends it.
 - **Every frame is exactly two raster frames**, so a 50 Hz player ticks exactly
   twice per rendered frame, in step. The `ftHist` `3` bucket is the alarm that
   says it has stopped being true.
+
+---
+
+## 17. Session log — 2026-08-10, the 6-byte seg record
+
+§10 of `docs/georam-vs-reu.md` listed this as the fallback if the answer to
+GeoRAM was "stay on the REU", which it was: **shrink the seg record from 10
+bytes to 6**, storing endpoints relative to the subsector's bounding-sphere
+centre — already in the slot header — with an escape for what does not fit.
+Its estimate was 488 B/frame ≈ 0.5 ms against ~20 cycles of adds, "so it pays
+for itself 3:1".
+
+It was built, it was pixel-exact, and **it was worth 0.06 ms/frame**. Both
+halves of the estimate were wrong, in the same direction, and the way they were
+wrong is the reusable part. **It was then reverted** — see "The decision"
+below. This section is the record of a measurement, not of shipping code; the
+engine and `docs/reu-format.md` are back at format version 2.
+
+### What it was
+
+Format version 3. A subsector whose seg endpoints all lie within ±128 of its
+sphere centre sets bit 7 of its slot's `segCount` and stores each endpoint as
+one `+128`-biased byte (`docs/reu-format.md` §5.2). E1M1: 171 of 237
+subsectors, 495 of 732 segs.
+
+The flag is per subsector rather than per seg because `SEGBUF`'s stride has to
+stay uniform — `doWall` indexes it by byte offset — and per-seg granularity
+reaches 71.6% of segs against 67.6%, which does not buy a variable stride.
+
+`segExpand` widens the record into the *identical* 10-byte layout before
+anything reads it. That is the design decision that matters: `doWall` and
+`segFacing` are untouched, so pixel-exactness is structural rather than tested
+for. The alternative — teaching both routines to read biased bytes and folding
+the centre into the camera instead, which would have cost almost no cycles —
+needs two variants of each, and `doWall` has nineteen spare bytes in its whole
+segment. The RAM decided the design.
+
+The compact records are DMA'd to the *top* of `SEGBUF`, at `SEGBUF + 128 - 6n`,
+not to its base. Expanding in place from a common base clobbers a record's own
+source bytes two records in; from the top, every 10-byte record written lands
+strictly below the 6-byte records still unread, for every `n` up to the slot's
+cap of 12 (`10i+10 ≤ 128-6n+6i` holds iff `10n ≤ 122`).
+
+### The measurement, and the two errors in the estimate
+
+| | estimated | measured |
+|---|---:|---:|
+| compact segs fetched per frame | 122 | **46.6** |
+| bytes saved per frame | 488 | **186** |
+| DMA saved, 1 µs/byte | 0.49 ms | **0.19 ms** |
+| CPU cost per record | ~20 cycles | **140 cycles** |
+| CPU cost per frame at 64 MHz | 0.03 ms | **0.12 ms** |
+| net | +0.46 ms, 3:1 | **+0.06 ms, 1.5:1** |
+
+**Error one: not every fetched seg is compact.** 67.6% of E1M1's segs are, but
+the spawn view fetches 46.6 compact records against 115.2 segs considered —
+40%. The subsectors the camera is standing in are the big ones; the compact
+ones are disproportionately the small far cells the sphere test rejects before
+their segs are ever fetched. The static ratio is not the fetched ratio, and
+only the fetched one is worth anything.
+
+**Error two: the cost is not the adds.** Four 16-bit adds is indeed ~20 cycles
+of *arithmetic*. But reconstructing into a fixed 10-byte record is eight
+stores, four loads, four loads of the origin high byte, and two index advances:
+140 cycles, seven times the estimate. The add was never the expensive part.
+
+### What the instruments could and could not say
+
+`make stats` — VICE at 1 MHz — is structurally the wrong instrument for this
+change and says so: the CPU cost is 64× overweighted against a DMA cost that
+does not scale, so it reports 2296 → 2328 ms/frame, a 1.4% *regression* that is
+also inside its ±17 ms run-to-run noise. The Makefile already warns that a
+change trading CPU for DMA bytes "looks better here than it will on hardware";
+this is the same warning read backwards.
+
+On the Ultimate: **37.6 ms min / 38.6 ms max, 100% of frames on the deadline,
+before and after, identical.** The predicted 0.06 ms is one sixteenth of the
+frame timer's 1.015 ms tick. This change cannot be measured by any instrument
+this project has; it can only be modelled, from a per-record cycle count and a
+profiler hit count.
+
+The hit count is how the model was closed: a `profile.py` checkpoint on
+`segExpLoop`, which fires once per compact record — 46.6/frame. That number
+times 140 cycles is the whole cost, and it is the only reason the 0.06 ms
+figure is worth more than the 0.5 ms one it replaced. The general move is
+reusable and cost the engine nothing: **put a non-stopping checkpoint on the
+new routine's inner loop and let VICE count it**, then multiply by a
+hand-counted cycle cost. It is the only way to price a change smaller than an
+instrument's resolution.
+
+### The low-RAM trap, for whoever needs those bytes next
+
+`segExpand` was 135 bytes and would not fit in one piece: the largest free
+block below `MATRIX` is 77 bytes. The first placement used `$0eef-$0f3f`,
+which reads as free in the memory map between the collision helpers and the
+backface test. It is not free — it is the BSP stack (`bspStkLo = $0f00`,
+`bspStkHi = $0f20`). It assembled clean, linked clean, and rendered the first
+frame as character-mode garbage: 96410 of 104448 pixels. Anything placed below
+`MATRIX` needs `bspStkLo`/`bspStkHi` checked by hand; the map comments do not
+cover them.
+
+### `make framehash`, and why `make shot` was not enough
+
+The acceptance test for every frame optimization since §13 is "0 of 104448
+pixels differ". Taking it with `make shot` turns out to be sloppy: `-limitcycles`
+stops wherever it stops, which is mid-flip often enough that **two runs of the
+same build differ by ~30 pixels**. Chasing that as if it were the change would
+have been a wasted session.
+
+`make framehash` reads the renderer's own 28160-byte output buffer at a frame
+boundary over the binary monitor and prints its sha256. The camera does not
+move without input, so every frame writes the identical bytes and the digest is
+exact. Baseline and compact build: `c5d78e65…` both. The hardware frame,
+DMA-read with `tools/u64shot.py`, is also identical, 0 of 56320 pixels.
+
+`WARMUP_SECONDS` in `tools/u64push.py` went 6 → 20 s in the same session, and
+for a related reason: at 6 s the first hardware run of this build reported
+16.46 fps and 52.8 ms of compute — a reading entirely made of the Ultimate's
+post-reset bus stealing, which the tool warns about but which is easy to read
+as a catastrophic regression in the change under test. At 20 s the same build
+reports 37.6 ms, flat.
+
+### The decision: reverted
+
+The change was complete, correct, and worth about 0.16% of a frame that is
+already 2 ms inside its deadline. Against that: 135 bytes of low RAM in three
+fragments (`$0cb3`, `$0de8`, `$0fc4` — the free space below MATRIX is that
+fragmented), a format version bump, and a permanent second representation of
+the engine's hottest record. **The measurement said this was a wash; the RAM
+said it was a loss.** So `src/defs.asm`, `src/render/bsp.asm`,
+`tools/wad2reu.py` and `docs/reu-format.md` were reverted, returning 135 bytes
+to M2 — which has 186 at `$ff40` and needs a music player.
+
+What survived, because none of it depends on the change: **`make framehash`**
+(the acceptance test is now exact instead of approximately exact), the
+**20-second hardware warmup**, and this section. `docs/georam-vs-reu.md` §10's
+seg-record fallback should be read as closed, with the number 0.06 ms rather
+than 0.5 ms.
+
+Its remaining fallback — folding `NODESPH` into the parent's slot, 164 B/frame
+— is smaller than this one was and is subject to exactly the same two
+corrections: the static ratio is not the fetched ratio, and the cost is the
+stores, not the arithmetic. **Model it, with a profiler hit count, before
+building it.** On this evidence the whole class of "trade CPU for REU bytes"
+optimizations is close to exhausted at this frame size; the next real gain is
+more likely to be structural than arithmetic.

@@ -69,7 +69,7 @@ REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats profile assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile framehash assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest setup clean
 
 # `setup` is defined first for readability but must not be the default goal:
@@ -236,6 +236,26 @@ debug: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/probe.py diff $(PRG) $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# The pixel-exact acceptance test. Hashes the renderer's own output buffer at
+# a frame boundary instead of judging a screenshot: -limitcycles stops wherever
+# it stops, which is mid-flip often enough that two runs of the same build
+# differ by a few dozen pixels, while MATRIX at a frame boundary is exact.
+#
+#   make framehash              # -> sha256 of the frame
+#
+# An optimization is accepted when the digest is unchanged. That is the same
+# standard as IMPLEMENTATION_PLAN.md §13/§15's "0 of 104448 pixels differ",
+# with the capture jitter taken out of it.
+framehash: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/framehash.py $(MONPORT); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 
