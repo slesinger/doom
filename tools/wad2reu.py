@@ -44,7 +44,7 @@ from collections import Counter
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 1
+VERSION = 2                     # 2 added the bounding spheres (SSEC_HDR, block 4)
 
 HEADER_SIZE = 64
 BLOCK_ALIGN = 256
@@ -54,9 +54,22 @@ MAXSEC = 96                     # capacity of the resident sector arrays
 SSEC_STRIDE_SHIFT = 7           # 128-byte subsector slot
 SSEC_STRIDE = 1 << SSEC_STRIDE_SHIFT
 SEG_RECORD = 10
-MAX_SEGS_PER_SSEC = (SSEC_STRIDE - 2) // SEG_RECORD      # 12
 
-BLK_MAPINFO, BLK_NODES, BLK_SECTORS, BLK_SSECDATA = 0, 1, 2, 3
+# The subsector slot header carries the subsector's bounding sphere as well as
+# its seg count and sector, so that the engine can reject the whole subsector
+# before the second DMA fetches any segs (docs/reu-format.md §5). Eight bytes
+# leaves exactly twelve seg records in a 128-byte slot: 8 + 12*10 = 128.
+SSEC_HDR = 8
+MAX_SEGS_PER_SSEC = (SSEC_STRIDE - SSEC_HDR) // SEG_RECORD      # 12
+
+# One bounding sphere per node, streamed: centre x, centre y, radius, each
+# signed 16-bit, padded to a power-of-two stride so the engine's address
+# arithmetic is three shifts and no multiply.
+SPHERE_RECORD = 6
+NODESPH_STRIDE = 8
+NODESPH_SHIFT = 3
+
+BLK_MAPINFO, BLK_NODES, BLK_SECTORS, BLK_SSECDATA, BLK_NODESPH = 0, 1, 2, 3, 4
 
 # reuProbe (src/reu.asm) round-trips a 4-byte signature through REU RAM at boot,
 # before the loader runs. The image's used region must not reach that address,
@@ -613,8 +626,101 @@ def pack_sectors(m: MapData) -> bytes:
     return b"".join(bytes(c) for c in cols)
 
 
+def _sphere(points) -> tuple:
+    """A bounding circle for `points`, as (cx, cy, r) in whole map units.
+
+    Not the minimal enclosing circle — the circumcircle of the axis-aligned
+    bounding box, which is at most 1.41x its radius. The looser circle costs
+    a few rejections; solving the minimal-circle problem here would buy them
+    back and change nothing else, because the engine's cost is the same three
+    numbers either way.
+
+    The radius is rounded *up* and the centre to whole units, so the packed
+    sphere always contains every point. That direction matters: a sphere that
+    is too small makes the engine cull geometry that is on screen, which shows
+    up as walls flickering out of existence at the edge of the view, and a
+    sphere that is too large only makes it cull less.
+    """
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    cx = (min(xs) + max(xs)) // 2
+    cy = (min(ys) + max(ys)) // 2
+    r = 0
+    for x, y in points:
+        r = max(r, (x - cx) ** 2 + (y - cy) ** 2)
+    r = math.isqrt(r)
+    while r * r < max((x - cx) ** 2 + (y - cy) ** 2 for x, y in points):
+        r += 1                          # isqrt floors; the sphere must contain
+    return cx, cy, r
+
+
+def _seg_points(group) -> list:
+    return [(s.x0, s.y0) for s in group] + [(s.x1, s.y1) for s in group]
+
+
+def ssec_spheres(m: MapData) -> list:
+    """One bounding sphere per subsector, over its own segs' endpoints.
+
+    Segs are the only thing a subsector draws. Its true convex cell can be
+    larger — the edges that run along BSP partition lines carry no seg
+    (docs/reu-format.md §5) — but nothing is ever rasterised out there, so
+    bounding the segs is bounding the output.
+    """
+    return [_sphere(_seg_points(g)) if g else (0, 0, 0) for g in m.subsectors]
+
+
+def node_spheres(m: MapData) -> list:
+    """One bounding sphere per node, over every seg endpoint in its subtree.
+
+    Computed from the packed tree rather than from the WAD's own per-child
+    bounding boxes, so the test map — whose BSP this tool builds itself, and
+    which has no WAD boxes to read — goes through the identical path. That is
+    the same argument as Phase 4.4's: bring it up on three hand-checkable
+    sectors before 236 nodes can hide a sign error.
+    """
+    spheres = [None] * len(m.nodes)
+    points = [None] * len(m.nodes)
+
+    def child_points(child):
+        if child & CHILD_IS_SSEC:
+            return _seg_points(m.subsectors[child & ~CHILD_IS_SSEC])
+        return walk(child)
+
+    def walk(i):
+        if points[i] is not None:
+            return points[i]
+        nd = m.nodes[i]
+        pts = child_points(nd.right) + child_points(nd.left)
+        if not pts:
+            pts = [(nd.px, nd.py)]      # a subtree with no segs at all
+        points[i] = pts
+        spheres[i] = _sphere(pts)
+        return pts
+
+    for i in range(len(m.nodes)):
+        walk(i)
+    return spheres
+
+
+def pack_nodesph(m: MapData) -> bytes:
+    out = bytearray(MAXNODES * NODESPH_STRIDE)
+    for i, (cx, cy, r) in enumerate(node_spheres(m)):
+        # The engine adds the radius to a camera-space coordinate and compares
+        # the sum against another one, in signed 16 bits. Map coordinates reach
+        # +/-4864 and the trig rotation can add ~41%, so a radius over 8000
+        # would be the first thing to overflow that. E1M1's largest is 2686.
+        if r > 8000:
+            raise ValueError(f"node {i} bounding sphere radius {r} is too "
+                             "large for the engine's 16-bit compare")
+        _s16(cx, f"node {i} sphere cx")      # range check; "<h" packs it
+        _s16(cy, f"node {i} sphere cy")
+        struct.pack_into("<hhH", out, i * NODESPH_STRIDE, cx, cy, r)
+    return bytes(out)
+
+
 def pack_ssecdata(m: MapData) -> bytes:
     out = bytearray(len(m.subsectors) * SSEC_STRIDE)
+    spheres = ssec_spheres(m)
     for i, group in enumerate(m.subsectors):
         if len(group) > MAX_SEGS_PER_SSEC:
             raise ValueError(f"subsector {i} has {len(group)} segs, "
@@ -622,7 +728,9 @@ def pack_ssecdata(m: MapData) -> bytes:
         base = i * SSEC_STRIDE
         out[base] = len(group)
         out[base + 1] = m.ssec_sector[i] & 0xFF
-        p = base + 2
+        cx, cy, r = spheres[i]
+        struct.pack_into("<hhH", out, base + 2, cx, cy, r)
+        p = base + SSEC_HDR
         for s in group:
             back = NO_BACK_SECTOR if s.back is None else s.back
             if back != NO_BACK_SECTOR and back >= len(m.sectors):
@@ -633,7 +741,8 @@ def pack_ssecdata(m: MapData) -> bytes:
     return bytes(out)
 
 
-def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int) -> bytes:
+def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
+                 sph_reu_base: int) -> bytes:
     b = bytearray(MAPINFO_SIZE)
     struct.pack_into("<HHBB", b, 0,
                      len(m.nodes), len(m.subsectors), len(m.sectors),
@@ -646,6 +755,9 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int) -> bytes:
                      m.root & 0xFFFF, sx, sy, sa,
                      spawn_ssec, m.ssec_sector[spawn_ssec] & 0xFF,
                      m.numsegs, m.mapid)
+    b[22] = sph_reu_base & 0xFF                 # NODESPH, streamed 6 B/node
+    b[23] = (sph_reu_base >> 8) & 0xFF
+    b[24] = (sph_reu_base >> 16) & 0xFF
     return bytes(b)
 
 
@@ -655,6 +767,7 @@ def build_image(m: MapData) -> bytes:
     nodes = pack_nodes(m)
     sectors = pack_sectors(m)
     ssecdata = pack_ssecdata(m)
+    nodesph = pack_nodesph(m)
 
     # MAPINFO needs SSECDATA's offset, and SSECDATA's offset depends only on
     # the fixed sizes ahead of it, so the layout is computed before packing it.
@@ -665,19 +778,21 @@ def build_image(m: MapData) -> bytes:
     ofs_nodes = ofs_mapinfo + align(MAPINFO_SIZE)
     ofs_sectors = ofs_nodes + align(len(nodes))
     ofs_ssecdata = ofs_sectors + align(len(sectors))
+    ofs_nodesph = ofs_ssecdata + align(len(ssecdata))
 
     sx, sy, _ = m.spawn
     spawn_ssec = descend(m, sx, sy)
-    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec)
+    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec, ofs_nodesph)
 
     blocks = [
         (BLK_MAPINFO, 1, ofs_mapinfo, mapinfo, LOAD_MAPINFO >> 8),
         (BLK_NODES, 1, ofs_nodes, nodes, LOAD_NODES >> 8),
         (BLK_SECTORS, 1, ofs_sectors, sectors, LOAD_SECTORS >> 8),
         (BLK_SSECDATA, 0, ofs_ssecdata, ssecdata, 0),
+        (BLK_NODESPH, 0, ofs_nodesph, nodesph, 0),
     ]
 
-    used = align(ofs_ssecdata + len(ssecdata))
+    used = align(ofs_nodesph + len(nodesph))
     if used > REU_PROBE_OFFSET:
         raise ValueError(
             f"image is {used} B and would reach REU ${REU_PROBE_OFFSET:06X}, "
@@ -727,11 +842,12 @@ def parse_image(img: bytes) -> dict:
     mi = blocks[BLK_MAPINFO]["data"]
     numnodes, numssec, numsec, shift = struct.unpack_from("<HHBB", mi, 0)
     ssec_base = mi[6] | (mi[7] << 8) | (mi[8] << 16)
+    sph_base = mi[22] | (mi[23] << 8) | (mi[24] << 16)
     root, sx, sy, sa, spawn_ssec, spawn_sec, numsegs, mapid = \
         struct.unpack_from("<HhhBHBHB", mi, 9)
 
     info = dict(numnodes=numnodes, numssec=numssec, numsec=numsec,
-                shift=shift, ssec_base=ssec_base, root=root,
+                shift=shift, ssec_base=ssec_base, sph_base=sph_base, root=root,
                 spawn=(sx, sy, sa), spawn_ssec=spawn_ssec,
                 spawn_sec=spawn_sec, numsegs=numsegs, mapid=mapid)
 
@@ -752,23 +868,29 @@ def parse_image(img: bytes) -> dict:
                               ceil - 0x10000 if ceil & 0x8000 else ceil,
                               sc[4 * MAXSEC + i], sc[5 * MAXSEC + i]))
 
-    subs, ssec_sector = [], []
+    subs, ssec_sector, ssec_sph = [], [], []
     stride = 1 << shift
     for i in range(numssec):
         base = ssec_base + (i << shift)
         count, secid = img[base], img[base + 1]
+        ssec_sph.append(struct.unpack_from("<hhH", img, base + 2))
         group = []
         for k in range(count):
             x0, y0, x1, y1, back, ramp = struct.unpack_from(
-                "<hhhhBB", img, base + 2 + k * SEG_RECORD)
+                "<hhhhBB", img, base + SSEC_HDR + k * SEG_RECORD)
             group.append(Seg(x0, y0, x1, y1, secid,
                              None if back == NO_BACK_SECTOR else back,
                              ramp >> 4))
         subs.append(group)
         ssec_sector.append(secid)
 
+    sp = blocks[BLK_NODESPH]["data"]
+    node_sph = [struct.unpack_from("<hhH", sp, i * NODESPH_STRIDE)
+                for i in range(numnodes)]
+
     return dict(info=info, blocks=blocks, nodes=nodes, sectors=sectors,
-                subsectors=subs, ssec_sector=ssec_sector, stride=stride)
+                subsectors=subs, ssec_sector=ssec_sector, stride=stride,
+                ssec_sph=ssec_sph, node_sph=node_sph)
 
 
 def validate(m: MapData, img: bytes) -> list[str]:
@@ -796,6 +918,9 @@ def validate(m: MapData, img: bytes) -> list[str]:
     check(p["blocks"][BLK_SECTORS]["load"] == LOAD_SECTORS, "SECTORS load address")
     check(p["blocks"][BLK_MAPINFO]["load"] == LOAD_MAPINFO, "MAPINFO load address")
     check(p["blocks"][BLK_SSECDATA]["flags"] & 1 == 0, "SSECDATA must not be resident")
+    check(p["blocks"][BLK_NODESPH]["flags"] & 1 == 0, "NODESPH must not be resident")
+    check(info["sph_base"] == p["blocks"][BLK_NODESPH]["ofs"],
+          "MAPINFO's sphere base does not point at the NODESPH block")
 
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
@@ -840,6 +965,37 @@ def validate(m: MapData, img: bytes) -> list[str]:
         if (a.px, a.py, a.dx, a.dy, a.right, a.left) != \
            (b.px, b.py, b.dx, b.dy, b.right, b.left):
             bad.append(f"node {i}: round-trip mismatch")
+
+    # 8. every bounding sphere must actually bound.
+    #
+    # This is the check that matters most about the spheres, and it is checked
+    # against the *decoded* image rather than against the packer's own output:
+    # a sphere that is too small does not corrupt anything, it makes the engine
+    # cull geometry that is on screen, and the symptom -- a wall that vanishes
+    # when you turn until it is near the edge of the view -- is exactly the kind
+    # of thing that survives a whole session being blamed on the renderer.
+    def contains(sph, pts, what):
+        cx, cy, r = sph
+        for x, y in pts:
+            if (x - cx) ** 2 + (y - cy) ** 2 > r * r:
+                bad.append(f"{what}: sphere ({cx},{cy}) r={r} does not contain "
+                           f"({x},{y})")
+                return
+
+    for i, group in enumerate(p["subsectors"]):
+        if group:
+            contains(p["ssec_sph"][i], _seg_points(group), f"subsector {i}")
+
+    def subtree_points(child):
+        if child & CHILD_IS_SSEC:
+            return _seg_points(p["subsectors"][child & ~CHILD_IS_SSEC])
+        nd = p["nodes"][child]
+        return subtree_points(nd.right) + subtree_points(nd.left)
+
+    for i, nd in enumerate(p["nodes"]):
+        pts = subtree_points(i)
+        if pts:
+            contains(p["node_sph"][i], pts, f"node {i} subtree")
 
     # 7. the descent the engine will perform, done against the decoded blocks
     decoded = MapData(m.name, m.mapid)
@@ -948,8 +1104,12 @@ def report(m: MapData, img: bytes) -> None:
     print(f"  spawn          ({m.spawn[0]}, {m.spawn[1]}) angle {m.spawn[2]} "
           f"-> subsector {p['info']['spawn_ssec']} sector {p['info']['spawn_sec']}")
     print("  wall ramps     " + "  ".join(f"{k}:{v}" for k, v in used.most_common()))
+    sph = p["node_sph"]
+    print(f"  node spheres   max radius {max((r for _, _, r in sph), default=0)}"
+          f"  mean {sum(r for _, _, r in sph) / max(1, len(sph)):.0f}")
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
-                      (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA")):
+                      (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
+                      (BLK_NODESPH, "NODESPH")):
         b = p["blocks"][bid]
         where = f"-> ${b['load']:04X}" if b["flags"] & 1 else "streamed"
         print(f"  block {bid} {name:<9}${b['ofs']:06X} +{b['length']:<6} {where}")

@@ -66,8 +66,8 @@ REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug assets reubench run-u64 u64-config u64-fps \
-        u64-map setup clean
+.PHONY: all run shot check debug stats assets reubench run-u64 u64-config \
+        u64-fps u64-map setup clean
 
 # `setup` is defined first for readability but must not be the default goal:
 # a bare `make` has to build, as the README says it does.
@@ -205,6 +205,28 @@ debug: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/probe.py diff $(PRG) $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# Frame time in the emulator, plus the renderer workload behind it. Uses the
+# same backgrounded-VICE dance as `debug`, and the same randomised port for the
+# same reason. STATSECS is emulated *and* wall-clock seconds under -warp, so a
+# short sample still covers many frames; raise it if the frame count is small.
+#
+# The numbers this prints are 1 MHz numbers. That is not a limitation: the
+# frame cost measured here is a cycle count, and the Ultimate's measured
+# 56.9 ms/frame at 64 MHz matches VICE's 4.0 s at 1 MHz to within a few percent
+# (IMPLEMENTATION_PLAN.md §12). REU DMA is the one cost that does not scale --
+# it is 1 byte/us on both -- so a change that trades CPU work for DMA bytes
+# looks better here than it will on hardware.
+STATSECS ?= 20
+stats: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/stats.py $(MONPORT) $(STATSECS); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

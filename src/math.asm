@@ -262,6 +262,7 @@ spanFill:
         bcs !go+
 !nul:   rts
 !go:    sta zSCnt
+        :CountA(cntPix)             // A is still the run length
         txa
         pha
         ldx zSX                     // bounds-check before either table lookup:

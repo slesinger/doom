@@ -26,7 +26,11 @@ ALLOWED = [
     (0x0200, 0x02FF, "colTop"),
     (0x0300, 0x03FF, "colBot"),
     (0x0400, 0x07FF, "COLBUF"),
-    (0x0E00, 0x0E61, "MAPINFO/MAPHDR/SSECHDR"),
+    # $0E20-$0E5F is nodeSphere's code now that MAPHDR stages inside MATRIX, so
+    # these are two regions rather than one span: a stray write into the gap is
+    # a write into code, and this is the only thing that would report it.
+    (0x0E00, 0x0E1F, "MAPINFO"),
+    (0x0E60, 0x0E67, "SSECHDR + bounding sphere"),
     (0x0F00, 0x0F3F, "BSP stack"),
     (0x0F40, 0x0F41, "frameCnt"),
     (0x0F42, 0x0F50, "reuScratch/reuOK/mapOK/mapErr/mapSum"),

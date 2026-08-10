@@ -7,24 +7,30 @@
 //  Memory map:
 //    $0200-$02FF  colTop (renderer clip)      $0300-$03FF colBot
 //    $0400-$076F  COLBUF (color RAM staging)
-//    $0810-$0DB1  main / input / map loader
-//    $0E00-$0E1F  MAPINFO            $0E20-$0E5F  MAPHDR
-//    $0E60-$0E61  SSECHDR            $0E70-$0EEE  collision helpers
+//    $0810-$0DBA  main / input / map loader
+//    $0DBC-$0DFF  sphere compares    $0E00-$0E1F  MAPINFO
+//    $0E20-$0E5C  node sphere fetch  $0E60-$0E67  SSECHDR + sphere
+//    $0E70-$0EEE  collision helpers
 //    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
-//    $1000-$7DFF  MATRIX (28160 B, 110 pages)
+//    $0F51-$0FC3  seg backface test  $0FC4-$0FF1  sphere transform
+//    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
 //    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
-//    $9900-$9FFF  converter + math/span code
+//    $9900-$9FFF  converter + math/span code + clock
 //    $A000-$BF3F  BITMAP0            (VIC bank 2)
 //    $C000-$C3FF  SCREEN1            (VIC bank 3)
-//    $C400-$CA2F  math tables (sqr, sin, rowCell)
-//    $CA30-$CE0F  doWall             $CE10-$CFC2  bsp traversal
+//    $C400-$CA2B  math tables (sqr, sin, rowCell)
+//    $CA30-$CE06  doWall             $CE08-$CFF8  bsp traversal
 //    $D000-$DB3F  NODES              $DC00-$DE3F  SECTORS   (under I/O)
 //    $E000-$FF3F  BITMAP1
 //============================================================
 
 #import "defs.asm"
+// Engine-only, and imported before anything expands its macros. It is not part
+// of defs.asm because reuload.asm and reubench.asm import that too and have no
+// renderer to instrument -- see the head of instrument.asm.
+#import "instrument.asm"
 
 .pc = $0801 "basic"
 :BasicUpstart2(main)
@@ -40,6 +46,7 @@ main:
         lda #BANK_IO
         sta $01
         jsr turboOn
+        jsr msInit                  // CIA2 millisecond clock -- clock.asm
         lda #$3b                    // bitmap mode on
         sta $d011
         lda #$18                    // multicolor on
@@ -109,6 +116,7 @@ mainLoop:
         jsr movePlayer
         jsr renderFrame             // 3D -> MATRIX
         jsr convert                 // MATRIX -> back buffer
+        jsr framePace               // hold the rate at 25 fps -- clock.asm
         jsr flip                    // show it
         inc frameCnt                // host-visible frame counter (defs.asm)
         bne mainLoop
@@ -163,11 +171,13 @@ clearHudRows:
 #import "input.asm"
 #import "reu.asm"
 #import "mapload.asm"
-// MAPINFO is the first fixed allocation above the code, so it -- not the BSP
-// stack at $0f00 -- is what the main segment has to clear. Before the stack
-// moved to $0f00 the margin here was three bytes, and nothing would have said
-// so. Deleting testmap.asm bought about 190 B of this back.
-.errorif * > MAPINFO, "main code overflows into MAPINFO"
+// SPHCODE2 is the first fixed allocation above the code, so it -- not MAPINFO
+// and not the BSP stack at $0f00 -- is what the main segment has to clear.
+// Deleting testmap.asm bought about 190 B of headroom here and the sphere
+// compares have now spent all but one byte of it, so the next thing that grows
+// in this segment fails the build. That is the intent: the two are competing
+// for the same block, and the assembler should say which one lost.
+.errorif * > SPHCODE2, "main code overflows into the sphere compares"
 
 #import "render/chunky2mc.asm"
 .errorif * > MATHCODE, "converter code overflows into math code"
@@ -178,3 +188,4 @@ clearHudRows:
 
 #import "render/walls.asm"
 #import "render/bsp.asm"
+#import "clock.asm"

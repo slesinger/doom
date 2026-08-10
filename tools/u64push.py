@@ -33,6 +33,12 @@ from u64 import Ultimate, U64Error, add_host_args
 
 # Must match `.const frameCnt` in src/defs.asm.
 FRAMECNT_ADDR = 0x0F40
+CIA2_TBLO = 0xDD06            # `.const CIA2_TBLO` in src/defs.asm
+
+# PAL's frame period. The VIC's raster is the only absolutely-known frequency
+# on the machine -- it does not care what the CPU or the turbo are doing -- so
+# it is what calibrates everything else here.
+PAL_FRAME_MS = 19.9504
 
 REU_CATEGORY = "C64 and Cartridge Settings"
 
@@ -213,6 +219,20 @@ def read_framecnt(u: Ultimate) -> int:
     return raw[0] | (raw[1] << 8)
 
 
+def read_ms(u: Ultimate) -> int:
+    """CIA2 Timer B, the engine's millisecond clock (src/clock.asm).
+
+    Counts *down* from $FFFF and wraps every 65.5 s. `$01` is $35 for the
+    whole run, so the Ultimate's DMA read of $DD06 sees the CIA register and
+    not the RAM under it. Read as one two-byte burst: the low byte ticks every
+    millisecond, so two separate reads could straddle a carry.
+    """
+    raw = u.readmem(CIA2_TBLO, 2)
+    if len(raw) < 2:
+        raise U64Error(f"readmem returned {len(raw)} bytes, expected 2")
+    return raw[0] | (raw[1] << 8)
+
+
 # Frames are dropped for the first second or so after a run_prg -- the
 # Ultimate is still finishing its own post-reset housekeeping and stealing
 # bus cycles. Measured: a 0-5 s window reads 37.8 fps, every 5 s window
@@ -245,9 +265,9 @@ def wait_for_engine(u: Ultimate, deadline: float = 20.0) -> None:
 def measure_fps(u: Ultimate, seconds: float) -> None:
     wait_for_engine(u)
     t0 = time.monotonic()
-    c0 = read_framecnt(u)
+    c0, m0 = read_framecnt(u), read_ms(u)
     time.sleep(seconds)
-    c1 = read_framecnt(u)
+    c1, m1 = read_framecnt(u), read_ms(u)
     t1 = time.monotonic()
 
     frames = (c1 - c0) & 0xFFFF          # 16-bit counter, wraps
@@ -260,6 +280,37 @@ def measure_fps(u: Ultimate, seconds: float) -> None:
     fps = frames / elapsed
     print(f"fps: {frames} frames in {elapsed:.2f} s = {fps:.2f} fps "
           f"({1000.0 / fps:.1f} ms/frame)")
+    check_cia_timebase(m0, m1, elapsed)
+
+
+def check_cia_timebase(m0: int, m1: int, elapsed: float) -> None:
+    """Calibrate CIA2 Timer B against the host clock and against PAL.
+
+    `framePace` caps the frame rate on the assumption that CIA phi2 stays at
+    1 MHz whatever the turbo is doing -- if it does not, FPS_CAP_TICKS is wrong by
+    the turbo ratio and every simple view runs at the wrong speed. `reubench`
+    already showed the CIA *rate* is turbo-invariant (it reported the same DMA
+    tick counts at 1 MHz and 64 MHz), but that calibration leaned on the REU's
+    assumed 1 byte/us. This one leans on nothing: it compares emulated
+    milliseconds against the host's own wall clock.
+
+    The counter wraps every 65.5 s, so anything past one wrap is reported as
+    unusable rather than guessed at -- and a badly wrong timebase shows up as
+    exactly that, which is the informative failure.
+    """
+    ticks = (m0 - m1) & 0xFFFF           # Timer B counts down
+    ratio = ticks / (elapsed * 1000.0)
+    print(f"cia: {ticks} CIA ms in {elapsed * 1000.0:.0f} host ms "
+          f"= {ratio:.3f} x")
+    if elapsed > 60.0:
+        print("cia: sample is longer than the counter's 65.5 s wrap -- "
+              "rerun with a shorter --fps window")
+    elif 0.95 <= ratio <= 1.05:
+        print("cia: ok -- Timer B is a real millisecond clock under turbo, "
+              "so FPS_CAP_TICKS means what it says")
+    else:
+        print(f"cia: *** off by {ratio:.3f}x -- FPS_CAP_TICKS in src/defs.asm is "
+              f"wrong by that factor ***")
 
 
 def main(argv=None) -> int:

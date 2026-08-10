@@ -234,11 +234,13 @@ checkMove:
         sta zChild                  // loaded yet this frame -- movePlayer
         lda camSsec+1               // runs before renderFrame
         sta zChild+1
-        jsr ssecFetch
+        jsr ssecHdr
         lda zSegCnt
         bne !+
         jmp moveOK                  // a subsector with no segs blocks nothing
 !:      sta zWCnt
+        jsr ssecSegs                // the sphere is the renderer's business:
+                                    // collision wants the segs unconditionally
         lda #0
         sta zWIdx                   // seg cursor: a byte offset (SEGSZ)
 !seg:   ldx zWIdx
@@ -340,7 +342,7 @@ moveOK:
         sta camSsec
         lda zChild+1
         sta camSsec+1
-        jsr ssecFetch               // its header carries the sector id
+        jsr ssecHdr                 // the header alone carries the sector id
         lda zSecId
         sta camSec
         jmp setEyeZ

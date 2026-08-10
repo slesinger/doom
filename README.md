@@ -19,12 +19,19 @@ it. The hand-built test map is gone — it goes through the same packer now, so
 `make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
 verifiable sectors.
 
-**What Milestone 1 still owes:** frame time. E1M1 costs 3.2x the test map per
-frame, which extrapolates to roughly 12-16 fps against the 25 fps target — the
-test map itself runs vsync-locked at 50.0 fps on real hardware. The number
-that matters is the one `make u64-fps` reports on the Ultimate. See
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12 for the measurement and
-the response.
+**What Milestone 1 still owes:** frame time, and less of it than it did.
+E1M1 measured **17.6 fps** on a C64 Ultimate at 64 MHz; two culling passes — a
+world-space seg backface test, and bounding-sphere rejection of whole BSP
+subtrees — took it to a measured **22.2 fps**, both verified pixel-identical
+against builds with them disabled. A frame cap now holds simple views at 25
+rather than letting them run at 50 and move the player twice as fast.
+
+The remaining gap is smaller than it looks. `flip` is raster-synced, so frame
+time can only be a multiple of 19.95 ms, and 45.1 ms means **three frames in
+four already make the 25 fps deadline and one in four misses it**. Another
+~10% off the frame would put nearly all of them under the boundary and lock the
+game at a solid 25. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md)
+§12-§13 for the measurements and the response.
 
 ---
 

@@ -378,7 +378,7 @@ courtyard and back without leaking through a wall or falling through a floor.
 |---|---|---|---|
 | 1 | ~~REU DMA is slow *and* doesn't scale with turbo~~ | Phase 1's benchmark | **Closed.** 1 byte/µs flat, no setup penalty, so per-subsector streaming needs no batching (§10). ~1.3 KB/frame = ~1.3 ms |
 | 2 | ~~No clean way to get a `.reu` image onto real hardware~~ | Phase 1.2 | **Closed the hard way.** REU Preload does not deliver on firmware 1.1.0; `src/reuload.asm` + `machine:writemem` does, and verifies every chunk (§11) |
-| 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | **Arrived.** E1M1 costs 3.2x the test map per frame (§12). Response as designed — node bbox rejection — but *streamed*, 4 B/node, not resident: there is no RAM for it |
+| 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | **Arrived and answered.** E1M1 measured 17.6 fps on hardware (§13). Response was the designed one — streamed per-node bounds — plus a seg backface test the plan had not anticipated. Frame down 33%, subsectors visited 235 → 39 |
 | 4 | ~~`$D000-$DFFF` banking interacts badly with the converter or `flip`~~ | Phase 2.3, caught by `make debug` | **Closed.** The BSP walk banks RAM in and out per node and per sector read; `make debug` stays clean |
 | 5 | Flat shading over 85 sectors of real geometry looks like undifferentiated mush | First E1M1 frame | **Arrived, twice.** The start room's floor and ceiling landed on the same byte (fixed in the Python table, §12), and distance falloff turned out never to have worked at all (`sta` sets no flags — §12) |
 | 6 | The existing projection math has range bugs that three hand-built sectors never exercised | Phase 4.4's test map, then E1M1 | **Not seen.** `make debug` is clean on E1M1 and the projected rows match the arithmetic to the pixel (§12) |
@@ -851,3 +851,245 @@ From the spawn, forward: sector 38 → 37 → 39 → 38, eye height 41 → 33 �
 is the solid part of the wall at `y = -2880`; the opening in that wall is at
 `x` 1216-1344 and the player was at 1056. That is the collision model working,
 not failing.
+
+
+---
+
+## 13. Session log — 2026-08-10, frame time
+
+Phase 5's open item was frame time, and hardware had finally measured it:
+**352 frames in 20.04 s = 17.57 fps, 56.9 ms/frame** on a C64 Ultimate at
+64 MHz. Playable at the low end, but under the 25 fps target — and *over* it in
+simple views, where the engine ran at 50 fps and moved the player twice as fast
+as it did in complex ones, because everything that moves is per-frame.
+
+Three things came out of this session: a frame cap, a seg backface test, and
+bounding-sphere rejection of BSP subtrees. The frame went **3888 → 2589 ms** in
+VICE, a third, and by the ratio that held for the 56.9 ms hardware reading that
+is roughly **46 ms/frame ≈ 22 fps**. Hardware confirmation is the next session's
+first job.
+
+### The instrumentation came first, and it was right to
+
+§12 closed with a plan: reject nodes by bounding box, because `doWall`'s
+occlusion early-out had measured no gain and the cost was therefore upstream of
+it. That reasoning was sound but the conclusion was only half right, and there
+was no counter in the engine that could have said which half.
+
+So the first thing built was nine free-running 24-bit counters
+(`INSTRUMENT = 1` in `src/instrument.asm`, 27 bytes at the tail of
+`TABLES_FREE`) and
+`tools/vicedbg/stats.py` to read them over the VICE binary monitor. They are
+never reset, so a host divides two readings by the `frameCnt` delta between
+them and gets per-frame averages without having to catch a frame boundary.
+
+The spawn frame, before any change:
+
+| | per frame |
+|---|---:|
+| nodes descended | 234 |
+| subsectors drawn | 235 |
+| segs considered | 725 |
+| — rejected: near plane | 27.6 |
+| — rejected: off screen or backfacing | 92.2 |
+| — rejected: already occluded | 16.7 |
+| span pixels written | 28382 |
+
+Two facts in that table overturned the plan's assumption. **There is no
+overdraw**: 28382 span pixels against a 28160-pixel screen. And of 725 segs,
+**219 — 69% — were rejected as back-facing**, each after two `transformPoint`
+calls and two `projSX` divisions, because `doWall`'s backface test is
+`sx0 < sx1` and needs both endpoints projected before it can compare them.
+
+The frame was almost entirely geometry front-end, and the single biggest waste
+was not un-culled subtrees at all.
+
+### Fix 1 — the seg backface test in world space
+
+Facing is a world-space property and needs no projection:
+
+```
+cross = dx*(camY - y0) - dy*(camX - x0)
+```
+
+is Doom's `R_PointOnSide` with the seg standing in for the partition line, and
+`cross < 0` means the camera is on the seg's right, which is where its front
+sector is by the winding rule. Two `ssmul32` calls, no divisions — and it is the
+same arithmetic `sideOf` already runs on nodes.
+
+`doWall`'s own test stays. It costs nothing that is not already paid by then,
+and it still catches what this one cannot see: a seg that faces the camera but
+lands entirely off the side of the screen.
+
+**3888 → 3191 ms/frame, 18%.** Verified pixel-identical against a stashed
+baseline: 0 of 104448 pixels differ.
+
+One bug on the way, worth recording because it is a whole class: `segFacing`
+runs through `ssmul32` → `mul8`, which clobbers X, and `doWall` needs X as the
+seg's byte offset. The fix is `ldx zWIdx` after the call and *before* the
+`bcs` — `ldx` does not touch carry.
+
+### Fix 2 — bounding spheres, not boxes
+
+The plan said quantised bbox, 4 B/node, streamed. What was built is a
+**bounding sphere**: centre x, centre y, radius, 6 bytes, streamed as block 4
+(`NODESPH`) with an 8-byte stride so the record offset is `index << 3` rather
+than a multiply. Format version 2. The same record is also inlined into every
+subsector slot header, which is why that header grew from 2 bytes to 8.
+
+A sphere over a box, because a box is 8 bytes of payload against 6 and its
+frustum test is four compares against three — and a *node's* bound is loose
+anyway, since it wraps a whole subtree, so the extra tightness buys much less
+than the arithmetic costs.
+
+The test itself is deliberately *not* the exact sphere test. At 90° the frustum
+planes are `rx = ±ry`, whose normals carry a `1/sqrt(2)`. Treating the sphere as
+the axis-aligned camera-space box `[rx±r] × [ry±r]` needs no such factor: the
+box contains the sphere, the test stays conservative, and all three compares are
+16-bit adds and subtracts.
+
+```
+ryMax < 0              -> behind the eye
+ryMax < rxMin          -> off the right edge
+rxMax + ryMax < 0      -> off the left edge
+```
+
+It hooks in at two places: `bspLoop` rejects a whole subtree before descending,
+and `renderSsec` rejects a subsector after its 8-byte header arrives but
+**before** the second transfer fetches a single seg — which is the second
+reason the two-transfer split earns its keep.
+
+**3191 → 2589 ms/frame.** Again pixel-identical, verified by building with
+`sphereVisible` stubbed to `sec / rts`: 0 of 104448 pixels differ.
+
+| | before | after |
+|---|---:|---:|
+| nodes descended | 234 | **71.7** |
+| subsectors drawn | 235 | **39.3** |
+| segs considered | 725 | **122.1** |
+| — skipped: backfacing | — | 53.6 |
+| — rejected: off screen | 92.2 | 15.2 |
+| — rejected: near plane | 27.6 | 4.0 |
+| subtrees sphere-culled | — | 10.2 |
+| subsectors sphere-culled | — | 10.1 |
+
+Ten rejected subtrees is what removes 162 node descents: rejecting a node
+removes everything below it.
+
+The validator earns a mention. `wad2reu.py --validate` now checks that **every
+sphere contains every seg endpoint below it**, walking the packed tree
+recursively. A bound short by one unit does not crash — it deletes geometry from
+some camera angles and not others, which is the hardest kind of bug to see in a
+rendered frame and the easiest to assert offline.
+
+### Fix 3 — the 25 fps cap
+
+`flip` syncs to raster line 251, so the frame rate is quantised to `50/n`.
+Without a cap a simple view ran at 50 and a complex one at 25, and the player
+moved at two different speeds.
+
+`framePace` holds each frame to at least `FPS_CAP_TICKS = 39` milliseconds before
+handing over to `flip`. The threshold is *just under* two PAL frames
+(2 × 19.95 = 39.9 ms): set it to 40 and every frame would miss the line-251
+crossing by 0.1 ms and cost a third raster frame — 16.7 fps instead of 25.
+
+The clock is CIA2's Timer B cascaded off a Timer A running at 1000 phi2 cycles,
+i.e. a 16-bit millisecond counter running *down* from `$FFFF` and wrapping every
+65.5 s. CIA phi2 stays 1 MHz whatever the CPU is doing, which is the point: the
+raster only says "somewhere in this 20 ms frame", and the CPU clock is 1 MHz in
+VICE and 64 MHz on the Ultimate. `sei` does not mask NMI and CIA2 is the C64's
+NMI source, hence `lda #$7f / sta $DD0D` in `msInit`.
+
+That last claim looked like the session's one open hardware question, and it
+turned out to have been answered in Phase 2. **`reubench` already proves the
+CIA timebase is turbo-invariant** (§10): it timed DMA with CIA2 Timer A and
+reported the same tick counts at 1 MHz and at 64 MHz — 4096 B in 16384 ticks
+per 4 transfers, both passes. Had the CIA scaled with the CPU, the 64 MHz pass
+would have counted 64x as many ticks and overflowed the 16-bit timer into
+garbage. It did not.
+
+What that argument does *not* close is the absolute rate: it calibrates the CIA
+against the REU's assumed 1 byte/µs, which is the same constant it was
+measuring. So `u64push.py --fps` now reads `$DD06/$DD07` alongside `frameCnt`
+and prints CIA milliseconds against the **host's** wall clock — a calibration
+that leans on nothing inside the machine. `make u64-fps` reports it as a
+`cia: ... x` line, and a ratio outside 0.95-1.05 means `FPS_CAP_TICKS` is wrong by
+exactly that factor.
+
+### Where the RAM came from
+
+There was no free block below MATRIX big enough for any of this, so the sphere
+test lands in three pieces and the backface test in a fourth, each in whatever
+hole existed:
+
+| | | |
+|---|---|---|
+| `$0DBC-$0DFF` | `sphereTest` | the main segment's last headroom |
+| `$0E20-$0E5C` | `nodeSphere` | `MAPHDR`'s old home — it stages inside MATRIX now |
+| `$0F51-$0FC3` | `segFacing` | between the BSP stack and MATRIX |
+| `$0FC4-$0FF1` | `sphereVisible` | the rest of that gap |
+
+`$0200-$07FF` and the stack page look free and are not: the PRG loads from
+`$0801`. `sphereTest` now starts exactly one byte above where the main segment
+ends, and `BSPCODE` moved down to `$CE08` — the alignment slack between `doWall`
+and the traversal — to fit the node hook. Every block is bounded by an
+`.errorif` against what follows it, so the next thing that grows fails the build
+by name rather than by symptom. **There is no low-RAM headroom left.**
+
+Three bytes came back from chaining `nodeSphere` into `sphereVisible` rather
+than calling both: they are never wanted apart.
+
+
+
+### Confirmed on hardware
+
+```
+fps: 223 frames in 10.05 s = 22.19 fps (45.1 ms/frame)
+cia: 9871 CIA ms in 10049 host ms = 0.982 x
+```
+
+**17.57 → 22.19 fps.** Both questions the session left open are answered.
+
+**The CIA timebase is real, and PAL's, not 1 MHz.** 0.982 is not 1.000 and was
+never going to be: PAL phi2 is 985248 Hz, so a Timer A latch of 1000 underflows
+every **1.015 ms**, predicting 0.985. Measured 0.982 — 0.3% below, which is
+host-side network jitter on a 10 s window. So the clock is turbo-invariant
+*and* absolutely calibrated, and `reubench`'s indirect argument (§10) holds.
+
+That has a consequence the code did not state. `FPS_CAP_MS` counted ticks, not
+milliseconds, and 39 ticks is 39.58 ms rather than 39. The constant is now
+`FPS_CAP_TICKS`, and 39 turns out to be not merely a good value but the
+**maximum**:
+
+| ticks | real | vs two PAL frames (39.90 ms) |
+|---:|---:|---|
+| 39 | 39.58 ms | fits — lands on the second line-251 crossing |
+| 40 | 40.60 ms | misses it, costs a third raster frame → 16.7 fps |
+
+39.58 ms is already the worst case: `msLast` is captured mid-tick, so the
+counter reaches 39 somewhere between 38 and 39 whole ticks later, never more.
+
+**The frame time reconciles exactly, and the reconciliation is the useful
+part.** VICE predicted 56.9 × 2589/3888 = **37.9 ms of compute**. Delivered is
+45.1. The gap is not error — it is `flip`'s raster quantisation. Frame time can
+only be a multiple of 19.95 ms, and 45.1 decomposes as
+
+    39.90 ms x 74%  +  59.85 ms x 26%  =  45.1 ms
+
+i.e. **roughly three frames in four now make the 25 fps deadline and one in
+four misses it.** 37.9 ms of compute sits just under the 39.90 ms boundary, so
+frames land either side of it depending on what is on screen.
+
+That is the worst place on the curve to be — small variations flip a frame
+between 25 and 16.7 fps, and that is judder rather than slowness. It is also
+the cheapest place to be: **another ~10% off the frame would put nearly every
+frame under the boundary and lock the game at a solid 25 fps**, turning a
+22.2 fps average into a stable 25. A 10% gain is worth 13% of frame rate here,
+not 10%, and it is worth more than that in how the game feels.
+
+### What this session did not do
+
+- **Sliding along walls** and **one-boundary-per-frame** — Phase 5's two open
+  items, untouched.
+- **Quality scaling.** The clock the feedback loop needs now exists. Nothing
+  reacts to a frame that overran.

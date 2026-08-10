@@ -46,7 +46,7 @@ At REU offset `$000000`, 64 bytes:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, ASCII `D64U` |
-| 4 | 1 | format version — **1** |
+| 4 | 1 | format version — **2** |
 | 5 | 1 | block count `N` |
 | 6 | 2 | reserved, zero |
 | 8 | 8×`N` | block descriptors |
@@ -91,6 +91,7 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 1 | `NODES` | yes | `$D000` | 2880 B |
 | 2 | `SECTORS` | yes | `$DC00` | 576 B |
 | 3 | `SSECDATA` | no — streamed | — | 30336 B |
+| 4 | `NODESPH` | no — streamed | — | 1920 B |
 
 Resident total: **3488 B**, of which 3456 sit under the I/O space (§6).
 
@@ -119,7 +120,8 @@ inspectable in a hex dump, which is not.
 | 18 | 1 | `spawnSector` |
 | 19 | 2 | `numSegs` |
 | 21 | 1 | `mapId` — 0 = test map, 1 = E1M1 |
-| 22 | 10 | reserved, zero |
+| 22 | 3 | `sphReuBase`, 24-bit REU offset of `NODESPH` |
+| 25 | 7 | reserved, zero |
 
 `spawnSsector` is redundant — the engine's own BSP descent will find it — and
 that is the point. `main.asm` compares the two at boot and halts with
@@ -155,16 +157,42 @@ the WAD's own encoding rather than inventing a cleaner one is worth a paragraph
 because it is the only place this format does not repack: any other scheme costs
 an instruction per node visit and buys nothing.
 
-**Node bounding boxes are not carried.** They are 16 B/node in the WAD and would
-not fit under `$D000` alongside the rest. Without them the walk visits every
-node and relies on column occlusion (`colTop`/`colBot`) plus the `openCols`
-early-out for rejection — correct, just not maximally culled. This is
-`IMPLEMENTATION_PLAN.md` risk #3, and Phase 4 has now **called it in**: E1M1
-costs 3.2x the test map per frame and lands the engine at roughly half the
-25 fps target. The escape hatch is a quantised bbox, and the shape it should
-take is a *streamed* one — 4 bytes per node fetched alongside the node visit,
-in a new block, rather than resident, because there are only 384 free bytes
-under the I/O space and 236 nodes need 944.
+**Node bounding boxes are not carried here.** The WAD's are 16 B/node and would
+not fit under `$D000` alongside the rest — there are 384 free bytes there and
+236 nodes would need 944. Format version 2 carries a *bounding sphere* instead,
+streamed, in its own block: §4.4.
+
+### 4.4 `NODESPH` — the streamed node bounding spheres
+
+Block 4, `MAXNODES` records of 8 bytes at `sphReuBase + (i << 3)`, one per node,
+never resident.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | centre x, signed 16-bit map units |
+| 2 | 2 | centre y |
+| 4 | 2 | radius, **unsigned**, rounded up |
+| 6 | 2 | pad, zero |
+
+The sphere contains every seg endpoint in the subtree below the node. The
+validator checks exactly that, for every node and every subsector, against the
+points themselves — a bound that is wrong by one unit makes geometry vanish, and
+nothing about the rendered frame would say which node did it.
+
+Two things are the way they are on purpose.
+
+**A sphere, not a box.** A box is 8 B of payload against the sphere's 6, and the
+frustum test on it is four compares against three. The sphere is the looser
+bound, but a *node's* bound is loose anyway — it wraps a whole subtree — so the
+tightness buys much less than the arithmetic costs.
+
+**The stride is 8, not 6.** Six bytes of every eight are used and 480 of E1M1's
+1920 are padding, so that the record offset is `index << 3` — three shifts
+rather than a multiply, per node, per frame. The block is streamed, so the
+padding costs REU space, which is free.
+
+The same record appears a second time, inline, as bytes 2–7 of every subsector
+slot header (§5), and the engine DMAs both into the same six bytes of RAM.
 
 ### 4.3 `SECTORS` — 6 arrays of 96 bytes at `$DC00`
 
@@ -200,8 +228,15 @@ multiply, no offset table.**
 |---|---|---|
 | 0 | 1 | `segCount` (0…12) |
 | 1 | 1 | `sectorId` — the front sector of every seg in this subsector |
-| 2 | 10×`segCount` | seg records (§5.1) |
+| 2 | 2 | bounding sphere centre x |
+| 4 | 2 | bounding sphere centre y |
+| 6 | 2 | bounding sphere radius, unsigned |
+| 8 | 10×`segCount` | seg records (§5.1) |
 | … | | padding to 128 B, zero |
+
+The sphere is the same record as `NODESPH`'s (§4.4), inline here so that the
+first transfer below carries it — a subsector outside the view is rejected
+before the second transfer fetches a single seg.
 
 This replaces the resident `SSECTORS` table that `IMPLEMENTATION_PLAN.md` §4
 proposed (237 entries × 4 arrays = 948 B of RAM). Spending 30 KB of REU to save
@@ -211,16 +246,18 @@ block for the BSP stack.
 
 **The engine fetches each slot in two transfers, not one:**
 
-1. 2 bytes at `ssecReuBase + (i<<7)` → `segCount`, `sectorId`
-2. `segCount × 10` bytes at `+2` → `SEGBUF` (`$0E80`, 128 B)
+1. 8 bytes at `ssecReuBase + (i<<7)` → `segCount`, `sectorId`, the sphere
+2. `segCount × 10` bytes at `+8` → `SEGBUF` (`$9740`, 128 B)
 
-Two transfers rather than one fixed 82-byte fetch, because DMA has no setup
-penalty but every transferred byte costs a microsecond. At E1M1's mean of 3.09
-segs/subsector that is 2 + 31 = 33 bytes instead of 82 — a 2.5× saving on the
-frame's dominant REU cost. Roughly 40 visible subsectors per frame gives
-**~1.3 KB/frame ≈ 1.3 ms of halted CPU**, against a 20 ms PAL frame.
+Two transfers rather than one fixed 128-byte fetch, because DMA has no setup
+penalty but every transferred byte costs a microsecond — and a microsecond
+regardless of the CPU's clock, which is why this does not get cheaper on a
+64 MHz Ultimate. At E1M1's mean of 3.09 segs/subsector that is 8 + 31 = 39 bytes
+instead of 128. Since the header grew to carry the sphere the split buys more
+than the byte count: the second transfer never happens at all for a subsector
+the sphere test rejects.
 
-`segCount ≤ 12` is a hard cap of the slot size (`2 + 12*10 = 122 ≤ 128`) and
+`segCount ≤ 12` is a hard cap of the slot size (`8 + 12*10 = 128`) and
 `wad2reu.py` asserts it. E1M1's maximum is 8; the distribution is
 1:38 2:66 3:35 4:64 5:14 6:14 7:1 8:5.
 
@@ -256,20 +293,24 @@ split at BSP partition lines. The engine never sees a linedef.
 ## 6. Where it lands in the machine
 
 ```
-$0810-$0DB1  main segment     code; .errorif guards the gap below MAPINFO
-$0DB2-$0DFF  free, 78 B       main-segment headroom
+$0810-$0DBA  main segment     code; .errorif guards the gap below SPHCODE2
+$0DBC-$0DFF  sphere compares  sphereTest -- what used to be the headroom here
 $0E00-$0E1F  MAPINFO          32 B, resident block 0
-$0E20-$0E5F  MAPHDR           64 B, the image header, kept for post-mortems
-$0E60-$0E61  SSECHDR          2 B, the slot header of the current subsector
+$0E20-$0E5C  node sphere      nodeSphere, the per-node fetch -- MAPHDR's old home
+$0E60-$0E67  SSECHDR          8 B, the slot header of the current subsector,
+                              and the six bytes a node's sphere is DMA'd into
 $0E70-$0EEE  collision helpers   segNear / padClass, out of line
 $0F00-$0F3F  BSP stack        32 x 16-bit, the address the portal stack had
 $0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
+$0F51-$0FC3  seg backface     segFacing, the world-space cross product
+$0FC4-$0FF1  sphere transform sphereVisible
+$1000-$7DFF  MATRIX           ... and MAPHDR stages at $5000, before frame 1
    ...
 $9740-$97BF  SEGBUF           128 B, DMA target for one subsector's segs
 $97C0-$98E3  bsp node test    sideOf / nodeStep / bspFindSsec
    ...
-$CA30-$CE0F  doWall           one seg into the column windows
-$CE10-$CFC2  bsp traversal    renderFrame, renderSsec, ssecFetch, sector reads
+$CA30-$CE06  doWall           one seg into the column windows
+$CE08-$CFF8  bsp traversal    renderFrame, renderSsec, ssecHdr/ssecSegs, sectors
    ...
 $D000-$DB3F  NODES            resident block 1   ]
 $DB40-$DBFF  free, 192 B                         ]  under the I/O space:
@@ -281,9 +322,10 @@ $DF00-$DFFF  REU registers    never used as RAM
 `SEGBUF` is in `TABLES_FREE` rather than next to `MAPINFO` because the main
 segment ends just short of `$0E00`: everything below it is code headroom, and
 `main.asm` has an `.errorif` on it. Deleting `testmap.asm` bought about 190 B
-of that back, most of which Phase 5's collision code then spent.
+of that back; Phase 5's collision code took some, and the sphere compares have
+now taken the last byte of it.
 
-The engine's code now lands in five pieces because the free RAM does. Every
+The engine's code lands in eight pieces because the free RAM does. Every
 one of them is bounded by an `.errorif` against whatever follows it, which is
 what makes the arrangement maintainable rather than merely tight: growing a
 routine past its block fails the build with the block's name in the message.
@@ -386,6 +428,12 @@ written:
    compared against the structures that produced it.
 7. `spawnSsector` found by descending the packed nodes equals the one found by
    descending the WAD's nodes.
+8. `NODESPH` is non-resident and `sphReuBase` points at block 4.
+9. **Every bounding sphere contains every point below it** — each subsector's
+   sphere against its own seg endpoints, each node's against every seg endpoint
+   in its subtree. This is the one check that matters most: the engine rejects
+   whole subtrees on these spheres, so a bound that is short by one unit deletes
+   geometry from the frame, silently and only from some angles.
 
 and writes `build/assets-map.png`, a top-down render of the *decoded* blocks —
 segs coloured by ramp, subsectors outlined — which is the check that the

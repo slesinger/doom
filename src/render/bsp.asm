@@ -19,13 +19,16 @@
 //     first, then its sector heights are read. This is only safe
 //     because interrupts are masked for the whole run.
 //
-//  2. Node bounding boxes are not carried (docs/reu-format.md §4.2),
-//     so nothing is rejected before it is visited. What keeps the
-//     frame affordable is that the walk is front-to-back and stops
-//     dead when openCols hits zero, which in a corridor happens a
-//     few subsectors in. That is the whole culling strategy;
-//     IMPLEMENTATION_PLAN.md risk #3 is the fallback if it is not
-//     enough on real geometry.
+//  2. Culling happens in three places, cheapest first. A node's
+//     bounding sphere and a subsector's are tested against the view
+//     frustum before either is descended into or has its segs
+//     fetched (sphereVisible, below); a seg that survives that is
+//     backface-tested in world space before any projection
+//     (segFacing, walls.asm); and the walk stops dead when openCols
+//     hits zero, which in a corridor happens a few subsectors in.
+//     Only the last of those is required for correctness -- the two
+//     rejections are conservative, so switching either off changes
+//     the frame time and not a single pixel.
 //
 //  3. There is no visplane machinery. A subsector's floor and
 //     ceiling are filled per seg, over that seg's own columns only.
@@ -87,7 +90,14 @@ renderFrame:
 bspLoop:
         lda zChild+1
         bmi bspLeaf                 // bit 15 set -> subsector index
+        :Count(CNT_NODE)            // before the ldx: Count clobbers X
         ldx zChild                  // node index; numNodes <= MAXNODES
+        jsr nodeSphere              // fetch this subtree's bounding sphere and
+        bcs !visible+               // test it -- nodeSphere ends in sphereVisible
+        :Count(CNT_NODEREJ)
+        jmp bspPop                  // outside the frustum: skip the whole subtree
+!visible:
+        ldx zChild
         jsr nodeStep                // zChild = near child, zFar = far
         ldx stackN
         cpx #BSPSTKMAX
@@ -104,6 +114,7 @@ bspLeaf:
         jsr renderSsec
         lda openCols
         beq bspDone                 // every column closed: frame is finished
+bspPop:
         lda stackN
         beq bspDone
         dec stackN
@@ -120,19 +131,34 @@ bspDone:
 // renderSsec — draw the subsector whose index is in zChild.
 //------------------------------------------------------------
 renderSsec:
-        jsr ssecFetch               // -> zSegCnt, zSecId, SEGBUF
+        jsr ssecHdr                 // -> zSegCnt, zSecId, the slot's sphere
         lda zSegCnt
         beq !rts+                   // a leaf with nothing to draw is legal
+        jsr sphereVisible           // ... and one outside the view is drawn
+        bcs !visible+               // without its segs ever being fetched
+        :Count(CNT_SSECREJ)
+        rts
+!visible:
+        jsr ssecSegs                // -> SEGBUF
+        :Count(CNT_SSEC)
         ldy zSecId
         jsr secFront
         lda #0
         sta zWIdx                   // seg cursor: a byte offset, not an index
         lda zSegCnt
         sta zWCnt
-!segs:  ldx zWIdx
-        jsr doWall
+!segs:  :Count(CNT_SEG)             // counted here, not at doWall's entry:
+        ldx zWIdx                   // that block has 19 bytes of headroom
+        jsr segFacing               // one cross product; skips ~2/3 of the
+        ldx zWIdx                   // segs before any projection -- walls.asm.
+        bcs !draw+                  // It runs through mul8, so X is gone and
+                                    // doWall needs it back. ldx spares carry.
+        :Count(CNT_SEGFACE)
+        jmp !next+                  // a skipped seg closes nothing, so
+!draw:  jsr doWall                  // openCols cannot have changed
         lda openCols
         beq !rts+
+!next:
         lda zWIdx
         clc
         adc #SEGSZ
@@ -142,18 +168,23 @@ renderSsec:
 !rts:   rts
 
 //------------------------------------------------------------
-// ssecFetch — stream subsector zChild's slot out of the REU.
+// ssecHdr — stream subsector zChild's slot header out of the REU.
 //
 // Slot address is ssecReuBase + (index << 7): one shift, no
-// multiply, no offset table (docs/reu-format.md §5). Two transfers,
-// because the second one's length is what the first one reports --
-// at E1M1's 3.09 segs per subsector that is 2 + 31 bytes instead of
-// a fixed 122, and every byte transferred halts the CPU for a
-// microsecond.
+// multiply, no offset table (docs/reu-format.md §5). It is left in
+// zD for ssecSegs, which is the second half of this and reads it.
 //
-// -> zSegCnt, zSecId, SEGBUF. Requires I/O banked in.
+// Two transfers, because the second one's length is what the first
+// one reports -- at E1M1's 3.09 segs per subsector that is 8 + 31
+// bytes instead of a fixed 128, and every byte transferred halts
+// the CPU for a microsecond regardless of the CPU's clock. Since
+// the header grew to carry the slot's bounding sphere the split
+// buys more than that: a subsector outside the view never reaches
+// the second transfer at all.
+//
+// -> zSegCnt, zSecId, sphCX/sphCY/sphR. Requires I/O banked in.
 //------------------------------------------------------------
-ssecFetch:
+ssecHdr:
         lda #0                      // zD = index << 7 = (index << 8) >> 1
         sta zD
         lda zChild
@@ -180,7 +211,7 @@ ssecFetch:
         sta REU_C64ADDR
         lda #>SSECHDR
         sta REU_C64ADDR+1
-        lda #2
+        lda #SSECHDRSZ
         sta REU_LENGTH
         lda #0
         sta REU_LENGTH+1
@@ -192,10 +223,18 @@ ssecFetch:
         sta zSegCnt
         beq !rts+
         cmp #13                     // the slot holds at most 12 segs; clamp
-        bcc !+                      // rather than let a bad image overrun
+        bcc !rts+                   // rather than let a bad image overrun
         lda #12                     // SEGBUF and the tables past it
         sta zSegCnt
-!:      asl                         // length = segCount * 10
+!rts:   rts
+
+//------------------------------------------------------------
+// ssecSegs — the second transfer: zSegCnt segs from the slot whose
+// base ssecHdr left in zD, into SEGBUF. Requires I/O banked in.
+//------------------------------------------------------------
+ssecSegs:
+        lda zSegCnt
+        asl                         // length = segCount * 10
         sta zT
         asl
         asl
@@ -204,9 +243,9 @@ ssecFetch:
         sta REU_LENGTH
         lda #0
         sta REU_LENGTH+1
-        lda zD                      // the segs start two bytes into the slot
+        lda zD                      // the segs follow the slot header
         clc
-        adc #2
+        adc #SSECHDRSZ
         sta REU_REUADDR
         lda zD+1
         adc #0
@@ -220,7 +259,7 @@ ssecFetch:
         sta REU_C64ADDR+1
         lda #REU_FETCH
         sta REU_COMMAND
-!rts:   rts
+        rts
 
 //------------------------------------------------------------
 // secFront — Y = sector id -> the front sector's ceiling and floor
@@ -491,3 +530,191 @@ bspFindSsec:
         rts
 
 .errorif * > TABLES_FREE_END+1, "bsp node test overflows past TABLES_FREE"
+
+//============================================================
+//  The bounding-sphere visibility test.
+//
+//  wad2reu.py gives every node and every subsector a sphere that
+//  contains all the geometry below it (docs/reu-format.md §4.3).
+//  Rejecting one against the view frustum costs a transformPoint
+//  and three compares, and it removes a whole subtree -- or a
+//  subsector's seg fetch -- from the frame.
+//
+//  The test is deliberately the *box* test, not the sphere test.
+//  The exact one wants the distance from the centre to each frustum
+//  plane, and at 90 degrees those planes are rx = +/-ry, whose
+//  normals carry a 1/sqrt(2). Treating the sphere as the axis-
+//  aligned camera-space box [rx-r, rx+r] x [ry-r, ry+r] needs no
+//  such factor: the box contains the sphere, so the test stays
+//  conservative, and every compare is a 16-bit add and a subtract.
+//  It keeps a band of about 41% of r beyond each frustum edge, and
+//  a sphere is already a loose bound on a subtree, so the exact
+//  version would be paying multiplies for a fraction of a fraction.
+//
+//  Nothing here may reject something visible. If it does, geometry
+//  disappears -- which is why `make check`'s screenshot comparison
+//  against a build without it is the test that matters.
+//
+//  It lands in three pieces because the free RAM below MATRIX is in
+//  three pieces (SPHCODE/SPHCODE2/SPHCODE3 in defs.asm), each with
+//  its own .errorif.
+//============================================================
+
+.pc = SPHCODE "sphere test: transform"
+
+//------------------------------------------------------------
+// sphereVisible — is the sphere now in sphCX/sphCY/sphR inside the
+// view frustum?
+//   carry set   -> possibly visible, go on
+//   carry clear -> certainly outside, reject
+//
+// The centre goes through the same transformPoint doWall uses for
+// seg endpoints, so "camera space" means exactly what it means
+// there: zRYt forward, zRXt rightward.
+//
+// Clobbers A, X, Y and everything transformPoint does (zA, zB, zP,
+// zT, zSign, zTx, zTy, zRXt, zRYt). Callers reload X.
+//------------------------------------------------------------
+sphereVisible:
+        lda sphCX
+        sec
+        sbc camX
+        sta zTx
+        lda sphCX+1
+        sbc camX+1
+        sta zTx+1
+        lda sphCY
+        sec
+        sbc camY
+        sta zTy
+        lda sphCY+1
+        sbc camY+1
+        sta zTy+1
+        lda sphR
+        sta zRad
+        lda sphR+1
+        sta zRad+1
+        jsr transformPoint          // -> zRXt, zRYt  (walls.asm)
+        jmp sphereTest
+
+.errorif * > MATRIX, "the sphere transform overflows into MATRIX"
+
+//------------------------------------------------------------
+//  Second piece: the compares themselves.
+//------------------------------------------------------------
+.pc = SPHCODE2 "sphere test: compares"
+
+//------------------------------------------------------------
+// sphereTest — the box [zRXt +/- zRad] x [zRYt +/- zRad] against the
+// frustum. Only the far edge in ry matters, so ryMax is computed
+// once and used by all three compares:
+//
+//   ryMax <  0            -> wholly behind the camera
+//   ryMax <  rxMin        -> wholly right of the plane rx = ry
+//   rxMax + ryMax <  0    -> wholly left of the plane rx = -ry
+//
+// The intermediate sums are 16-bit signed. They hold because the
+// camera-relative coordinates transformPoint produces are bounded
+// by the map's own extent (E1M1 fits in about 6000 units) and the
+// largest sphere wad2reu.py will emit has radius 8000 -- the packer
+// raises rather than write one larger.
+//------------------------------------------------------------
+sphereTest:
+        lda zRYt                    // zT = ryMax = ry + r
+        clc
+        adc zRad
+        sta zT
+        lda zRYt+1
+        adc zRad+1
+        sta zT+1
+        bmi !reject+                // ryMax < 0: entirely behind the eye
+        lda zRXt                    // zA = rxMin = rx - r
+        sec
+        sbc zRad
+        sta zA
+        lda zRXt+1
+        sbc zRad+1
+        sta zA+1
+        lda zT                      // ryMax - rxMin < 0 -> off the right edge
+        cmp zA
+        lda zT+1
+        sbc zA+1
+        bvc !+
+        eor #$80
+!:      bmi !reject+
+        lda zRXt                    // rxMax = rx + r
+        clc
+        adc zRad
+        sta zA
+        lda zRXt+1
+        adc zRad+1
+        pha                         // keep the high byte; A is needed for the lo
+        lda zA
+        clc
+        adc zT                      // rxMax + ryMax < 0 -> off the left edge
+        pla
+        adc zT+1
+        bmi !reject+
+        sec
+        rts
+!reject:
+        clc
+        rts
+
+.errorif * > MAPINFO, "the sphere compares overflow into MAPINFO"
+
+//------------------------------------------------------------
+//  Third piece: the per-node fetch.
+//------------------------------------------------------------
+.pc = SPHCODE3 "sphere test: node fetch"
+
+//------------------------------------------------------------
+// nodeSphere — X = node index. DMAs that node's sphere record out
+// of block 4 into NODESPH, which is the same six bytes the
+// subsector slot header's sphere occupies, and falls straight
+// through into sphereVisible: the two are never wanted apart, and
+// chaining them keeps three bytes out of the traversal segment,
+// which is the one with no room left.
+//   carry set -> possibly visible,  carry clear -> reject
+//
+// The record's stride is 8 and not 6 for exactly one reason: it
+// makes the offset three shifts instead of a multiply. Six bytes
+// of every eight are used and 480 of block 4's 1920 are padding,
+// which costs nothing -- the block is streamed, never resident.
+//
+// Requires I/O banked in.
+//------------------------------------------------------------
+nodeSphere:
+        txa                         // reu addr = miSphBase + (index << 3)
+        asl
+        asl
+        asl
+        clc
+        adc miSphBase
+        sta REU_REUADDR
+        php                         // the lsr chain below eats the carry
+        txa
+        lsr                         // index >> 5 = the high byte of index*8
+        lsr
+        lsr
+        lsr
+        lsr
+        plp
+        adc miSphBase+1
+        sta REU_REUADDR+1
+        lda #0
+        adc miSphBase+2
+        sta REU_BANK
+        lda #<NODESPH
+        sta REU_C64ADDR
+        lda #>NODESPH
+        sta REU_C64ADDR+1
+        lda #NODESPHSZ
+        sta REU_LENGTH
+        lda #0
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        jmp sphereVisible
+
+.errorif * > SSECHDR, "the node sphere fetch overflows into SSECHDR"

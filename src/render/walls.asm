@@ -129,6 +129,7 @@ doWall:
         cmp #NEAR
         bcs !clip0+
 !reject:
+        :Count(CNT_SEGNEAR)
         rts
 !clip0:                             // clip endpoint 0 against ry=NEAR
         lda #NEAR                   // num = NEAR - ry0
@@ -262,6 +263,7 @@ doWall:
         cmp zC0
         bcs !cols+
 !reject2:
+        :Count(CNT_SEGBACK)
         rts
 !cols:
         // ---- is any column in [zC0, zC1] still open?
@@ -853,3 +855,105 @@ projRow:
         rts
 
 .errorif * > BITMAP0, "walls helpers overflow into BITMAP0"
+
+//------------------------------------------------------------
+//  Third piece: the backface test, in the free RAM between the BSP
+//  stack and MATRIX. Called by bsp.asm's renderSsec, one seg ahead of
+//  doWall.
+//------------------------------------------------------------
+.pc = BFACECODE "backface test"
+
+//------------------------------------------------------------
+// segFacing — is the seg at byte offset X in SEGBUF facing the camera?
+//   carry set   -> front-facing, draw it
+//   carry clear -> back-facing or edge-on, skip it
+//
+// doWall already rejects a back-facing seg, with the signed compare
+// sx0 < sx1 (pipeline.md §8.5) -- but only after two transformPoint
+// calls and two projSX divisions, because it needs the projected x of
+// both endpoints to make the comparison. That is about six thousand
+// cycles to learn that a seg is pointing away, and instrumenting the
+// spawn frame said 219 of its 319 segs -- 69% -- end exactly there
+// (IMPLEMENTATION_PLAN.md §13).
+//
+// Facing is a world-space property, though, and needs no projection:
+//
+//   cross = dx*(camY - y0) - dy*(camX - x0),   dx,dy = seg delta
+//
+// is Doom's R_PointOnSide with the seg for the partition line, and
+// cross < 0 means the camera is on the seg's *right*, which is where
+// its front sector is by the winding rule (docs/reu-format.md §5.1).
+// So the whole test is the sign of one cross product -- two ssmul32
+// calls, no divisions -- and it is the same arithmetic sideOf already
+// runs on nodes.
+//
+// cross == 0 is the camera exactly on the seg's line, which projects
+// to zero width. Rejecting it matches doWall, whose test is `sx0 <
+// sx1` and so drops the equal case too.
+//
+// doWall's own test stays. It costs nothing that is not already paid
+// by then, and it still catches what this one cannot see: a seg that
+// faces the camera but lands entirely off the side of the screen.
+//
+// Clobbers A, X, Y, zA, zB, zP, zSign and zTop0..zTop0+3 -- the same
+// borrow of doWall's line endpoints that sideOf makes, and safe for
+// the same reason: doWall has not filled them yet.
+//------------------------------------------------------------
+segFacing:
+        lda sgX1,x                  // zA = dx = x1 - x0
+        sec
+        sbc sgX0,x
+        sta zA
+        lda sgX1+1,x
+        sbc sgX0+1,x
+        sta zA+1
+        lda camY                    // zB = pdy = camY - y0
+        sec
+        sbc sgY0,x
+        sta zB
+        lda camY+1
+        sbc sgY0+1,x
+        sta zB+1
+        jsr ssmul32                 // zP = dx*pdy
+        lda zP+0
+        sta zTop0
+        lda zP+1
+        sta zTop0+1
+        lda zP+2
+        sta zTop0+2
+        lda zP+3
+        sta zTop0+3
+        ldx zWIdx                   // ssmul32 runs through mul8, which
+        lda sgY1,x                  // clobbers X. zA = dy = y1 - y0
+        sec
+        sbc sgY0,x
+        sta zA
+        lda sgY1+1,x
+        sbc sgY0+1,x
+        sta zA+1
+        lda camX                    // zB = pdx = camX - x0
+        sec
+        sbc sgX0,x
+        sta zB
+        lda camX+1
+        sbc sgX0+1,x
+        sta zB+1
+        jsr ssmul32                 // zP = dy*pdx
+        lda zTop0                   // cross = dx*pdy - dy*pdx, sign only
+        sec
+        sbc zP+0
+        lda zTop0+1
+        sbc zP+1
+        lda zTop0+2
+        sbc zP+2
+        lda zTop0+3
+        sbc zP+3
+        bvc !+
+        eor #$80
+!:      bmi !front+
+        clc                         // cross >= 0: facing away, or edge-on
+        rts
+!front: sec
+        rts
+
+.errorif * > $1000, "the backface test overflows into MATRIX"

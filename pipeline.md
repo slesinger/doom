@@ -1290,32 +1290,45 @@ $0100-$01FF  6510 stack
 $0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
 $0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0BC5  main + input + testmap code and data
-$0BC6-$0EFF  free             826 B
-$0F00-$0F3F  portal stack (pStkSec/XL/XR, 12 each) + visitedSec
-$0F40-$0F41  frameCnt         host-readable frame counter (tools/u64push.py --fps)
+$0810-$0DBA  main + input + REU + map loader code
+$0DBC-$0DFF  sphereTest       the three frustum compares
+$0E00-$0E1F  MAPINFO          resident block 0
+$0E20-$0E5C  nodeSphere       the per-node sphere fetch
+$0E60-$0E67  SSECHDR          subsector slot header + its bounding sphere
+$0E70-$0EEE  collision helpers
+$0F00-$0F3F  BSP descent stack (32 x 16-bit child words)
+$0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
+$0F51-$0FC3  segFacing        world-space seg backface test
+$0FC4-$0FF1  sphereVisible    sphere decode + transform
 $1000-$7DFF  MATRIX           28160 B = 110 pages, cell-major chunky buffer
 $8000-$83FF  SCREEN0          (VIC bank 2)
 $8400-$973F  converter tables dither 4 KB, scrTab/colTab 512 B, xOfs 320 B
-$9740-$98FF  free             448 B (TABLES_FREE)
+$9740-$97BF  SEGBUF           one subsector's segs, DMA target
+$97C0-$98E3  bsp node test    sideOf / nodeStep / bspFindSsec
+$98E4-$98FE  instrumentation counters (INSTRUMENT = 1 builds only)
 $9900-$9B4A  converter code
-$9B60-$9D6B  math + spanFill code
+$9B4B-$9B5A  cntBump          the counter helper
+$9B60-$9D7C  math + spanFill code
 $9D80-$9F8D  walls helper routines
+$9F8E-$9FE8  CIA2 ms clock + framePace
 $A000-$BF3F  BITMAP0          (VIC bank 2)
 $C000-$C3FF  SCREEN1          (VIC bank 3)
 $C400-$CA2B  math tables      sqr 1024 B, sin 512 B, rowCell 44 B
-$CA30-$CED3  walls renderer code
-$CED4-$CFFF  free             300 B
+$CA30-$CE06  doWall
+$CE08-$CFF8  bsp traversal    renderFrame, renderSsec, ssecHdr/ssecSegs
+$D000-$DEFF  NODES + SECTORS  resident, under the I/O space ($01 = $34 to read)
 $E000-$FF3F  BITMAP1          (VIC bank 3, under Kernal ROM -- write-only)
 ```
 
 Three things worth knowing about this map:
 
-- **The portal stack sits at `$0F00`, deliberately far above the code.** It
-  used to start at `$0B20`, and adding the strafe handling to `movePlayer` grew
-  the main segment to `$0BC5` — straight through it, silently, because nothing
-  checked. `main.asm` now carries `.errorif * > pStkSec`. The free block below
-  MATRIX is unchanged in total; it is just split either side of the stack now.
+- **There is no free block below MATRIX any more.** The eight code fragments
+  between `$0DBC` and `$0FF1` are there because that is where the holes were,
+  not because anything about them belongs together. Every one is bounded by an
+  `.errorif` against whatever follows it, so growing one past its block fails
+  the build with the block's name in the message — which is what makes the
+  arrangement maintainable rather than merely tight. `sphereTest` starts exactly
+  one byte above where the main segment ends.
 - **The math tables end at `$CA2C` and the walls code begins at `$CA30`.**
   Four bytes of slack. Adding a single table entry to `sqr`, `sin` or `rowCell`
   will silently overrun into executable code unless `WALLSCODE` moves first.
@@ -1325,7 +1338,7 @@ Three things worth knowing about this map:
   dead scanline-major `rowLo`/`rowHi` pair from `3d-renderer-design.md`, deleted
   now that `spanFill` is confirmed to use the cell-major `rowCell` pair instead;
   `main.asm` has an `.errorif` keeping the dither tables from growing back into
-  it. The first 128 B are now `SEGBUF`.
+  it. It is now fully spent: `SEGBUF`, the node test, and the counters.
 - **`$D000-$DEFF` is where E1M1 lives.** 4 KB of RAM hides under the I/O space,
   and nothing else claims it, so E1M1's 236 BSP nodes and 85 sectors are
   resident there; everything else streams from the REU one subsector at a time.
@@ -1366,11 +1379,48 @@ transient was excluded: windows that catch a slow frame read 40-44 fps instead
 of 50.
 
 So the §12.1 estimate of ~994k cycles was low by roughly a third — 20 ms at
-64 MHz is ~1.28M cycles — but right about where the time goes. The practical
-reading is that **the test map has little headroom left before it drops to
-25 fps**, and E1M1 will not fit in what remains without the §12.1 optimizations.
-Quality scaling (`algorithm.md`'s `quality.degrade_step`) must react *before*
-the overrun, not after; that mechanism still does not exist.
+64 MHz is ~1.28M cycles — but right about where the time goes.
+
+**E1M1 measured 17.6 fps (56.9 ms/frame) on the same machine, and 22.2 fps
+(45.1 ms/frame) after two culling passes.** The VICE column below is what
+predicted it:
+
+| Build | VICE ms/frame | E1M1 nodes | subsectors | segs |
+|---|---:|---:|---:|---:|
+| Phase 4 as measured on hardware | 3888 | 234 | 235 | 725 |
+| \+ world-space seg backface test | 3191 | 234 | 235 | 725 |
+| \+ node/subsector bounding spheres | **2589** | **72** | **39** | **122** |
+
+Both passes are conservative rejections, so both were verified by comparing the
+rendered frame against a build with the test disabled: 0 of 104448 pixels
+differ, twice. That is the check that matters — a culling bug does not crash,
+it deletes geometry from some angles and not others.
+
+Scaling the VICE column by the ratio that held for the 56.9 ms reading predicts
+**37.9 ms of compute**; hardware delivered 45.1. The difference is not error,
+it is `flip`'s raster quantisation — frame time can only be a multiple of
+19.95 ms, and 45.1 decomposes as `39.90 x 74% + 59.85 x 26%`. Three frames in
+four make the 25 fps deadline; one in four misses it. Compute is sitting just
+under the two-frame boundary, which is both the worst place to be (variations
+flip a frame between 25 and 16.7 fps, which reads as judder) and the cheapest
+(another ~10% locks it at a solid 25).
+
+**Frame pacing now has a floor as well as a ceiling.** Without a cap the engine
+runs at whatever `50/n` the frame happens to cost, and everything that moves is
+per-frame, so a simple view at 50 fps moved the player twice as fast as a
+complex one at 25. `framePace` (`src/clock.asm`) holds each frame to at least `FPS_CAP_TICKS = 39`
+CIA ticks before handing over to `flip`'s raster sync, which pins the common
+case at 25 fps. **A tick is 1.015 ms, not 1 ms** — PAL phi2 is 985248 Hz, so a
+Timer A latch of 1000 underflows a little slower than a millisecond, which
+`make u64-fps` confirms as a 0.982 ratio against the host clock. So 39 ticks is
+39.58 ms, just under two PAL frames (39.90), and 40 would be 40.60 — past the
+line-251 crossing, costing a third raster frame and giving 16.7 fps instead of
+25. 39 is the maximum, not merely a good choice. The clock behind it is CIA2's Timer B, cascaded off a Timer A running at
+1000 phi2 cycles, which is a millisecond counter that does not care what the
+CPU clock is — established in §10 of `IMPLEMENTATION_PLAN.md`, where `reubench`
+timed DMA with the same CIA and got identical tick counts at 1 MHz and 64 MHz,
+and re-checked against the host's wall clock by `make u64-fps`. Quality scaling (`algorithm.md`'s `quality.degrade_step`) is the
+other half of this and still does not exist.
 
 ---
 
@@ -1491,10 +1541,10 @@ Mapping `algorithm.md`'s abstract stages onto what exists today:
 | `PollInput` | `readInput` | ✅ complete |
 | `SimulatePlayer` | `movePlayer` | ⚠️ integer coords, no sliding, no `dt` |
 | `ResolveCamera` | inline in `renderFrame` | ✅ complete |
-| `PredictStreaming` | — | ❌ no REU streaming |
-| `BuildVisibleSectorSet` | portal stack in `popLoop` | ⚠️ no PVS, no supersectors |
-| `CollectCandidateWalls` | `renderSector`'s wall loop | ✅ complete |
-| `FilterWalls` | near-plane + backface + window clamp | ✅ complete |
+| `PredictStreaming` | `ssecHdr`/`ssecSegs`, `nodeSphere` — per visit, not predictive | ⚠️ no prefetch |
+| `BuildVisibleSectorSet` | BSP descent + bounding-sphere rejection | ⚠️ no PVS, no supersectors |
+| `CollectCandidateWalls` | `renderSsec`'s seg loop | ✅ complete |
+| `FilterWalls` | world-space backface, then near-plane + window clamp | ✅ complete |
 | `sort.front_to_back` | **not needed** — convexity (§8.5) | ✅ by construction |
 | `ProjectWallsToColumns` | `lineSetup` + the column loop | ✅ complete |
 | `BuildSpriteCandidates` / `CullAndSortSprites` | — | ❌ not started |
@@ -1515,9 +1565,10 @@ they are choices rather than omissions:
   floor/ceiling pass. When textures arrive and material page locality starts to
   matter, this is the decision to revisit.
 - **No quality scaling.** Every cap in the engine today is a hard cap
-  (`PSTKMAX = 12`, 160 columns, 176 rows) rather than an adaptive budget. The
-  frame-time feedback loop in `algorithm.md` §4 needs a cycle counter the
-  engine does not yet have.
+  (`BSPSTKMAX = 32`, 160 columns, 176 rows) rather than an adaptive budget.
+  The clock the feedback loop in `algorithm.md` §4 needs now exists —
+  `src/clock.asm` runs CIA2 as a millisecond counter and `framePace` already
+  reads it (§12.3) — but nothing yet *reacts* to a frame that overran.
 
 The next milestones, in dependency order:
 

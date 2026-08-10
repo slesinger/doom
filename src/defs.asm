@@ -89,33 +89,80 @@
 .errorif SECTAB < NODETAB_END, "node table overruns the sector table"
 .errorif SECTAB_END > $df00, "resident map tables overrun the REU registers"
 
-// $0e00-$0e5f. MAPINFO's page alignment is load-bearing: a block descriptor
-// carries only the high byte of its load address (docs/reu-format.md §2).
-// $0e60-$0eff is free.
+// MAPINFO's page alignment is load-bearing: a block descriptor carries only
+// the high byte of its load address (docs/reu-format.md §2). What used to be
+// the free tail of this page is now SPHCODE3 and SSECHDR.
 .const MAPINFO  = $0e00             // 32 B, resident block 0
-.const MAPHDR   = $0e20             // 64 B, the image header, kept after boot
-                                    // so a rejected image can be read back
+
+// The 64-byte image header, staged inside MATRIX rather than below it.
+// mapLoad walks its block descriptors and is the only code that ever reads it;
+// it runs before the first frame, so MATRIX is 28 KB of scratch at that point.
+// $5000 is clear of $1000, where the same routine stages each resident block
+// (the largest is NODES at 2880 B). Moving it out of $0e20 freed the 64 bytes
+// the bounding-sphere test now occupies -- see SPHCODE3.
+.const MAPHDR   = MATRIX + $4000
 
 // One subsector's segs, DMA'd per visit. In TABLES_FREE rather than in the
-// $0e00 page because the main segment now ends at $0dc6 and everything below
-// MAPINFO is code headroom -- see main.asm's .errorif.
+// $0e00 page: everything below MAPINFO is code headroom, and the sphere
+// compares have taken the last of it -- see main.asm's .errorif.
 .const SEGBUF   = TABLES_FREE       // 128 B, $9740-$97bf
 .const SEGBUFSZ = 128
 .errorif SEGBUF + SEGBUFSZ > TABLES_FREE_END, "SEGBUF overruns TABLES_FREE"
 
-// The two-byte slot header (segCount, sectorId) that precedes those segs, read
-// by its own short DMA. Separate from SEGBUF because the second transfer's
-// length depends on what the first one says -- docs/reu-format.md §5.
-.const SSECHDR  = $0e60             // 2 B
+// The eight-byte slot header that precedes those segs, read by its own short
+// DMA. Separate from SEGBUF because the second transfer's length depends on
+// what the first one says -- docs/reu-format.md §5.
+//
+//   +0 segCount   +1 sectorId   +2 sphere cx   +4 sphere cy   +6 sphere radius
+//
+// The sphere is why the header grew from two bytes to eight: with it in the
+// first transfer, a subsector that is outside the view can be rejected before
+// the second transfer fetches a single seg.
+.const SSECHDR  = $0e60             // 8 B, $0e60-$0e67
+.const SSECHDRSZ = 8
+.const sphCX    = SSECHDR + 2
+.const sphCY    = SSECHDR + 4
+.const sphR     = SSECHDR + 6
+
+// A node's sphere is DMA'd into the *same* six bytes. Nothing needs both at
+// once: the node test runs in bspLoop, before the descent reaches a leaf, and
+// renderSsec re-fetches the slot header every time it draws one.
+.const NODESPH  = sphCX
+.const NODESPHSZ = 6                // cx, cy, r -- the record's 2 pad bytes
+                                    // exist only to make the stride a shift
 
 // Collision helpers, out of line from the main segment. $0e70-$0eff, 144 B.
 .const COLLCODE = $0e70
+
+// segFacing, the world-space backface test, in the free RAM between the BSP
+// stack and MATRIX. $0f51-$0fc3.
+.const BFACECODE = $0f51
+
+// The bounding-sphere visibility test, in three pieces because the free RAM
+// below MATRIX is in three pieces. Every one is guarded by an .errorif against
+// what follows it, so growing one past its block fails the build by name.
+//
+//   SPHCODE   $0fc4-$0fff   60 B   sphereVisible: decode + transform
+//   SPHCODE2  $0dbc-$0dff   68 B   sphereTest:    the three frustum compares
+//   SPHCODE3  $0e20-$0e5f   64 B   nodeSphere:    the per-node REU fetch
+//
+// SPHCODE2 takes what used to be the main segment's headroom and SPHCODE3
+// takes MAPHDR's old home, so both of those are now spent. The next routine
+// that needs low RAM has to find it somewhere else. SPHCODE2 in particular is
+// sized to the byte -- it starts one byte above where the main segment ends,
+// and both ends are asserted.
+.const SPHCODE   = $0fc4
+.const SPHCODE2  = $0dbc
+.const SPHCODE3  = $0e20
 
 // bsp.asm lands in two pieces. The traversal proper follows doWall in the walls segment; the node test
 // and the standalone descent go in the tail of TABLES_FREE. Two pieces
 // because the free RAM comes in two pieces -- neither block alone is big
 // enough. Both are asserted against what follows them.
-.const BSPCODE  = $ce10             // after the walls segment, up to $cfff
+// $ce08 is where doWall ends, not a round number: the sphere test's node hook
+// spent the alignment slack that used to sit between them. walls.asm's own
+// .errorif is what keeps doWall from growing back into this.
+.const BSPCODE  = $ce08             // after the walls segment, up to $cfff
 .const BSPCODE2 = TABLES_FREE + SEGBUFSZ    // $97c0, tail of TABLES_FREE
 
 // seg record field offsets within SEGBUF, indexed by the seg's byte offset in
@@ -142,9 +189,14 @@
 .const miSpawnSec   = MAPINFO + 18
 .const miNumSegs    = MAPINFO + 19
 .const miMapId      = MAPINFO + 21
+.const miSphBase    = MAPINFO + 22  // 24-bit REU offset of block 4, NODESPH
 
 // image header field offsets — docs/reu-format.md §2
-.const MAPFMT_VERSION = 1
+// 2 added the bounding spheres: the eight-byte subsector slot header and
+// block 4. A version-1 image loads none of it, so mapload.asm rejects it
+// rather than reading zeroes as spheres of radius nothing and culling the
+// entire map.
+.const MAPFMT_VERSION = 2
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5
@@ -329,6 +381,20 @@
 .const zInput  = $8f
 
 //------------------------------------------------------------
+// zero page — frame pacing and the bounding-sphere test ($90-$95)
+//
+// $90 upwards was untouched: the engine allocated $02-$8f and never calls the
+// KERNAL, so everything above it has been free RAM since boot.
+//------------------------------------------------------------
+.const msLast  = $90        // CIA2 Timer B at the last completed frame
+.const msNow   = $92        // scratch for a torn-read-safe timer read
+
+// The bounding sphere's radius, world units, live across transformPoint.
+// The centre needs no zero page of its own: it goes straight into zTx/zTy,
+// which is what transformPoint reads.
+.const zRad    = $94
+
+//------------------------------------------------------------
 // zero page — converter ($40-$4a)
 //------------------------------------------------------------
 .const zTmp    = $40        // $40-$47: 8 packed bytes of current cell
@@ -412,6 +478,10 @@
 
 .const WALLS2         = $9d80      // walls helper routines after math code
 
+// The millisecond clock and the frame pacer, in the gap between the walls
+// helpers and BITMAP0. 114 B, $9f8e-$9fff.
+.const CLKCODE        = $9f8e
+
 // Free-running 16-bit frame counter, incremented once per completed flip.
 // Nothing in the engine reads it; it exists so that a host can DMA-read it
 // twice over a known wall-clock interval and get a real frame rate out of
@@ -432,3 +502,61 @@
 // bus as the engine has it banked, so $d000 reads back the registers, not the
 // node table. The engine reads that RAM itself, so it can add it up.
 .const mapSum         = $0f49      // 4 blocks x 2 bytes, $0f49-$0f50
+
+//------------------------------------------------------------
+// CIA2 as a millisecond clock — see src/clock.asm.
+//
+// Timer A free-runs at 1000 phi2 cycles, Timer B counts A's underflows, so
+// $DD06/$DD07 is a 16-bit millisecond counter running *down* from $ffff and
+// wrapping every 65.5 s. It is the only wall clock the engine has: the raster
+// only says "somewhere in this 20 ms frame", and the CPU clock is 1 MHz in
+// VICE and 64 MHz on the Ultimate.
+//
+// Two things depend on it. `framePace` uses it to hold the frame rate at
+// FPS_CAP_TICKS, and a host can read $DD06/$DD07 over the monitor for *emulated*
+// milliseconds, which is what makes a frame-time measurement possible under
+// warp (tools/vicedbg/stats.py).
+//------------------------------------------------------------
+.const CIA2_TALO   = $dd04
+.const CIA2_TAHI   = $dd05
+.const CIA2_TBLO   = $dd06
+.const CIA2_TBHI   = $dd07
+.const CIA2_ICR    = $dd0d
+.const CIA2_CRA    = $dd0e
+.const CIA2_CRB    = $dd0f
+
+.const MS_TICKS    = 1000          // phi2 cycles per Timer A underflow
+
+// Frame pacing. Without a cap the engine runs at whatever 50/n the frame
+// happens to cost, and everything that moves is per-frame, so a simple view
+// at 50 fps moves the player twice as fast as a complex one at 25 fps. The
+// cap makes 50 fps unreachable and pins the common case at 25.
+//
+// THE UNIT IS A TIMER B TICK, NOT A MILLISECOND. PAL phi2 is 985248 Hz, not
+// 1 MHz, so a Timer A latch of 1000 underflows every 1.015 ms. Hardware
+// confirms it: `make u64-fps` measured 9871 CIA ticks against 10049 host
+// milliseconds, a ratio of 0.982 where PAL predicts 0.985.
+//
+// That is what fixes this number at 39 and makes 39 the *maximum*:
+//
+//   39 ticks = 39.58 ms   <  two PAL frames (39.90 ms)   -- lands on the
+//   40 ticks = 40.60 ms   >  two PAL frames              second crossing
+//
+// The wait hands over to flip's raster sync, which then lands on the next
+// line-251 crossing. At 40 every frame would miss that crossing and cost a
+// third raster frame -- 16.7 fps instead of 25. The 39.58 ms figure is already
+// the worst case: msLast is captured mid-tick, so the counter reaches 39
+// somewhere between 38 and 39 whole ticks after it, never later.
+.const FPS_CAP_TICKS = 39
+
+//------------------------------------------------------------
+// Renderer instrumentation lives in src/instrument.asm, not here.
+//
+// defs.asm is imported by three PRGs -- the engine, reuload.asm and
+// reubench.asm -- and the last two have no renderer and no clock.asm. The
+// Count macro's body names `cntBump`, and KickAssembler resolves the symbols
+// inside a macro body whether or not the macro is ever invoked and whether or
+// not the `.if` guarding them is false. So a macro here that references engine
+// code fails the standalone builds at parse time, pointing into a macro they
+// do not use. Nothing in this file may name a symbol only one PRG defines.
+//------------------------------------------------------------
