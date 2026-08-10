@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -116,6 +117,38 @@ class Ultimate:
         """Reset, DMA the PRG into memory, and start it."""
         self._json("POST", "/v1/runners:run_prg", body=data,
                    content_type="application/octet-stream")
+
+    def run_prg_basic(self, data: bytes, settle: float = 5.0) -> None:
+        """Start a PRG the way a human would, keeping the cartridge alive.
+
+        ``run_prg`` is the obvious call and it is wrong for anything that
+        touches the Ultimate's cartridge personality. It injects the
+        program by a path that leaves the cartridge disabled: with "RAM
+        Expansion Unit" set to "GeoRAM Mode", the window at $de00 reads
+        as open bus for every program started that way. The REU is not a
+        cartridge and survives it, which is why this went unnoticed for
+        as long as the project only used the REU -- and why a GeoRAM
+        probe delivered by ``run_prg`` reports "no device" on a machine
+        where memtest64, loaded normally, finds 4 MB.
+
+        This resets, DMAs the program into RAM, fixes BASIC's
+        end-of-program pointer so RUN believes in it, and types RUN
+        through the keyboard buffer. The machine ends up in exactly the
+        state an ordinary load-and-run leaves it in.
+
+        ``settle`` is how long to wait for the KERNAL to finish booting
+        before the DMA lands; too short and the reset wipes the program
+        back out.
+        """
+        load = data[0] | (data[1] << 8)
+        body = data[2:]
+        end = load + len(body)
+        self.reset()
+        time.sleep(settle)
+        self.writemem(load, body)
+        self.writemem(0x2D, bytes([end & 0xFF, end >> 8]))  # VARTAB
+        self.writemem(0x0277, b"RUN\r")                     # keyboard buffer
+        self.writemem(0x00C6, b"\x04")                      # ...and its length
 
     def readmem(self, address: int, length: int = 256) -> bytes:
         """DMA-read C64 memory. Returns raw bytes, not JSON."""
