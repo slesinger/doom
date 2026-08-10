@@ -370,6 +370,10 @@ courtyard and back without leaking through a wall or falling through a floor.
    `data_structures.md` reconciled with the formats Phase 3 actually emitted.
 4. Tag the milestone.
 
+**1-3 are done (§16).** Measured 25.05 fps with 37.6 ms of compute against a
+39.90 ms deadline, `make u64-map` verifying all three resident blocks on the
+machine, and `make check` green. 4 is the user's call.
+
 ---
 
 ## 6. Risks, in order of how much they could cost
@@ -1087,6 +1091,14 @@ frame under the boundary and lock the game at a solid 25 fps**, turning a
 22.2 fps average into a stable 25. A 10% gain is worth 13% of frame rate here,
 not 10%, and it is worth more than that in how the game feels.
 
+*(§16 revisits this paragraph. The decomposition assumes the only outcomes are
+two and three raster frames; the frame timer built later shows a third one —
+2.30 s startup frames the Ultimate's post-reset housekeeping causes — that a
+20 s average cannot distinguish from many slightly-late frames. How much of
+the 45.1 was really judder and how much was one slow frame is no longer
+recoverable; that it was mostly judder is consistent with the fact that §15's
+9.4% moved the reading to a clean 25.05.)*
+
 ### What this session did not do
 
 - **Sliding along walls** and **one-boundary-per-frame** — Phase 5's two open
@@ -1361,8 +1373,10 @@ milestone is not tagged until they run. Everything else in Phase 6 is done:
 `make check` is green, the frame is pixel-identical, and the documentation is
 this section.
 
-> **It was confirmed, and the prediction was wrong: 22.73 fps, not 25.**
-> The reading and what it costs this projection are §16.
+> **Confirmed: 25.05 fps, every frame on the deadline.** The compute figure
+> was optimistic — 37.6 ms measured against 34.3 predicted, so ~2 ms of margin
+> rather than 5.6 — but the conclusion held: this is what locked the frame. §16
+> has the reading, and the first run of it that said 22.73 and was wrong.
 
 ### For M2's sound task
 
@@ -1375,90 +1389,55 @@ Three things this session leaves deliberately in place for it:
 - **~5.6 ms of frame headroom** rather than the ~2 ms §13 left. A 50 Hz
   interrupt against a 25 fps frame is two interrupts a frame, which at §14's
   measured 9.1 µs each is 0.05% — but it now has room to be sloppy.
-  *(§16: the headroom is not there. The budget claim still holds — 0.05% of a
-  frame is 0.05% whatever the frame costs — but "room to be sloppy" does not.)*
+  *(§16: measured, it is ~2 ms, not 5.6. Still ample for a 50 Hz player at
+  0.018 ms/frame, but not room to be sloppy.)*
 - **The frame is locked to a multiple of 19.95 ms**, so a 50 Hz player ticking
   twice per rendered frame is exactly in step. That only holds while compute
   stays under the boundary, which is what the headroom is for.
-  *(§16: it is a multiple of 19.95 ms, but not always the same multiple — one
-  frame in five is three raster frames rather than two, so a 50 Hz player ticks
-  two or three times per rendered frame. M2 must drive the player from the
-  interrupt and not from the frame loop.)*
+  *(§16: measured over 502 consecutive frames, every one of them two raster
+  frames. `ftHist` is the alarm that says it has stopped being true.)*
 
 ---
 
-## 16. Session log — 2026-08-10, the reading that contradicted the projection
+## 16. Session log — 2026-08-10, the 25 fps lock, and the two frames that hid it
 
-Hardware ran, and it did not lock 25 fps:
+**Milestone 1 is closed on hardware: a measured 25.05 fps, every frame on the
+deadline.**
 
 ```
-fps: 456 frames in 20.06 s = 22.73 fps (44.0 ms/frame)
-cia: 19725 CIA ms in 20060 host ms = 0.983 x
-map: block 0 $0E00 +32 verified byte-exact and by checksum $075A
-map: block 1 $D000 +2880 verified by checksum $44FA (under I/O)
-map: block 2 $DC00 +576 verified by checksum $9E3E (under I/O)
+boot: 2 frame(s) before the window cost up to 2.30 s each -- the Ultimate's
+      post-reset bus stealing, now sat out
+fps: 502 frames in 20.04 s = 25.05 fps (39.9 ms/frame)
+cia: 19706 CIA ms in 20044 host ms = 0.983 x
+frame: compute 37.6 ms last, 37.6 min, 38.6 max (deadline 39.90 ms)
+frame: raster frames 1x0 2x502 3x0 4+x0 -- 100% made the 25 fps deadline
+frame: ok -- every frame's compute fits in two raster frames
 ```
 
-**22.19 → 22.73 fps.** The VICE frame came down 9.4%; the hardware frame came
-down **2.4%**, from 45.1 to 44.0 ms. `make u64-map` passes, so Phase 6's
-delivery item is closed. Phase 6's *frame-rate* item is not what §15 said it
-would be.
+`make u64-map` passes too: `mapOK=1`, all three resident blocks verified by
+checksum against `build/assets.reu`. Both Phase 6 gates are met.
 
-### What the number actually says
+### The session started with the opposite reading
 
-Frame time is quantised — `flip` syncs to raster line 251 — so the only
-decomposition of 44.0 ms is
+The first hardware run of §15's build said **22.73 fps, 44.0 ms/frame** — the
+9.4% VICE win delivering 2.4% on hardware, and no lock. The obvious
+decomposition made it worse: frame time is quantised to 19.95 ms, and 44.0
+reads as `39.90 x 79% + 59.85 x 21%`, i.e. one frame in five missing the
+deadline where §13 had one in four. Every part of that was wrong, and the way
+it was wrong is the lesson.
 
-    39.90 ms x 79%  +  59.85 ms x 21%  =  44.0 ms
-
-against §13's 39.90 × 74% + 59.85 × 26%. **One frame in five misses the 25 fps
-deadline where it used to be one in four.** The work was real and it moved the
-right number; it moved it about a fifth as far as the projection said.
-
-### Why the projection was wrong, as far as can be told from outside
-
-§15 scaled §13's ratio: 37.9 ms of hardware compute at VICE 2551, so ~34.3 ms
-at VICE 2311, which is 5.6 ms clear of the boundary and should have missed
-nothing. If compute really were 34.3 ms, **every** frame would land on the
-second raster crossing and the reading would be 25.00 fps exactly. It is not,
-so compute is not 34.3 ms — the conversion is wrong somewhere, and the
-measurement cannot say where, because *by how much* a frame overran is exactly
-what quantisation destroys.
-
-Two candidates, both consistent with the reading and not separable from
-outside:
-
-1. **The ratio is not a ratio.** REU DMA is 1 byte/µs on both machines and does
-   not scale with the CPU clock, so a fixed ~1.3 ms of the hardware frame is
-   0.05% of the VICE frame and 3% of the hardware one. Scaling the whole frame
-   by a CPU-work ratio therefore over-credits every CPU-side saving. This is the
-   effect the session was warned about; it accounts for maybe 1.3 ms, not 5.
-2. **Compute varies frame to frame on hardware and does not in VICE.** This is
-   the one the reading actually points at. A static camera doing deterministic
-   work should land on the *same* raster crossing every frame — 25.00 fps or
-   16.67, never 22.73. Under VICE it does: the engine's own timer now reports
-   **min 2268, max 2269 ticks over 203 frames**, a one-tick spread. On hardware
-   something makes an identical frame cost a different amount, and a spread that
-   straddles the boundary is exactly what produces a mixed reading.
-
-The pacer was suspected and cleared by construction. `framePace` releases at
-most `FPS_CAP_TICKS` = 39 ticks = 39.58 ms after its own previous release,
-which is *before* `flip`'s raster wait, so its release always precedes the
-39.90 ms crossing and it can never by itself push a frame onto the third one.
-It can only fail the other way — admitting a 19.95 ms frame if a view ever gets
-cheap enough — which the histogram now watches for.
+**The decomposition assumed the only possibilities were two and three raster
+frames.** They were not. Nothing in the average could have said so, because an
+average of quantised frames cannot distinguish *many frames slightly over* from
+*one frame catastrophically over* — and those two want completely opposite
+work. Chasing the first would have meant another optimisation pass on a
+renderer that was already fast enough.
 
 ### So the engine times itself now
 
-The average frame rate cannot separate "1 ms over the deadline" from "10 ms
-over", and those two want opposite work: one wants a constant shaved, the other
-wants an algorithm replaced. Only the machine can see the difference, so it
-measures it — the same argument as §13's counters, for the same reason.
-
-Two reference points per frame, from the CIA millisecond clock that §13 already
-calibrated: one at the flip (`frameMark`, from `mainLoop`), one when the
-renderer hands over to the pacer (`frameStat`, from `framePace`'s first line,
-before it waits — after the wait every frame reads the same).
+Two reference points a frame, off the CIA millisecond clock §13 calibrated:
+`frameMark` at the flip, `frameStat` at the moment the renderer hands over to
+the pacer — before it waits, because after the wait every frame reads the same.
 
 | | |
 |---|---|
@@ -1467,42 +1446,78 @@ before it waits — after the wait every frame reads the same).
 | `ftCMin`, `ftCMax` | compute, min and max over the run |
 | `ftHist` | 4 × 16-bit: frames costing 1, 2, 3, 4+ raster frames |
 
-`make u64-fps` clears the accumulators, waits, and prints them, with a verdict
-line that says which of the three cases the run is in:
-
-- `cmax` under 39.90 → compute is not the problem, the misses are pacing;
-- `cmin` over 39.90 → the renderer is the whole story and 25 fps needs exactly
-  that much off it;
-- straddling → the *spread* costs the frames, not the average, and the work is
-  to find what varies.
-
-The block is 16 bytes at **`$02a0`**, in colTop's unused tail — the renderer
-touches columns 0-159 only. That address is deliberately *outside* the PRG
-image: a runtime write inside it shows up in `probe.py`'s live-RAM diff as an
-unexplained difference, which is the trade `instrument.asm`'s counters accept
-and this one does not have to. The code is 168 bytes at `$0d40`, from the block
-§15 freed. Cost is three `msRead`s and about sixty cycles a frame — under a
-microsecond at 64 MHz, a thousandth of what it measures — which is why it is
-not behind `INSTRUMENT`: **a measurement you need a special build for is a
+16 bytes at **`$02a0`**, in colTop's unused tail — the renderer touches columns
+0-159 only — and deliberately *outside* the PRG image, so a runtime write there
+never shows in `probe.py`'s live-RAM diff. 168 bytes of code at `$0d40`, from
+the block §15 freed. Three `msRead`s and about sixty cycles a frame: under a
+microsecond at 64 MHz, a thousandth of what it measures, which is why it is not
+behind `INSTRUMENT`. **A measurement you need a special build for is a
 measurement you make once.**
 
-Seeding it is worth a line, because the first version got it wrong and the
-error was invisible: `ftInit` sits after the spawn descent, not next to
-`msInit`. Its reference point is the last flip, and before the first flip that
-is the boot sequence, so frame 1 reported `reuProbe` + `mapLoad` as compute —
-2396 ticks against a true 2269 — and poisoned `ftCMax` for the whole run.
+Seeding it is worth a line, because the first version got it wrong invisibly:
+`ftInit` is called after the spawn descent, not next to `msInit`. Its reference
+point is the last flip, and before the first flip that is the boot sequence, so
+frame 1 reported `reuProbe` + `mapLoad` as compute — 2396 ticks against a true
+2269 — and poisoned `ftCMax` for the whole run.
 
-Verified pixel-identical against the §15 build: 0 of 104448 pixels differ.
-`make check` green.
+### What it said, immediately
 
-### Where this leaves Milestone 1
+The histogram from boot, sampled once a second:
 
-**M1's playable goal is met and its frame-rate target is not.** E1M1 renders
-and walks out of the WAD on hardware at a measured 22.73 fps, with the map
-image verified end to end. 25 fps is a target §13 set, not a milestone
-definition, and the honest statement is the measured one.
+```
+t= 3.0s  comp=37 min=37 max=2268  hist=[0, 12, 0, 2]
+t= 9.1s  comp=38 min=37 max=2268  hist=[0, 164, 0, 2]
+```
 
-The next session's first job is one `make u64-fps` — the instrumentation is
-in and the run costs a minute. Until then, what to optimise next is a guess,
-and this project has already paid for guessing twice (§12's early-out, §15's
-coarse transform).
+**Two frames, and only ever those two, cost 2268 ticks — 2.30 s each.** Every
+other frame from the third onwards is 37-38 ms and lands on the second raster
+crossing; the `3` bucket never leaves zero. There was no judder and there were
+no marginal frames. There were two enormous ones at startup.
+
+2.30 s is, to within 0.4%, the 1 MHz frame time (VICE measures 2311 ms). That
+looks exactly like a turbo that has not engaged yet — so `turboOn` was called
+from `mainLoop` on every frame and it changed nothing: still two frames, still
+2269 ticks. The Ultimate is holding the bus for its own post-reset
+housekeeping, which is the transient `u64push.py`'s `WARMUP_SECONDS` already
+existed to sit out. The call was reverted; the finding is now a comment on
+`turboOn`, because the next person to see 2.30 s will reach for the same
+register.
+
+One of those frames inside a 20 s window is 2.3 s of it, which turns 502 frames
+into 456 and 25.0 fps into 22.7 — the original reading, exactly. The warmup is
+3 s and the wait is for `frameCnt` to move, but `frameCnt` does not move until
+the first of the two slow frames has *finished*, so 3 s cleared it about as
+often as not. That is why §13 and §15 measured clean and this one did not.
+
+### The measurement is self-diagnosing now
+
+`WARMUP_SECONDS` is 6.0, and `make u64-fps` reports the transient it sat out
+rather than silently discarding it. If a `4+` frame ever lands inside the
+window, the report says so and refuses to interpret the fps line — no frame the
+renderer produces varies by a factor of four, so that bucket is never about the
+renderer.
+
+### What the numbers actually were
+
+§15 predicted ~34.3 ms of compute. Measured: **37.6 ms steady, 38.6 ms worst**,
+about 2 ms under the 39.90 ms boundary rather than the 5.6 ms projected. So the
+conversion *was* optimistic — REU DMA is 1 byte/µs on both machines and so is a
+far larger share of the hardware frame than of the VICE frame, which makes a
+whole-frame ratio over-credit every CPU-side saving. It was optimistic by 3 ms,
+not by the 10 the bad reading implied, and the conclusion it drew was right:
+**the last 9.4% is what locked the frame.** Without it compute is ~41 ms, i.e.
+at the boundary rather than 2 ms under it, and a reading that mixes 39.90 and
+59.85 ms frames is exactly what that looks like.
+
+Two ms of margin is not much. The frame timer is what will notice when M2's
+audio, or anything else, spends it.
+
+### For M2
+
+- **`$ff40-$fff9`, 186 bytes**, still free with the CPU vectors intact.
+- **~2 ms of frame headroom**, measured rather than projected — §14's 50 Hz
+  player at 0.018 ms/frame fits with room to spare, but the room is 2 ms and
+  not 5.6.
+- **Every frame is exactly two raster frames**, so a 50 Hz player ticks exactly
+  twice per rendered frame, in step. The `ftHist` `3` bucket is the alarm that
+  says it has stopped being true.

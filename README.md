@@ -19,28 +19,30 @@ it. The hand-built test map is gone — it goes through the same packer now, so
 `make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
 verifiable sectors.
 
-**Frame time: a measured 22.7 fps on a C64 Ultimate at 64 MHz.** E1M1 started
-at 17.6; two culling passes — a world-space seg backface test, and
-bounding-sphere rejection of whole BSP subtrees — took it to 22.2, and a
-further 9.4% off the VICE frame (`spanFill`'s cell step, a short path through
-`udiv`, the exact frustum test in place of the axis-aligned box) took it to
-22.7. A frame cap holds simple views at 25 rather than letting them run at 50
-and move the player twice as fast.
+**Frame time: a measured 25.05 fps on a C64 Ultimate at 64 MHz, with every one
+of 502 consecutive frames on the deadline.** E1M1 started at 17.6 fps; two
+culling passes — a world-space seg backface test, and bounding-sphere rejection
+of whole BSP subtrees — took it to 22.2, and a further 9.4% off the frame
+(`spanFill`'s cell step, a short path through `udiv`, the exact frustum test in
+place of the axis-aligned box) is what locked it. A frame cap holds simple
+views at 25 rather than letting them run at 50 and move the player twice as
+fast.
 
 `flip` is raster-synced, so frame time can only be a multiple of 19.95 ms, and
-22.7 fps means **four frames in five make the 25 fps deadline and one misses
-it** — which is judder rather than slowness. That last 9.4% was supposed to
-close it and moved it about a fifth as far as projected; the engine now times
-itself per frame so the next attempt starts from a measurement instead of a
-conversion. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §16 has the
-reading and why the projection was wrong.
+the engine now times its own compute against that boundary: **37.6 ms against a
+39.90 ms deadline**, reported by `make u64-fps` along with a histogram of how
+many raster frames each one spanned. Two milliseconds is not much margin, and
+the point of measuring it is to notice when something spends it.
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §16 has the reading — and
+the run before it that said 22.7 fps and was wrong, because two 2.3-second
+startup frames were hiding inside a 20-second average.
 
 Every optimization in this project is verified **pixel-identical** against the
 build before it — 0 of 104448 pixels differing — because the rendered frame is
 the only oracle the engine has. See
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12-§16 for the
 measurements, including one change that measured *slower* and was reverted, and
-one projection that hardware refuted.
+one hardware reading that was believed for half a session and was an artifact.
 
 ---
 

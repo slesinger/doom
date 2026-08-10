@@ -146,6 +146,13 @@ mainLoop:
 //
 // Harmless on a stock C64 and in VICE, where $D031 is an unconnected
 // VIC mirror -- see the TURBOREG notes in defs.asm.
+//
+// It is also not the reason the first two frames after `run_prg` cost
+// 2.30 s each -- which is, to within 0.4%, the 1 MHz frame time. That
+// looks exactly like a turbo that has not engaged yet, and it is not:
+// calling turboOn once per frame from mainLoop changes nothing (§16).
+// The Ultimate is holding the bus for its own post-reset housekeeping,
+// which tools/u64push.py's WARMUP_SECONDS exists to sit out.
 //------------------------------------------------------------
 turboOn:
         lda #TURBO_1MHZ

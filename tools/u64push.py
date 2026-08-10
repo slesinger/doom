@@ -246,12 +246,19 @@ def read_ms(u: Ultimate) -> int:
     return raw[0] | (raw[1] << 8)
 
 
-# Frames are dropped for the first second or so after a run_prg -- the
-# Ultimate is still finishing its own post-reset housekeeping and stealing
-# bus cycles. Measured: a 0-5 s window reads 37.8 fps, every 5 s window
-# after that reads exactly 50.00. Timing across the transient silently
-# under-reports, so it is discarded rather than averaged in.
-WARMUP_SECONDS = 3.0
+# Frames are dropped for the first seconds after a run_prg -- the Ultimate is
+# still finishing its own post-reset housekeeping and stealing bus cycles.
+# Measured: a 0-5 s window reads 37.8 fps, every 5 s window after that reads
+# exactly 50.00. Timing across the transient silently under-reports, so it is
+# discarded rather than averaged in.
+#
+# The engine's own timer has since put a number on it (IMPLEMENTATION_PLAN.md
+# §16): the first *two* frames cost 2.30 s each, 58x the frames that follow.
+# One of them inside a 20 s window is enough to read 22.7 fps for an engine
+# that is running at 25.0, which is exactly what happened once. 3 s of warmup
+# cleared it about as often as not, because the wait is for frameCnt to move
+# and frameCnt does not move until the first of those two frames has finished.
+WARMUP_SECONDS = 6.0
 
 
 def wait_for_engine(u: Ultimate, deadline: float = 20.0) -> None:
@@ -277,6 +284,7 @@ def wait_for_engine(u: Ultimate, deadline: float = 20.0) -> None:
 
 def measure_fps(u: Ultimate, seconds: float) -> None:
     wait_for_engine(u)
+    report_boot_transient(u)
     reset_frame_stats(u)
     t0 = time.monotonic()
     c0, m0 = read_framecnt(u), read_ms(u)
@@ -304,6 +312,27 @@ def measure_fps(u: Ultimate, seconds: float) -> None:
 # the top of the window keeps that transient out of ftCMax, which is otherwise
 # the one number it would dominate.
 FT_CLEAR = bytes([0, 0, 0, 0, 0xFF, 0xFF, 0, 0]) + bytes(8)
+
+
+def report_boot_transient(u: Ultimate) -> None:
+    """Say what the warmup just sat out, before clearing it away.
+
+    The accumulators run from the first rendered frame, so reading them at
+    the top of the window is a free measurement of the post-reset transient
+    -- the thing that made a 25.0 fps engine read 22.7 once.
+    """
+    try:
+        raw = u.readmem(FT_ADDR, 16)
+    except U64Error:
+        return
+    if len(raw) < 16:
+        return
+    slow = raw[14] | raw[15] << 8            # the 4+ raster frames bucket
+    cmax = raw[6] | raw[7] << 8
+    if slow:
+        print(f"boot: {slow} frame(s) before the window cost up to "
+              f"{cmax * TICK_MS / 1000.0:.2f} s each -- the Ultimate's "
+              f"post-reset bus stealing, now sat out")
 
 
 def reset_frame_stats(u: Ultimate) -> None:
@@ -344,6 +373,17 @@ def report_frame_stats(u: Ultimate) -> None:
                      for n, h in enumerate(hist, start=1))
     print(f"frame: raster frames {parts} -- "
           f"{100.0 * hist[1] / total:.0f}% made the 25 fps deadline")
+
+    # A frame spanning four or more raster frames is not the renderer being
+    # slow; nothing it does varies by a factor of four. It is the post-reset
+    # transient bleeding into the window, and it drags the average far enough
+    # to look like a general slowdown -- see WARMUP_SECONDS.
+    if hist[3]:
+        print(f"frame: *** {hist[3]} frame(s) in the window spanned 4+ raster "
+              f"frames, worst {cmax * TICK_MS:.0f} ms. That is the Ultimate's "
+              f"post-reset housekeeping, not the engine: raise WARMUP_SECONDS "
+              f"and measure again before believing the fps line above ***")
+        return
 
     if cmax * TICK_MS <= deadline:
         print("frame: ok -- every frame's compute fits in two raster frames, "

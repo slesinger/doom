@@ -1397,9 +1397,9 @@ So the §12.1 estimate of ~994k cycles was low by roughly a third — 20 ms at
 64 MHz is ~1.28M cycles — but right about where the time goes.
 
 **E1M1 measured 17.6 fps (56.9 ms/frame) on the same machine, 22.2 fps
-(45.1 ms/frame) after two culling passes, and 22.7 fps (44.0 ms/frame) after
-§15's three bit-identical wins.** The VICE column below is what predicted the
-first two, and over-predicted the third:
+(45.1 ms/frame) after two culling passes, and 25.05 fps — the raster-locked
+maximum, every frame on the deadline — after §15's three bit-identical wins.**
+The VICE column below is what predicted it:
 
 | Build | VICE ms/frame | E1M1 nodes | subsectors | segs |
 |---|---:|---:|---:|---:|
@@ -1421,6 +1421,14 @@ under the two-frame boundary, which is both the worst place to be (variations
 flip a frame between 25 and 16.7 fps, which reads as judder) and the cheapest
 (another ~10% locks it at a solid 25).
 
+*(§16 revisits this paragraph. The decomposition assumes the only outcomes are
+two and three raster frames; the frame timer built later shows a third one —
+2.30 s startup frames the Ultimate's post-reset housekeeping causes — that a
+20 s average cannot distinguish from many slightly-late frames. How much of
+the 45.1 was really judder and how much was one slow frame is no longer
+recoverable; that it was mostly judder is consistent with the fact that §15's
+9.4% moved the reading to a clean 25.05.)*
+
 **That ~10% has since been taken** — 9.4%, in three bit-identical changes
 (`IMPLEMENTATION_PLAN.md` §15): `spanFill`'s cell step inlined, an eight-
 iteration path through `udiv` for the quotients that fit in a byte, and the
@@ -1429,23 +1437,27 @@ demanding 0.59 of a radius more clearance than geometry requires. VICE went
 2551 → 2311 ms/frame, which through the conversion above predicts ~34.3 ms of
 compute, about 5.6 ms clear of the 39.90 ms boundary.
 
-**Hardware refused that prediction: 22.73 fps, 44.0 ms/frame** (§16). The VICE
-frame came down 9.4%, the hardware frame 2.4%, and the decomposition moved from
-`39.90 x 74% + 59.85 x 26%` to `39.90 x 79% + 59.85 x 21%` — one frame in five
-misses the deadline instead of one in four. At 34.3 ms of compute *every* frame
-would make it and the reading would be 25.00; it is not, so the conversion is
-wrong somewhere it cannot be seen from outside. Two candidates: REU DMA is
-1 byte/µs on both machines and so is a far larger share of the hardware frame
-than of the VICE one, which makes a whole-frame ratio over-credit every
-CPU-side saving; and compute may vary frame to frame on hardware where it does
-not in VICE (the engine's own timer reports a one-tick spread over 203 VICE
-frames with a static camera, which cannot produce a 22.73 reading).
+**Hardware confirms it: 25.05 fps, 502 frames in 20.04 s, all 502 of them
+exactly two raster frames** (§16). The predicted 34.3 ms of compute was
+optimistic — the engine's own timer measures **37.6 ms steady, 38.6 ms worst**
+against the 39.90 ms boundary — because REU DMA is 1 byte/µs on both machines
+and so is a far larger share of the hardware frame than of the VICE frame,
+which makes a whole-frame ratio over-credit every CPU-side saving. Optimistic
+by 3 ms, and right about the conclusion: without §15's 9.4% compute is ~41 ms,
+at the boundary rather than 2 ms under it, and a reading that mixes 39.90 and
+59.85 ms frames is what that looks like.
 
-**The engine therefore times itself now** (`src/clock.asm`, §16): compute per
-frame, min and max over a run, and a histogram of how many raster frames each
-one spanned, at `$02a0` for `make u64-fps` to read. The average frame rate
-cannot separate "1 ms over the deadline" from "10 ms over" — `flip` quantises
-both to 59.85 ms — and those two want opposite work.
+**The engine times itself now** (`src/clock.asm`, §16): compute per frame, min
+and max over a run, and a histogram of how many raster frames each one spanned,
+at `$02a0` for `make u64-fps` to read. The average frame rate cannot separate
+"1 ms over the deadline" from "10 ms over" — `flip` quantises both to 59.85 ms
+— and those two want opposite work. The first hardware run after §15 read
+22.73 fps and was believed for half a session; the histogram showed why in one
+sample. Two frames, and only ever those two, cost **2.30 s each** while the
+Ultimate finished its post-reset housekeeping, and one of them inside a 20 s
+window turns 502 frames into 456. No frame the renderer produces varies by a
+factor of four, so that bucket is never about the renderer — and `make u64-fps`
+now says so instead of averaging it in.
 
 Worth recording alongside it: a *cheaper* transform for the sphere test
 measured **slower**. Culling accuracy turned out to be worth several times what
