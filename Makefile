@@ -6,6 +6,8 @@
 #   make shot       headless VICE run, screenshot to build/shot.png
 #   make check      the regression gate: build + shot content + live-RAM diff
 #   make debug      live-RAM vs PRG diff under the VICE binary monitor
+#   make stats      emulated ms/frame + renderer workload counters
+#   make profile    per-frame call counts for the hot routines
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
 #   make u64-config apply the required turbo settings to the Ultimate
 #   make run-u64    push PRG to the Ultimate over the network and run it
@@ -67,7 +69,7 @@ REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest setup clean
 
 # `setup` is defined first for readability but must not be the default goal:
@@ -256,6 +258,29 @@ stats: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/stats.py $(MONPORT) $(STATSECS); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# Where the frame actually goes. Sets a non-stopping exec checkpoint on each hot
+# routine and reports VICE's own hit counters per frame, so it profiles the
+# shipping build from outside and costs the engine nothing -- which matters,
+# because instrument.asm's counters already fill TABLES_FREE to its last byte.
+#
+# This is what found the 9.4% in IMPLEMENTATION_PLAN.md §15: the frame was 35%
+# multiply chain and 18% udiv, and 47% of every transformPoint turned out to be
+# the bounding-sphere test rather than a seg endpoint.
+#
+# Frames are ~2.4 emulated seconds each under -warp, so PROFSECS wants to be
+# long enough for a double-figure frame count before the per-frame averages
+# mean much.
+PROFSECS ?= 25
+profile: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/profile.py $(MONPORT) $(PROFSECS); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

@@ -19,19 +19,29 @@ it. The hand-built test map is gone — it goes through the same packer now, so
 `make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
 verifiable sectors.
 
-**What Milestone 1 still owes:** frame time, and less of it than it did.
-E1M1 measured **17.6 fps** on a C64 Ultimate at 64 MHz; two culling passes — a
-world-space seg backface test, and bounding-sphere rejection of whole BSP
-subtrees — took it to a measured **22.2 fps**, both verified pixel-identical
-against builds with them disabled. A frame cap now holds simple views at 25
-rather than letting them run at 50 and move the player twice as fast.
+**Frame time.** E1M1 measured **17.6 fps** on a C64 Ultimate at 64 MHz; two
+culling passes — a world-space seg backface test, and bounding-sphere rejection
+of whole BSP subtrees — took it to a measured **22.2 fps**. A frame cap holds
+simple views at 25 rather than letting them run at 50 and move the player twice
+as fast.
 
-The remaining gap is smaller than it looks. `flip` is raster-synced, so frame
-time can only be a multiple of 19.95 ms, and 45.1 ms means **three frames in
-four already make the 25 fps deadline and one in four misses it**. Another
-~10% off the frame would put nearly all of them under the boundary and lock the
-game at a solid 25. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md)
-§12-§13 for the measurements and the response.
+`flip` is raster-synced, so frame time can only be a multiple of 19.95 ms, and
+at 22.2 fps three frames in four made the 25 fps deadline while one in four
+missed it — which is judder, not slowness. A further **9.4%** has since come off
+the frame (`spanFill`'s cell step, a short path through `udiv`, and the exact
+frustum test in place of the axis-aligned box), which should put compute about
+5.6 ms clear of the boundary and lock the game at a solid 25.
+
+Every optimization in this project is verified **pixel-identical** against the
+build before it — 0 of 104448 pixels differing — because the rendered frame is
+the only oracle the engine has. See
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12-§15 for the
+measurements, including one change that measured *slower* and was reverted.
+
+**What Milestone 1 still owes:** the hardware confirmation of that last 9.4%.
+`make u64-fps` is the outstanding gate — the numbers above it are VICE
+projections through a conversion §13 established, not a reading off the
+machine.
 
 ---
 
@@ -92,7 +102,9 @@ src/render/walls.asm      one seg: near-plane clip, projection, line
                           interpolators, column spans, occlusion
 src/render/chunky2mc.asm  Bayer-dithered chunky -> multicolor converter,
                           double buffering, flip
-tools/vicedbg/            VICE binary-monitor client + live-RAM diff probe
+tools/vicedbg/            VICE binary-monitor client, live-RAM diff probe,
+                          frame/workload stats, and profile.py (per-frame call
+                          counts for the hot routines, via VICE checkpoints)
 tools/checkshot.py        screenshot content assertion (coverage + colour count)
 tools/u64.py              Ultimate REST + FTP client (stdlib only)
 tools/u64config.py        applies the turbo settings the engine requires

@@ -897,9 +897,12 @@ but that cost is small and bounded:
 
 - **Within a cell**, stepping down one row is `+4`.
 - **Crossing to the next cell row** is `+1280 = $500` — and because the low byte
-  of 1280 is zero, `spanNextCell` only touches the pointer's **high byte**:
+  of 1280 is zero, the step only touches the pointer's **high byte**:
   `lda zSPtr+1 : clc : adc #5 : sta zSPtr+1`. A 16-bit pointer advance for the
-  price of an 8-bit one.
+  price of an 8-bit one. It is inlined at both of its sites; as a subroutine
+  that preserved A across itself it cost 29 cycles against the 64 the eight
+  stores it serves are worth, and the cell loop runs ~4600 times a frame
+  (`IMPLEMENTATION_PLAN.md` §15).
 
 The pointer is built from two tables so no multiplication is needed:
 
@@ -919,7 +922,7 @@ The fill itself is structured **head / whole cells / tail**:
 | Part | Per-pixel cost | Notes |
 |---|---|---|
 | head (0-7 px to the cell boundary) | ~19 cy | `sta (zp),y` + 4× `iny` + loop |
-| whole 8-pixel cells | ~13.7 cy | 8 unrolled `ldy #n : sta (zp),y` + `spanNextCell` |
+| whole 8-pixel cells | ~11.3 cy | 8 unrolled `ldy #n : sta (zp),y` + the inlined cell step |
 | tail (0-7 px) | ~19 cy | as head |
 
 The whole-cell path unrolls all eight stores with immediate `ldy` values
@@ -1290,8 +1293,9 @@ $0100-$01FF  6510 stack
 $0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
 $0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0DBA  main + input + REU + map loader code
-$0DBC-$0DFF  sphereTest       the three frustum compares
+$0810-$0C20  main + input + REU code
+$0C30-$0CB2  sphereVisible + sphereTest
+$0D00-$0D31  udiv8            udiv's eight-iteration short path
 $0E00-$0E1F  MAPINFO          resident block 0
 $0E20-$0E5C  nodeSphere       the per-node sphere fetch
 $0E60-$0E67  SSECHDR          subsector slot header + its bounding sphere
@@ -1299,8 +1303,8 @@ $0E70-$0EEE  collision helpers
 $0F00-$0F3F  BSP descent stack (32 x 16-bit child words)
 $0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
 $0F51-$0FC3  segFacing        world-space seg backface test
-$0FC4-$0FF1  sphereVisible    sphere decode + transform
 $1000-$7DFF  MATRIX           28160 B = 110 pages, cell-major chunky buffer
+             ... staging MAPHDR at $5000 and the boot-only map loader at $5100
 $8000-$83FF  SCREEN0          (VIC bank 2)
 $8400-$973F  converter tables dither 4 KB, scrTab/colTab 512 B, xOfs 320 B
 $9740-$97BF  SEGBUF           one subsector's segs, DMA target
@@ -1322,13 +1326,22 @@ $E000-$FF3F  BITMAP1          (VIC bank 3, under Kernal ROM -- write-only)
 
 Three things worth knowing about this map:
 
-- **There is no free block below MATRIX any more.** The eight code fragments
-  between `$0DBC` and `$0FF1` are there because that is where the holes were,
+- **Low RAM is fragmented, and every fragment is asserted.** The code blocks
+  between `$0C30` and `$0FC3` are there because that is where the holes were,
   not because anything about them belongs together. Every one is bounded by an
   `.errorif` against whatever follows it, so growing one past its block fails
   the build with the block's name in the message — which is what makes the
-  arrangement maintainable rather than merely tight. `sphereTest` starts exactly
-  one byte above where the main segment ends.
+  arrangement maintainable rather than merely tight.
+- **`mapLoad` is assembled into MATRIX**, at `$5100`. It runs once, before the
+  first frame, and `spanFill` overwrites it during that frame; `MAPHDR` already
+  staged there on the same argument. That freed 411 contiguous bytes of low RAM
+  and is what let `sphereTest` grow from the box test to the exact one
+  (`IMPLEMENTATION_PLAN.md` §15). Nothing in that file may be called after boot.
+- **`$FF40-$FFF9` is 186 bytes of free RAM and is being kept free** for M2's
+  audio interrupt, which has to reach the vector at `$FFFE`. Code placed there
+  works, but it extends the PRG image across `$D000-$DFFF`, so loading it writes
+  filler over the I/O space — fine under VICE's RAM injection, untested on the
+  U64's DMA path.
 - **The math tables end at `$CA2C` and the walls code begins at `$CA30`.**
   Four bytes of slack. Adding a single table entry to `sqr`, `sin` or `rowCell`
   will silently overrun into executable code unless `WALLSCODE` moves first.
@@ -1405,6 +1418,21 @@ under the two-frame boundary, which is both the worst place to be (variations
 flip a frame between 25 and 16.7 fps, which reads as judder) and the cheapest
 (another ~10% locks it at a solid 25).
 
+**That ~10% has since been taken** — 9.4%, in three bit-identical changes
+(`IMPLEMENTATION_PLAN.md` §15): `spanFill`'s cell step inlined, an eight-
+iteration path through `udiv` for the quotients that fit in a byte, and the
+exact `sqrt(2)·r` frustum test in place of the axis-aligned box, which had been
+demanding 0.59 of a radius more clearance than geometry requires. VICE went
+2551 → 2311 ms/frame, which through the conversion above predicts **~34.3 ms of
+compute, about 5.6 ms clear of the 39.90 ms boundary**. Awaiting confirmation
+by `make u64-fps`.
+
+Worth recording alongside it: a *cheaper* transform for the sphere test
+measured **slower**. Culling accuracy turned out to be worth several times what
+the transform costs — 128 units of radius slop cost 6.7% of the frame, against
+the 4.4% the coarse transform saved — and that is what pointed at the frustum
+test as the real target.
+
 **Frame pacing now has a floor as well as a ceiling.** Without a cap the engine
 runs at whatever `50/n` the frame happens to cost, and everything that moves is
 per-frame, so a simple view at 50 fps moved the player twice as fast as a
@@ -1438,8 +1466,8 @@ The program used to hang with a CPU JAM at `$CDD7` — the second operand byte o
 `sta colTop,x`, reached because execution landed mid-instruction. `spanFill` was
 writing outside MATRIX: 317 corrupted bytes, all holding `$45` or `$02`
 (sector A's floor and ceiling bytes), in 29-byte runs at stride 4, repeating
-every `$500` — unmistakably `spanFill`'s unrolled cell loop plus
-`spanNextCell`. The three fixes in §13.5 closed it, and a separate bug (an
+every `$500` — unmistakably `spanFill`'s unrolled cell loop plus its
+cell step. The three fixes in §13.5 closed it, and a separate bug (an
 init loop whose `BPL` never ran, so `colTop`/`colBot` started as garbage) was
 what kept the screen black afterwards.
 

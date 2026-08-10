@@ -1204,3 +1204,172 @@ read backwards.
 - **Tempo.** The main loop runs at 25 fps and a player wants 50 Hz. That is
   what the interrupt is for, and the interrupt is now known to work; nothing
   has been built on it.
+
+---
+
+## 15. Session log — 2026-08-10, the last 10%
+
+§13 closed by naming the prize precisely: frame compute was 37.9 ms against a
+39.90 ms raster boundary, so **another ~10% off the frame would put nearly
+every frame under it and turn a 22.2 fps average into a stable 25**. This
+session took it. **VICE, spawn view, 1 MHz: 2551 → 2311 ms/frame, −9.4%**, and
+every step of it verified as *0 of 104448 pixels* differing from the build
+before it.
+
+Bit-identical was the constraint, chosen deliberately: the frame is the only
+oracle this engine has, and an optimization that changes it by a pixel cannot
+be told from one that broke it.
+
+### The profiler came first, again, and again it was right to
+
+§13 built counters because guessing had cost a session. The same thing happened
+here one level down: the workload counters say how much *geometry* the
+traversal touched, and by this point the frame was not geometry-bound but
+arithmetic-bound. Nothing in the engine could say which arithmetic.
+
+`tools/vicedbg/profile.py` is the answer, and it costs the engine nothing: it
+sets a **non-stopping exec checkpoint** on each hot routine's entry and reads
+the hit counter VICE maintains itself. No `Count` macros, no RAM — which
+matters, because instrument.asm's nine counters already fill `TABLES_FREE` to
+its last byte and `doWall` has nineteen spare bytes in its whole segment.
+
+The spawn frame, before any change:
+
+| routine | calls/frame | ≈ share of the frame |
+|---|---:|---|
+| `mul8` (via `umul16`) | 8648 | ~35% |
+| `spanFill` | 2593 calls / 28.4k px | ~27% |
+| `udiv` + `sdiv` | 628 | ~18% |
+| `convert` | 1 | ~13% |
+| `clampAcc` | 2385 | ~3% |
+
+And the fact that reframed the problem: **`transformPoint` ran 326 times a
+frame and 153 of those — 47% — were the bounding-sphere test, not a seg
+endpoint.** The sphere test was the single largest consumer of the engine's
+most expensive routine, and it is the one caller whose arithmetic does not have
+to be exact.
+
+### Fix 1 — `spanFill`'s cell step, inlined
+
+`spanNextCell` was a subroutine that preserved A across itself with `pha`/`pla`
+— 29 cycles, against the 64 that the eight stores it serves are worth, entered
+about 4600 times a frame. Both call sites reload A from `zSCol` immediately
+afterwards anyway, so inlined it is 10 cycles and needs no save at all.
+
+**2551 → 2495 ms, 2.2%.** One byte of code.
+
+### Fix 2 — `udiv` skips half its loop when the quotient is a byte
+
+The hottest routine in the engine, and it always ran sixteen iterations. But
+most of what it divides is a screen row or a screen column, not a 16-bit
+number, and there is an exact test for that:
+
+```
+(zD+2:zD+1) < zV   <=>   zD < 256*zV   <=>   quotient < 256
+```
+
+When the quotient's top eight bits are all zero, the first eight iterations
+**cannot subtract** — all they do is shift the dividend's top byte into the
+remainder. Skipping them leaves the remainder at exactly `(zD+2:zD+1)`, which
+is where `udiv8` starts. Same quotient, bit for bit; half the loop.
+
+**2495 → 2360 ms, 5.4%**, and it is the cheapest change here by a wide margin:
+one 16-bit compare and a fifty-byte second loop.
+
+### Fix 3 — the frustum test was throwing away 0.59r
+
+§13 chose the axis-aligned box `[rx±r] × [ry±r]` over the exact sphere test,
+because at 90° the frustum planes are `rx = ±ry` and their normals carry a
+`1/sqrt(2)` the box does not need. That reasoning was sound and the conclusion
+was too expensive: the box makes the side tests `rx - ry >= 2r`, where a sphere
+actually clears a 45° plane at `sqrt(2)·r = 1.41r`. **The test was demanding
+0.59 of a radius more clearance than geometry requires, on two of its three
+planes.**
+
+`1.5 >= sqrt(2)`, so `k = r + (r >> 1)` is still conservative — it can never
+reject something visible — and it is r plus one shift where the exact constant
+would want a multiply. The plane at `ry = 0` was exact already and is unchanged.
+
+**2360 → 2311 ms, 2.4%.**
+
+### The one that measured slower, and what it taught
+
+The obvious target was the 153 sphere-test `transformPoint` calls. A coarse
+replacement was written in full: 1.7 trig instead of 2.14, axis deltas rounded
+to 32 units, four 8×8 `mul8` where `transformPoint` runs sixteen. It works, and
+it is **~680 cycles a call cheaper — 4.4% of the frame.**
+
+It is also, measured end to end, **2% slower**, and the reason is the thing
+worth keeping:
+
+| `SPH_SLOP` | ms/frame |
+|---:|---:|
+| 0 (not conservative — measurement only) | 2256 |
+| 128 (the error bound the coarse transform actually needs) | 2408 |
+
+A coarse transform has to grow every sphere by its own error bound or it starts
+deleting geometry. **128 units of radius cost 6.7% of the frame — more than
+the transform saved.** The frame is far more sensitive to how tightly the
+spheres bound the geometry than to what the transform costs, which is the exact
+opposite of what the call-count profile suggested, and it is what turned the
+session toward Fix 3. Accuracy in the culling test is worth more than speed in
+it; the same lever, pulled the other way, is where the win came from.
+
+The code is gone but the measurement is why `sphereVisible` still says
+`jsr transformPoint`.
+
+### Where the RAM came from
+
+None of this fitted. §13 ended with "there is no low-RAM headroom left", and
+the exact frustum test needs about 35 bytes more than the box test.
+
+**`mapLoad` moved into MATRIX** (`BOOTCODE = MATRIX + $4100`). It has one
+caller, main.asm's boot path; it runs before the first frame; and `spanFill`
+overwrites it during that frame. `MAPHDR` had already staged inside MATRIX on
+exactly this argument — this just takes the argument to its conclusion. **411
+bytes of low RAM, contiguous**, which is what let the sphere test be shaped by
+what is correct rather than by what fits in sixty bytes.
+
+| | |
+|---|---|
+| `$0c30-$0cb2` | `sphereVisible` + `sphereTest` |
+| `$0d00-$0d31` | `udiv`'s short path |
+| `$0cb3-$0cff`, `$0d32-$0dff`, `$0fc4-$0fff` | free — the largest unclaimed RAM below MATRIX |
+
+**`$ff40-$fff9` (186 B) was used and then deliberately given back.** `udiv8`
+was assembled there first — it is genuine free RAM above BITMAP1, and both
+banking states have HIRAM = 0 so it is reachable either way. But reaching past
+`$cfda` extends the PRG image across `$d000-$dfff`, so loading it writes 4 KB
+of filler over the I/O space. Harmless under VICE's RAM injection; unverified
+on the U64's DMA path, and not worth finding out for a change that measured
+identically from low RAM. **That block stays free for M2's audio interrupt,
+which is the one thing that has to reach `$fffe`.**
+
+### What this predicts, and the one thing not yet measured
+
+§13's reconciliation gives the conversion: 37.9 ms of hardware compute at VICE's
+2551. At 2311 that is **~34.3 ms**, about 5.6 ms clear of the 39.90 ms
+boundary — so nearly every frame should now make it and the game should sit at
+a stable **25 fps** instead of averaging 22.2.
+
+**This has not been confirmed on hardware.** The C64 Ultimate was not reachable
+at the end of this session — nothing on 192.168.1.0/24 answers `/v1/info` — so
+`make u64-fps` and `make u64-map` are the outstanding Phase 6 items, and the
+milestone is not tagged until they run. Everything else in Phase 6 is done:
+`make check` is green, the frame is pixel-identical, and the documentation is
+this section.
+
+### For M2's sound task
+
+Three things this session leaves deliberately in place for it:
+
+- **`$ff40-$fff9`, 186 bytes**, free and reachable from both banking states,
+  with the CPU vectors at `$fffa` intact. §14 measured a 50 Hz player at
+  0.018 ms/frame, so the budget is not the problem; a home for the handler was,
+  and this is one.
+- **~5.6 ms of frame headroom** rather than the ~2 ms §13 left. A 50 Hz
+  interrupt against a 25 fps frame is two interrupts a frame, which at §14's
+  measured 9.1 µs each is 0.05% — but it now has room to be sloppy.
+- **The frame is locked to a multiple of 19.95 ms**, so a 50 Hz player ticking
+  twice per rendered frame is exactly in step. That only holds while compute
+  stays under the boundary, which is what the headroom is for.
