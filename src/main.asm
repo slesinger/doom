@@ -15,9 +15,10 @@
 //    $0E20-$0E5C  node sphere fetch  $0E60-$0E67  SSECHDR + sphere
 //    $0E70-$0EEE  collision helpers
 //    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
-//    $0F51-$0FC3  seg backface test
-//    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000
-//                 and the boot-only map loader at $5100 (BOOTCODE)
+//    $0F51-$0FC3  seg backface test  $0FC4-$0FF7  music player state
+//    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000,
+//                 the boot-only map loader at $5100 (BOOTCODE) and the music
+//                 boot code at $5300 (MUSBOOT)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
 //    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
@@ -28,6 +29,7 @@
 //    $CA30-$CE06  doWall             $CE08-$CFF8  bsp traversal
 //    $D000-$DB3F  NODES              $DC00-$DE3F  SECTORS   (under I/O)
 //    $E000-$FF3F  BITMAP1
+//    $FF40-....   music IRQ handler — copied there at boot, not in the PRG
 //============================================================
 
 #import "defs.asm"
@@ -102,11 +104,23 @@ main:
         lda zChild
         cmp miSpawnSsec
         bne !mismatch+
+        // Start the music, and only now unmask interrupts. musInit needs
+        // MAPINFO (miMusBase comes out of the image), and everything above
+        // this point runs with the banking flipped around by mapLoad, so the
+        // first tick must not land in the middle of it. An image without a
+        // music block leaves musOK at 0 and the engine renders in silence --
+        // see src/music.asm.
+        jsr musInit
         // Seed the frame-time statistics *here*, not next to msInit: their
         // reference point is the last flip, and before the first one that is
         // the boot sequence. Seeded up there, frame 1 reports reuProbe and
         // mapLoad as compute and poisons ftCMax for the whole run.
         jsr ftInit                  // clock.asm
+        // The `sei` at the top of main has held for the whole boot. From here
+        // the BSP walk's $34/$35 windows are interruptible, which is safe only
+        // because musIrq saves and restores $01 and the REU's transfer
+        // registers (src/music.asm, and src/irqtest.asm measured it).
+        cli
         jmp mainLoop
 !mismatch:
         lda #MERR_SPAWN
@@ -200,6 +214,11 @@ clearHudRows:
 // Imported after that assertion, not before it, because it does not belong to
 // the main segment any more: it assembles into MATRIX (BOOTCODE in defs.asm).
 #import "mapload.asm"
+// Same argument as mapload.asm, one block further up MATRIX (MUSBOOT): musInit
+// is boot-only. The IRQ handler it installs is inside this file too, assembled
+// with .pseudopc at $ff40 and copied there -- so it costs the PRG image
+// nothing above $cfda.
+#import "music.asm"
 
 #import "render/chunky2mc.asm"
 .errorif * > MATHCODE, "converter code overflows into math code"

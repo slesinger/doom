@@ -188,6 +188,7 @@ catches what the others cannot:
 | `tools/vicedbg/probe.py diff` | **zero** unexpected differences between live RAM and the loaded PRG — a stray pointer is caught on the frame it happens, not three frames later when the screen has already gone black |
 | `reuOK == 1` in the same pass | the emulator actually attached an REU. A missing REU is invisible from inside the C64 — `$DFxx` reads back `$00` and every DMA silently succeeds while moving nothing — and it stayed missing for the whole life of the project because `-default` sat after `-reu` on VICE's command line |
 | `mapOK == 1`, and every resident block compared against `build/assets.reu` | the map image reached REU RAM *and* the right bytes landed at the right addresses. Three separate silent failures have already been found on this path, each one letting every read "succeed" and return the wrong thing — `docs/reu-format.md` §9 lists them |
+| all 25 SID registers against the music stream | the tune is playing and is *in step*. The chip's state is reconstructed by replaying `build/assets.reu`'s own stream up to wherever the engine's pointer has reached, so a replay head half a record out of step is caught — which nothing else would see, because it still writes plausible bytes to the SID and merely sounds wrong (`docs/reu-format.md` §4.6) |
 
 `make shot` deliberately ignores VICE's exit status: `-limitcycles` always ends
 the run non-zero, so the artifact is the evidence, not the status code. Its

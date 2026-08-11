@@ -229,7 +229,18 @@
 .const musEnd    = MUSDATA + 46     // 3 B: one past the last record
 .const musBank   = MUSDATA + 49     // 1 B: $01 as the interrupt found it
 .const musOK     = MUSDATA + 50     // 1 B: 1 = a stream was found and started
-.errorif MUSDATA + 51 > $1000, "music data overruns MATRIX"
+.const musErr    = MUSDATA + 51     // 1 B: why not, when musOK is 0
+.errorif MUSDATA + 52 > $1000, "music data overruns MATRIX"
+
+// musErr values -- why a music stream that was present was rejected. Zero with
+// musOK = 0 means the image simply carries no music, which is not an error
+// (src/music.asm). Unlike mapErr these do not halt the machine: silence is a
+// survivable outcome and a black screen is not. tools/vicedbg/probe.py and
+// tools/u64push.py --verify-map are what make a non-zero value visible.
+.const MUSERR_NONE    = 0
+.const MUSERR_MAGIC   = 1           // stream header is not "MU"
+.const MUSERR_VERSION = 2           // wrong stream format version
+.const MUSERR_WINDOW  = 3           // records are longer than MUSWINDOW
 
 // The nine REU registers the handler has to put back. It DMAs its own record
 // while the renderer is mid-transfer-setup: the renderer fills $DF02-$DF08 and
@@ -259,8 +270,11 @@
 .const SID_VOLUME = $d418
 
 // The IRQ vector, read from RAM in both banking states (HIRAM = 0 in $34 and
-// $35 alike), which is the property that makes MUSCODE reachable at all.
+// $35 alike), which is the property that makes MUSCODE reachable at all. The
+// NMI vector is next to it and is pointed at an `rti`: `sei` does not mask NMI
+// and RESTORE is still wired to one.
 .const IRQVEC     = $fffe
+.const NMIVEC     = $fffa
 
 // bsp.asm lands in two pieces. The traversal proper follows doWall in the walls segment; the node test
 // and the standalone descent go in the tail of TABLES_FREE. Two pieces

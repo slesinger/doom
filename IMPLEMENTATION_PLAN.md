@@ -1667,3 +1667,128 @@ stores, not the arithmetic. **Model it, with a profiler hit count, before
 building it.** On this evidence the whole class of "trade CPU for REU bytes"
 optimizations is close to exhausted at this frame size; the next real gain is
 more likely to be structural than arithmetic.
+
+---
+
+## 18. Session log — 2026-08-11, the music
+
+M2's first piece: `DooM_Medley.sid` plays under the engine, on hardware, with
+`make check` green and the rendered frame bit-identical.
+
+### There is no player on the C64, and that is the whole design
+
+A `.sid` is 6502 code at fixed absolute addresses — `DooM_Medley` wants
+`$0FF6-$3E6A` — and that lands inside `MATRIX`. §14 counted the engine's free
+RAM at ~360 bytes in four holes. A resident player was never going to happen,
+and every previous plan for audio quietly assumed one would.
+
+But the SID chip only ever sees register writes. So the player runs **once, at
+build time**, in `tools/cpu6502.py`: `init` is called, `play` is called at the
+tune's own rate, and `$D400-$D418` is snapshotted after each call.
+`tools/sidstream.py` delta-encodes those snapshots — a count byte and that many
+`(register, value)` pairs per tick — into block 5 of `assets.reu`. What runs on
+the machine is a replay head: fetch a record, write the registers it names,
+advance a 24-bit pointer. Chip-identical by construction, no resident player
+code, and the loop is a pointer rewind rather than a second `init`.
+
+405 KB for 7:22, against 1.11 MB of raw snapshots. That ratio is not about REU
+space, which is free; it is about upload time, and it is not enough — see the
+cost section below.
+
+### The interrupt, and the two things it had to survive
+
+`main.asm` had held `sei` since its first instruction. It now clears it once
+`musInit` returns, so the tick lands inside the BSP walk's `$34`/`$35` bank
+windows and inside the renderer's REU transfer setup about four times a frame.
+
+Both hazards were measured before the player was written (§14), which is the
+only reason this was a day's work rather than a week's: the handler saves and
+restores `$01`, and saves and restores `$DF02-$DF0A` around its own DMA. The
+second one is the subtle half — a transfer is "fill in the registers, then
+write the command", and an interrupt in that gap would otherwise return to a
+command register holding the music's parameters.
+
+**The frame is bit-identical with the player running.** `make framehash` gives
+`c5d78e65…` with and without it — the same standard §13/§15 held optimisations
+to. That is the evidence that both hazards are actually handled, and it is
+worth more than the reasoning above it.
+
+### The bug the silent path found
+
+`build/testmap.reu` carries no music, which is a supported configuration:
+`miMusBase == 0` means "render in silence". The first version returned early on
+that, before installing the vectors — and `main.asm`'s `cli` then took the
+KERNAL's still-running CIA 1 jiffy IRQ through `$FFFE`, which held whatever the
+reset left in it. **The engine hung before frame 1 on an image that was merely
+silent**, and nothing about that failure looks like an audio bug.
+
+`musInit` now installs the handler and the vectors and turns off every
+interrupt source *first*, unconditionally, and only a stream that checks out
+switches CIA 1 back on. Every exit is now `cli`-safe. This was found by running
+the test-map image, not by reading the code.
+
+### What it costs: nothing measurable on hardware, and 5.7% in VICE
+
+| | fps | on deadline | compute max |
+|---|---:|---:|---:|
+| no player | 24.99 | 100% | 38.6 ms |
+| player running (x2) | 24.99 | 100% | 38.6 ms |
+
+Predicted 0.17 ms/frame — four ticks, each an interrupt (1.7 µs, §14), a
+40-byte DMA and a mean of 3.3 register writes — and the measurement cannot
+resolve it, because a Timer B tick is 1.015 ms. Consistent, not confirmed.
+
+**`make stats` is useless for this one change and will stay useless.** It
+reports +5.7% (2307 → 2438 ms/frame), which is real arithmetic about the
+emulator: the tick rate is a CIA latch, i.e. fixed in *real* time, while VICE's
+1 MHz frame lasts 2.3 emulated seconds. An emulated frame absorbs ~231 ticks
+where the Ultimate absorbs 4. Every other change to this engine can be judged
+in VICE and converted (§12); this one cannot.
+
+**One reading said 24.10 fps and 93%, and it is unexplained.** It was taken
+immediately after a 470 KB `make u64-map`, and the three clean readings were
+taken standalone. §16's lesson is exactly this shape — a hardware number
+believed for half a session that was an artifact of what ran before it — so the
+attempt to reproduce it was made rather than assumed. It could not be
+completed: see below.
+
+### The upload got 13x bigger, and the Ultimate did not like it
+
+The image went from ~36 KB used to ~470 KB, because the uploader sends one
+contiguous region from offset 0 to the last byte any descriptor claims. Three
+chunks became 29, and `make run-u64` went from seconds to minutes.
+
+Then, after several such uploads in one session, **`POST /v1/runners:run_prg`
+started answering `404 Cannot open file` — for every PRG, including paths that
+had worked minutes earlier**, and it survived a `machine:reset`. The Ultimate
+needs a power cycle. This is correlation, not a proven cause, and it is not
+something the C64 side can see; but the only thing that changed about this
+machine's workload is a 13x larger upload repeated several times.
+
+**Worth doing before this is trusted for routine use:** teach the uploader to
+send only the regions descriptors actually claim, instead of one span from
+zero. The 28 KB hole between the map and `MUSIC_OFFSET` is uploaded as zeros
+today, and more importantly the music never changes between builds — a
+content hash per chunk, skipped when it matches, would take the common
+rebuild-and-run back to three chunks.
+
+### Verified, and how
+
+`make check` gained a check that is exact rather than indicative: it reads
+`musPtr` and all 25 SID registers from the running machine **without leaving
+the monitor in between**, then replays the stream in Python up to that pointer
+and compares. A match proves the tick fires, the DMA lands, the pointer stays
+on record boundaries and every write reaches the chip. The boundary half is the
+one that matters — a replay head half a record out of step still writes
+plausible bytes to the SID and merely sounds wrong, which no screenshot and no
+checksum would catch.
+
+That test is VICE-only: the SID is write-only and the Ultimate's `readmem` is a
+DMA into a running machine, so `$D400-$D418` reads back `$40` in every
+register, and there is nothing to stop time between the two reads anyway. On
+hardware the check is `musErr == 0` plus a pointer that is inside the block and
+advancing — measured at 487 stream bytes in 0.5 s, ~107 ticks/s against the
+tune's 100.25 Hz.
+
+`docs/reu-format.md` §4.6 is the format contract and §2/§3 carry the version
+bump to 3 and the `BF_PAGES` flag the 400 KB length field needed.

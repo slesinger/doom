@@ -9,6 +9,7 @@
 #   make stats      emulated ms/frame + renderer workload counters
 #   make profile    per-frame call counts for the hot routines
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
+#   make music      assets/DooM_Medley.sid -> build/music.bin (block 5)
 #   make u64-config apply the required turbo settings to the Ultimate
 #   make run-u64    push PRG to the Ultimate over the network and run it
 #   make u64-fps    run on the Ultimate and measure the real frame rate
@@ -79,7 +80,7 @@ REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
 .PHONY: all run shot check debug stats profile framehash assets reubench run-u64 u64-config \
-        u64-fps u64-map sidtest irqtest audiotest setup clean \
+        u64-fps u64-map sidtest irqtest audiotest music setup clean \
         intro run-intro shot-intro run-intro-u64 intro-config
 
 # `setup` is defined first for readability but must not be the default goal:
@@ -255,8 +256,25 @@ run-intro-u64: $(INTROPRG) $(INTROREU) u64-config intro-config
 # converter or on the traversal, but not on both at once.
 assets: $(REUIMG) $(TESTREU)
 
-build/assets.reu: tools/wad2reu.py $(WAD)
-	$(PYTHON) tools/wad2reu.py $(WAD) -o $@
+# The music stream is built separately and cached, because it is the output of
+# running the tune through a 6502 emulator in Python (tools/cpu6502.py) for its
+# whole 7:22 -- seconds of work that depends on the .sid and on nothing the map
+# packer knows. `make assets` embeds the result as block 5; see docs/reu-format.md
+# §4.6 and src/music.asm for what the engine does with it.
+#
+# build/testmap.reu deliberately gets no music: it is the geometry bring-up
+# image, and it doubles as the test that a silent image boots and renders
+# rather than being rejected (musOK = 0 with musErr = 0).
+MUSICSID  ?= assets/DooM_Medley.sid
+MUSICBIN  := build/music.bin
+
+$(MUSICBIN): tools/sidstream.py tools/cpu6502.py $(MUSICSID)
+	$(PYTHON) tools/sidstream.py $(MUSICSID) -o $@
+
+music: $(MUSICBIN)
+
+build/assets.reu: tools/wad2reu.py $(WAD) $(MUSICBIN)
+	$(PYTHON) tools/wad2reu.py $(WAD) --music $(MUSICBIN) -o $@
 
 $(TESTREU): tools/wad2reu.py
 	$(PYTHON) tools/wad2reu.py --map TEST -o $(TESTREU)
@@ -360,6 +378,12 @@ framehash: $(PRG) $(REUIMG)
 # (IMPLEMENTATION_PLAN.md §12). REU DMA is the one cost that does not scale --
 # it is 1 byte/us on both -- so a change that trades CPU work for DMA bytes
 # looks better here than it will on hardware.
+#
+# THE MUSIC IS THE ONE THING THIS CANNOT MEASURE. Its tick rate is a CIA latch,
+# i.e. fixed in real time, while a frame here lasts 2.3 emulated seconds instead
+# of 39.9 ms -- so an emulated frame absorbs ~231 music ticks where the Ultimate
+# absorbs 4. The +5.7% this reports for the player is about sixty times its cost
+# on hardware. Use `make u64-fps` for that one. See docs/reu-format.md §4.6.
 STATSECS ?= 20
 stats: $(PRG) $(REUIMG)
 	@mkdir -p build

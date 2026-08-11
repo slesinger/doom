@@ -29,11 +29,18 @@ ALLOWED = [
     # $0E20-$0E5F is nodeSphere's code now that MAPHDR stages inside MATRIX, so
     # these are two regions rather than one span: a stray write into the gap is
     # a write into code, and this is the only thing that would report it.
+    # The nine REU transfer registers the music interrupt saves and puts back
+    # around its own DMA, in UDIV8's tail (MUSREU in src/defs.asm).
+    (0x0D33, 0x0D3B, "MUSREU"),
     (0x0E00, 0x0E1F, "MAPINFO"),
     (0x0E60, 0x0E67, "SSECHDR + bounding sphere"),
     (0x0F00, 0x0F3F, "BSP stack"),
     (0x0F40, 0x0F41, "frameCnt"),
     (0x0F42, 0x0F50, "reuScratch/reuOK/mapOK/mapErr/mapSum"),
+    # musBuf (the per-tick DMA window), the three stream pointers and the
+    # player's status bytes -- MUSDATA in src/defs.asm. The handler itself is
+    # at $FF40, outside the PRG image, so this diff never sees it.
+    (0x0FC4, 0x0FF7, "music player state"),
     (0x1000, 0x7DFF, "MATRIX"),
     (0x8000, 0x83FF, "SCREEN0"),
     (0xA000, 0xBF3F, "BITMAP0"),
@@ -204,6 +211,92 @@ def check_map(m):
     return bad
 
 
+MUS_OK = 0x0FF6          # `.const musOK`  in src/defs.asm
+MUS_ERR = 0x0FF7         # `.const musErr` in src/defs.asm
+MUS_PTR = 0x0FEC         # `.const musPtr` -- 24-bit, advances every tick
+MUS_HDRSZ = 16           # the stream header, docs/reu-format.md §4.6
+SID_BASE = 0xD400
+SID_REGS = 25            # $D400-$D418, what the stream carries
+
+# musErr values, from src/defs.asm.
+MUSERR = {0: "none", 1: "bad stream magic", 2: "wrong stream version",
+          3: "records longer than MUSWINDOW"}
+
+
+def check_music(m):
+    """Assert that all 25 SID registers hold what the stream says they should.
+
+    This is the whole audio path in one comparison, and it can be exact because
+    the tune was replayed offline: tools/sidstream.py ran the player in Python
+    and recorded the register writes, so walking the stream from its start up to
+    wherever `musPtr` has reached reconstructs the chip state the C64 must be in
+    at that instant. If they match, then the handler is firing, its DMA is
+    landing, its pointer arithmetic is on record boundaries, and every register
+    write reached the chip. If the pointer has drifted off a boundary the walk
+    says so directly -- and that is the failure this is really for, because a
+    replay head half a record out of step still writes plausible-looking bytes
+    to the SID and just sounds wrong.
+
+    musOK alone would say only that musInit liked the header, which it can do
+    and still produce silence. musOK = 0 with musErr = 0 is not a failure: it
+    means the image carries no music block, which is what build/testmap.reu is.
+
+    musPtr and the registers are read without leaving the monitor in between,
+    so the machine is stopped for both and an interrupt cannot land between
+    them and tear the two apart.
+    """
+    ok = m.mem_get(MUS_OK, MUS_OK, bank=1)[0]
+    err = m.mem_get(MUS_ERR, MUS_ERR, bank=1)[0]
+    ptr = bytes(m.mem_get(MUS_PTR, MUS_PTR + 2, bank=1))
+    sid = bytes(m.mem_get(SID_BASE, SID_BASE + SID_REGS - 1, bank=3))
+    m.exit_mon()
+
+    if err:
+        print(f"\nMUSIC: *** stream rejected *** -- musErr={err} "
+              f"({MUSERR.get(err, 'unknown')})")
+        return 1
+    if ok != 1:
+        print("\nMUSIC: no music block in the image -- rendering in silence")
+        return 0
+    try:
+        img = open(REU_IMAGE, "rb").read()
+    except OSError as e:
+        print(f"\nMUSIC: musOK=1, but {REU_IMAGE} is unreadable ({e})")
+        return 1
+
+    mi = img[0x100:0x120]                       # MAPINFO, block 0
+    base = mi[25] | mi[26] << 8 | mi[27] << 16
+    want_ofs = (ptr[0] | ptr[1] << 8 | ptr[2] << 16) - base
+    if not 0 < want_ofs <= len(img) - base:
+        print(f"\nMUSIC: *** musPtr ${ptr[2]:02X}{ptr[1]:02X}{ptr[0]:02X} is "
+              f"not inside the music block at ${base:06X} ***")
+        return 1
+
+    state = bytearray(SID_REGS)                 # musInit clears the chip first
+    p, ticks = MUS_HDRSZ, 0
+    while p < want_ofs:
+        n = img[base + p]
+        for k in range(n):
+            state[img[base + p + 1 + 2 * k]] = img[base + p + 2 + 2 * k]
+        p += 1 + 2 * n
+        ticks += 1
+    if p != want_ofs:
+        print(f"\nMUSIC: *** musPtr is {want_ofs - p} bytes off a record "
+              f"boundary *** -- {ticks} records reach {p}, the engine says "
+              f"{want_ofs}. The replay head has lost the stream.")
+        return 1
+    if bytes(state) != sid:
+        n = sum(1 for a, b in zip(state, sid) if a != b)
+        first = next(k for k, (a, b) in enumerate(zip(state, sid)) if a != b)
+        print(f"\nMUSIC: *** {n} of {SID_REGS} SID registers differ at tick "
+              f"{ticks} *** first at $D4{first:02X}: stream says "
+              f"${state[first]:02X}, chip has ${sid[first]:02X}")
+        return 1
+    print(f"\nMUSIC: playing -- tick {ticks}, all {SID_REGS} SID registers "
+          f"match the stream (volume ${sid[24] & 0x0F:X})")
+    return 0
+
+
 def cmd_diff(m, prg_path, settle):
     load, img = load_prg(prg_path)
     m.exit_mon()
@@ -224,7 +317,7 @@ def cmd_diff(m, prg_path, settle):
     for name, n in counts.most_common():
         print(f"  {n:7d}  {name}")
 
-    rc = check_reu(m) | check_map(m)
+    rc = check_reu(m) | check_map(m) | check_music(m)
 
     bad = [d for d in diffs if region(d[0]).startswith("***")]
     print(f"\nunexpected differences: {len(bad)}")

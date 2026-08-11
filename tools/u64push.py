@@ -155,8 +155,14 @@ def image_used_bytes(img: bytes) -> int:
         return len(img.rstrip(b"\x00")) or 1
     end = 64
     for i in range(img[5]):
-        _bid, _flags, o0, o1, o2, length, _hi = struct.unpack_from(
+        _bid, flags, o0, o1, o2, length, _hi = struct.unpack_from(
             "<BBBBBHB", img, 8 + i * 8)
+        # BF_PAGES (bit 1): the length is in 256-byte pages, not bytes. Only
+        # the music stream sets it -- 400 KB does not fit a 16-bit byte count.
+        # Reading it as bytes here would size the upload at 1583 B and deliver
+        # a stream that is 0.4% present, which the engine would replay as noise.
+        if flags & 0x02:
+            length *= 256
         end = max(end, (o0 | o1 << 8 | o2 << 16) + length)
     return end
 
@@ -457,7 +463,56 @@ def verify_map(u: Ultimate, image: str) -> int:
             print(f"map: *** block {bid} ${addr:04X} +{length}: {n} of "
                   f"{length} bytes differ ***")
             rc = 1
-    return rc
+    return rc | verify_music(u, img)
+
+
+# Must match src/defs.asm. musErr values come from src/music.asm.
+MUSOK_ADDR = 0x0FF6
+MUSERR_ADDR = 0x0FF7
+MUSPTR_ADDR = 0x0FEC          # 24-bit stream offset of the next record
+MUSERR = {0: "none", 1: "bad stream magic", 2: "wrong stream version",
+          3: "records longer than MUSWINDOW"}
+
+
+def verify_music(u: Ultimate, img: bytes) -> int:
+    """Check that the player took, and that its pointer is inside the stream.
+
+    The exact test -- reconstructing all 25 SID registers from the stream and
+    comparing them against the chip -- needs the machine stopped between the
+    two reads, which the Ultimate's REST API cannot do: every readmem is a DMA
+    into a running machine, and four music ticks land per frame. So this checks
+    what can be checked without stopping time: the header was accepted, and the
+    pointer is inside the block and moving. `make check` does the exact version
+    under VICE (tools/vicedbg/probe.py).
+    """
+    ok = u.readmem(MUSOK_ADDR, 1)[0]
+    err = u.readmem(MUSERR_ADDR, 1)[0]
+    if err:
+        print(f"music: *** stream rejected *** musErr={err} "
+              f"({MUSERR.get(err, '?')})")
+        return 1
+    if ok != 1:
+        print("music: no music block in the image -- rendering in silence")
+        return 0
+
+    mi = img[0x100:0x120]                       # MAPINFO, block 0
+    base = mi[25] | mi[26] << 8 | mi[27] << 16
+    p0 = u.readmem(MUSPTR_ADDR, 3)
+    time.sleep(0.5)
+    p1 = u.readmem(MUSPTR_ADDR, 3)
+    o0 = (p0[0] | p0[1] << 8 | p0[2] << 16) - base
+    o1 = (p1[0] | p1[1] << 8 | p1[2] << 16) - base
+    if not 0 < o0 <= len(img) - base:
+        print(f"music: *** musPtr is outside the stream *** offset {o0}")
+        return 1
+    if o0 == o1:
+        print(f"music: *** STALLED *** musOK=1 but musPtr sat at {o0} across "
+              "two samples -- the player is installed and the tick is not "
+              "firing")
+        return 1
+    print(f"music: playing -- musPtr {o0} -> {o1} in the stream at "
+          f"${base:06X}")
+    return 0
 
 
 def read_framecnt(u: Ultimate) -> int:

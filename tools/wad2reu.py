@@ -116,6 +116,18 @@ REU_IMAGE_SIZE = 512 * 1024
 # a tune changes length.
 MUSIC_OFFSET = 0x010000
 
+# The stream's own 16-byte header, written by tools/sidstream.py and read by
+# src/music.asm at boot. Frozen in docs/reu-format.md §4.6.
+MUSIC_MAGIC = b"MU"
+MUSIC_VERSION = 1
+MUSIC_HEADER_SIZE = 16
+
+# The DMA window the engine fetches per tick -- MUSWINDOW in src/defs.asm. The
+# stream's header says how big a window its longest record needs; this is the
+# ceiling the player can actually offer, and a stream asking for more is
+# rejected here rather than replayed from a truncated record.
+MUSWINDOW = 40
+
 LOAD_MAPINFO = 0x0E00
 LOAD_NODES = 0xD000
 LOAD_SECTORS = 0xDC00
@@ -765,7 +777,7 @@ def pack_ssecdata(m: MapData) -> bytes:
 
 
 def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
-                 sph_reu_base: int) -> bytes:
+                 sph_reu_base: int, mus_reu_base: int = 0) -> bytes:
     b = bytearray(MAPINFO_SIZE)
     struct.pack_into("<HHBB", b, 0,
                      len(m.nodes), len(m.subsectors), len(m.sectors),
@@ -781,12 +793,23 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
     b[22] = sph_reu_base & 0xFF                 # NODESPH, streamed 6 B/node
     b[23] = (sph_reu_base >> 8) & 0xFF
     b[24] = (sph_reu_base >> 16) & 0xFF
+    b[25] = mus_reu_base & 0xFF                 # MUSIC, streamed; 0 = no tune
+    b[26] = (mus_reu_base >> 8) & 0xFF
+    b[27] = (mus_reu_base >> 16) & 0xFF
     return bytes(b)
 
 
-def build_image(m: MapData) -> bytes:
+def build_image(m: MapData, music: bytes = b"") -> bytes:
     """Assemble the whole .reu image. Blocks follow the header in id order,
-    each padded up to a 256-byte boundary (docs/reu-format.md §3)."""
+    each padded up to a 256-byte boundary (docs/reu-format.md §3).
+
+    `music` is a stream from tools/sidstream.py, or empty for no music. It is
+    the one block that does not follow its predecessor: it starts at the fixed
+    MUSIC_OFFSET, above reuProbe's scratch, so that the map below it keeps the
+    whole first 64 KB and nothing has to move when a tune changes length. An
+    empty stream leaves `miMusBase` at zero, which src/music.asm reads as
+    "render in silence" rather than as an error.
+    """
     nodes = pack_nodes(m)
     sectors = pack_sectors(m)
     ssecdata = pack_ssecdata(m)
@@ -803,17 +826,21 @@ def build_image(m: MapData) -> bytes:
     ofs_ssecdata = ofs_sectors + align(len(sectors))
     ofs_nodesph = ofs_ssecdata + align(len(ssecdata))
 
+    ofs_music = MUSIC_OFFSET if music else 0
+
     sx, sy, _ = m.spawn
     spawn_ssec = descend(m, sx, sy)
-    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec, ofs_nodesph)
+    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec, ofs_nodesph, ofs_music)
 
     blocks = [
-        (BLK_MAPINFO, 1, ofs_mapinfo, mapinfo, LOAD_MAPINFO >> 8),
-        (BLK_NODES, 1, ofs_nodes, nodes, LOAD_NODES >> 8),
-        (BLK_SECTORS, 1, ofs_sectors, sectors, LOAD_SECTORS >> 8),
+        (BLK_MAPINFO, BF_RESIDENT, ofs_mapinfo, mapinfo, LOAD_MAPINFO >> 8),
+        (BLK_NODES, BF_RESIDENT, ofs_nodes, nodes, LOAD_NODES >> 8),
+        (BLK_SECTORS, BF_RESIDENT, ofs_sectors, sectors, LOAD_SECTORS >> 8),
         (BLK_SSECDATA, 0, ofs_ssecdata, ssecdata, 0),
         (BLK_NODESPH, 0, ofs_nodesph, nodesph, 0),
     ]
+    if music:
+        blocks.append((BLK_MUSIC, BF_PAGES, ofs_music, music, 0))
 
     used = align(ofs_nodesph + len(nodesph))
     if used > REU_PROBE_OFFSET:
@@ -822,22 +849,66 @@ def build_image(m: MapData) -> bytes:
             "where reuProbe round-trips its signature at boot (src/defs.asm "
             "REU_PROBE_ADDR/BANK). Move the probe scratch before growing "
             "the image past that.")
-    if used > REU_IMAGE_SIZE:
-        raise ValueError(f"image is {used} B, past REU_IMAGE_SIZE "
+    if music and MUSIC_OFFSET < REU_PROBE_OFFSET:
+        raise ValueError(
+            f"MUSIC_OFFSET ${MUSIC_OFFSET:06X} is below reuProbe's scratch at "
+            f"${REU_PROBE_OFFSET:06X}, which would corrupt the stream at boot")
+    end = max(used, ofs_music + len(music))
+    if end > REU_IMAGE_SIZE:
+        raise ValueError(f"image needs {end} B, past REU_IMAGE_SIZE "
                          f"({REU_IMAGE_SIZE} B); raise it and -reusize together")
     img = bytearray(REU_IMAGE_SIZE)
     img[0:4] = MAGIC
     img[4] = VERSION
     img[5] = len(blocks)
     for i, (bid, flags, ofs, payload, loadhi) in enumerate(blocks):
-        if len(payload) > 0xFFFF:
-            raise ValueError(f"block {bid} is {len(payload)} B, length field is 16-bit")
+        # The length field is 16 bits. Every block the 6502 reads is well under
+        # 64 KB and carries its length in bytes; the music stream is ~400 KB and
+        # carries it in pages, flagged BF_PAGES. mapload.asm never sees the
+        # difference -- it skips non-resident descriptors before reading a
+        # length -- but tools/u64push.py sizes the upload from these and does.
+        length = len(payload)
+        if flags & BF_PAGES:
+            length = (length + BLOCK_ALIGN - 1) // BLOCK_ALIGN
+        if length > 0xFFFF:
+            raise ValueError(f"block {bid} is {len(payload)} B, too long for "
+                             "the 16-bit length field even in pages")
         struct.pack_into("<BBBBBHB", img, 8 + i * 8,
                          bid, flags,
                          ofs & 0xFF, (ofs >> 8) & 0xFF, (ofs >> 16) & 0xFF,
-                         len(payload), loadhi)
+                         length, loadhi)
         img[ofs:ofs + len(payload)] = payload
     return bytes(img)
+
+
+# ----------------------------------------------------------------------------
+# The music stream
+# ----------------------------------------------------------------------------
+
+def load_music(path: str) -> bytes:
+    """Read a stream from tools/sidstream.py and check its header here.
+
+    The stream is built by a separate tool into build/music.bin because running
+    the tune through the 6502 emulator costs seconds and depends on nothing this
+    file knows about. What this does check is that the blob is a stream at all
+    and that its DMA window fits MUSWINDOW in src/defs.asm -- the engine checks
+    that too, at boot, but a build-time failure names the file.
+    """
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if len(blob) < MUSIC_HEADER_SIZE or blob[0:2] != MUSIC_MAGIC:
+        raise ValueError(f"{path}: not a music stream (magic {blob[0:2]!r})")
+    if blob[2] != MUSIC_VERSION:
+        raise ValueError(f"{path}: stream version {blob[2]}, expected "
+                         f"{MUSIC_VERSION} -- rebuild it with sidstream.py")
+    if not 0 < blob[3] <= MUSWINDOW:
+        raise ValueError(f"{path}: DMA window is {blob[3]} B, and src/defs.asm "
+                         f"MUSWINDOW is {MUSWINDOW}")
+    end = blob[9] | blob[10] << 8 | blob[11] << 16
+    if end > len(blob):
+        raise ValueError(f"{path}: header says the stream ends at {end}, "
+                         f"but the file is {len(blob)} B")
+    return blob
 
 
 # ----------------------------------------------------------------------------
@@ -857,6 +928,8 @@ def parse_image(img: bytes) -> dict:
         bid, flags, o0, o1, o2, length, loadhi = struct.unpack_from(
             "<BBBBBHB", img, 8 + i * 8)
         ofs = o0 | (o1 << 8) | (o2 << 16)
+        if flags & BF_PAGES:
+            length *= BLOCK_ALIGN
         if ofs + length > len(img):
             raise ValueError(f"block {bid} runs past the end of the image")
         blocks[bid] = dict(flags=flags, ofs=ofs, length=length,
@@ -866,11 +939,13 @@ def parse_image(img: bytes) -> dict:
     numnodes, numssec, numsec, shift = struct.unpack_from("<HHBB", mi, 0)
     ssec_base = mi[6] | (mi[7] << 8) | (mi[8] << 16)
     sph_base = mi[22] | (mi[23] << 8) | (mi[24] << 16)
+    mus_base = mi[25] | (mi[26] << 8) | (mi[27] << 16)
     root, sx, sy, sa, spawn_ssec, spawn_sec, numsegs, mapid = \
         struct.unpack_from("<HhhBHBHB", mi, 9)
 
     info = dict(numnodes=numnodes, numssec=numssec, numsec=numsec,
-                shift=shift, ssec_base=ssec_base, sph_base=sph_base, root=root,
+                shift=shift, ssec_base=ssec_base, sph_base=sph_base,
+                mus_base=mus_base, root=root,
                 spawn=(sx, sy, sa), spawn_ssec=spawn_ssec,
                 spawn_sec=spawn_sec, numsegs=numsegs, mapid=mapid)
 
@@ -944,6 +1019,38 @@ def validate(m: MapData, img: bytes) -> list[str]:
     check(p["blocks"][BLK_NODESPH]["flags"] & 1 == 0, "NODESPH must not be resident")
     check(info["sph_base"] == p["blocks"][BLK_NODESPH]["ofs"],
           "MAPINFO's sphere base does not point at the NODESPH block")
+
+    # 10. the music stream, if there is one. miMusBase is what src/music.asm
+    # follows, and a zero there means silence -- so the failure this catches is
+    # a block that is present and unreachable, which sounds exactly like a
+    # build with no tune in it and is not.
+    if BLK_MUSIC in p["blocks"]:
+        mus = p["blocks"][BLK_MUSIC]
+        check(mus["flags"] & BF_RESIDENT == 0, "MUSIC must not be resident")
+        check(mus["flags"] & BF_PAGES != 0,
+              "MUSIC must set BF_PAGES: its length does not fit 16 bits in bytes")
+        check(info["mus_base"] == mus["ofs"],
+              "MAPINFO's music base does not point at the MUSIC block")
+        check(mus["ofs"] >= REU_PROBE_OFFSET,
+              f"MUSIC at ${mus['ofs']:06X} is below reuProbe's scratch")
+        head = mus["data"][:MUSIC_HEADER_SIZE]
+        check(head[0:2] == MUSIC_MAGIC and head[2] == MUSIC_VERSION,
+              "MUSIC block does not start with a v1 stream header")
+        check(0 < head[3] <= MUSWINDOW,
+              f"MUSIC DMA window {head[3]} exceeds MUSWINDOW {MUSWINDOW}")
+        loop = head[6] | head[7] << 8 | head[8] << 16
+        end = head[9] | head[10] << 8 | head[11] << 16
+        check(MUSIC_HEADER_SIZE <= loop <= end,
+              f"MUSIC loop point {loop} is not inside the stream (ends {end})")
+        # The player fetches a fixed window and reads the record length out of
+        # it, so the last record's fetch runs off the end of the stream by
+        # design. sidstream.py pads for that; if it did not, the final tick of
+        # every loop would replay whatever follows in the image.
+        check(end + head[3] <= len(mus["data"]),
+              "MUSIC block has no room for the last record's DMA window")
+    else:
+        check(info["mus_base"] == 0,
+              "MAPINFO points at a music block the image does not contain")
 
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
@@ -1132,10 +1239,22 @@ def report(m: MapData, img: bytes) -> None:
           f"  mean {sum(r for _, _, r in sph) / max(1, len(sph)):.0f}")
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
-                      (BLK_NODESPH, "NODESPH")):
+                      (BLK_NODESPH, "NODESPH"), (BLK_MUSIC, "MUSIC")):
+        if bid not in p["blocks"]:
+            continue
         b = p["blocks"][bid]
         where = f"-> ${b['load']:04X}" if b["flags"] & 1 else "streamed"
         print(f"  block {bid} {name:<9}${b['ofs']:06X} +{b['length']:<6} {where}")
+    if BLK_MUSIC in p["blocks"]:
+        h = p["blocks"][BLK_MUSIC]["data"][:MUSIC_HEADER_SIZE]
+        latch = h[4] | h[5] << 8
+        ticks = h[12] | h[13] << 8 | h[14] << 16
+        rate = 985248 / (latch + 1)
+        print(f"  music          {ticks} ticks at {rate:.2f} Hz "
+              f"(CIA latch ${latch:04X}) = {ticks / rate / 60:.0f}:"
+              f"{ticks / rate % 60:04.1f}, {h[3]} B DMA window")
+    else:
+        print("  music          none -- the engine will render in silence")
     if m.ramp_misses:
         print("  UNMAPPED textures (fell back to "
               f"{RAMP_NAMES[DEFAULT_RAMP]}): "
@@ -1150,6 +1269,10 @@ def main(argv=None) -> int:
     ap.add_argument("--map", default="E1M1",
                     help="map lump name, or TEST for the built-in test map")
     ap.add_argument("--png", help="write a top-down render of the decoded image")
+    ap.add_argument("--music", metavar="STREAM",
+                    help="a SID register stream from tools/sidstream.py "
+                         "(build/music.bin) to embed as block 5; without it "
+                         "the engine renders in silence")
     ap.add_argument("--no-validate", action="store_true")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
@@ -1161,8 +1284,9 @@ def main(argv=None) -> int:
             if not a.wad:
                 ap.error("a WAD path is required unless --map TEST")
             m = load_wad_map(Wad(a.wad), a.map.upper())
-        img = build_image(m)
-    except ValueError as e:
+        music = load_music(a.music) if a.music else b""
+        img = build_image(m, music)
+    except (ValueError, OSError) as e:
         print(f"wad2reu: {e}", file=sys.stderr)
         return 2
 

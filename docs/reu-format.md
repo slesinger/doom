@@ -46,7 +46,7 @@ At REU offset `$000000`, 64 bytes:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, ASCII `D64U` |
-| 4 | 1 | format version — **2** |
+| 4 | 1 | format version — **3** |
 | 5 | 1 | block count `N` |
 | 6 | 2 | reserved, zero |
 | 8 | 8×`N` | block descriptors |
@@ -66,10 +66,18 @@ the wrong thing.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 1 | block id (§3) |
-| 1 | 1 | flags — bit 0 = resident (load at boot) |
+| 1 | 1 | flags — bit 0 = resident (load at boot), bit 1 = length is in pages |
 | 2 | 3 | REU offset, 24-bit (lo, hi, bank) |
-| 5 | 2 | length in bytes |
+| 5 | 2 | length, in bytes — or in 256-byte pages if flags bit 1 is set |
 | 7 | 1 | load address **high byte**; 0 for non-resident blocks |
+
+**The page-unit flag exists for one block.** The music stream (§4.6) is ~400 KB
+and the length field is 16 bits. Only the host-side uploader ever reads that
+length for a non-resident block, so this costs the 6502 nothing:
+`mapload.asm` tests bit 0 and skips the descriptor before it looks at a length
+at all. `tools/u64push.py` does read it, and sizing that upload in bytes would
+have delivered 1583 bytes of a 405 KB stream — 0.4% of a tune, replayed as
+noise, with every check green.
 
 Resident blocks always load at a **page-aligned** C64 address, which is why one
 byte is enough for the destination and why the boot loader is a single loop over
@@ -92,12 +100,20 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 2 | `SECTORS` | yes | `$DC00` | 576 B |
 | 3 | `SSECDATA` | no — streamed | — | 30336 B |
 | 4 | `NODESPH` | no — streamed | — | 1920 B |
+| 5 | `MUSIC` | no — streamed | — | 405136 B |
 
 Resident total: **3488 B**, of which 3456 sit under the I/O space (§6).
 
 Blocks are stored in the image in id order, each padded to a 256-byte boundary.
 Padding costs REU space, which is free, and makes every block's offset
 inspectable in a hex dump, which is not.
+
+`MUSIC` is the one block that does not simply follow its predecessor: it sits at
+a fixed `MUSIC_OFFSET` of `$010000`, above `reuProbe`'s scratch (§9.4), so the
+map below it keeps the whole first 64 KB and nothing has to move when a tune
+changes length. It is also **optional** — `make assets` without a stream omits
+the block and leaves `miMusBase` at zero, which `src/music.asm` reads as "render
+in silence" rather than as an error. `build/testmap.reu` is built that way.
 
 ---
 
@@ -121,7 +137,8 @@ inspectable in a hex dump, which is not.
 | 19 | 2 | `numSegs` |
 | 21 | 1 | `mapId` — 0 = test map, 1 = E1M1 |
 | 22 | 3 | `sphReuBase`, 24-bit REU offset of `NODESPH` |
-| 25 | 7 | reserved, zero |
+| 25 | 3 | `musReuBase`, 24-bit REU offset of `MUSIC` — **0 means no music** |
+| 28 | 4 | reserved, zero |
 
 `spawnSsector` is redundant — the engine's own BSP descent will find it — and
 that is the point. `main.asm` compares the two at boot and halts with
@@ -217,6 +234,131 @@ Heights are Doom's own units with no rescaling — E1M1's floors span −136…1
 ceilings −40…264, so the existing 16-bit integer world coordinates and the
 projection math in `pipeline.md` §8 carry over untouched.
 
+### 4.6 `MUSIC` — the SID register stream
+
+Block 5, never resident, at `musReuBase`. Written by `tools/sidstream.py`,
+embedded by `wad2reu.py --music`, replayed by `src/music.asm`.
+
+**There is no player in this format, and that is the point.** A `.sid` is 6502
+code at fixed absolute addresses — `DooM_Medley` wants `$0FF6-$3E6A` — and that
+lands inside `MATRIX`. The engine's free RAM is about 360 bytes in four holes
+(`IMPLEMENTATION_PLAN.md` §14), so a resident player was never possible. But the
+SID chip only ever sees register writes, so the player runs once at build time in
+`tools/cpu6502.py`: `init` is called, `play` is called at the tune's own rate,
+and `$D400-$D418` is snapshotted after every call. What ships is the snapshots.
+Chip-identical by construction, zero resident player code, and the loop is a
+pointer rewind rather than a second `init`.
+
+#### Header — 16 bytes at offset 0
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | magic, ASCII `MU` |
+| 2 | 1 | stream version — **1** |
+| 3 | 1 | `window` — bytes the player must fetch per tick |
+| 4 | 2 | CIA 1 timer A latch, i.e. the tune's own tick rate |
+| 6 | 3 | `loopOffset` — where the tune repeats from |
+| 9 | 3 | `endOffset` — one past the last record |
+| 12 | 3 | `tickCount` |
+| 15 | 1 | reserved, zero |
+
+All three offsets are from the **start of the stream**, header included, and the
+engine adds `musReuBase` to each at boot. The rate is carried rather than assumed
+because tunes set their own: `DooM_Medley` wants 100.25 Hz (latch `$2663`), not
+the 50 Hz a vertical-blank player would use.
+
+#### Records — one per tick, variable length
+
+A count byte, then that many `(register, value)` pairs for the registers that
+changed since the previous tick. `DooM_Medley` changes a mean of 3.3 of 25, so
+this is 9.1 bytes where a raw snapshot is 25 — 405 KB against 1.11 MB for the
+whole 7:22. That ratio is not about REU space, which is free; it is about upload
+time, because `u64push.py` re-sends and verifies the used region on every
+hardware run.
+
+**The chip must start at zero.** The encoder's "previous" frame begins as 25 zero
+bytes, so a register the tune never writes is never in any record. `musInit`
+therefore clears `$D400-$D418` before the first tick; without it those registers
+keep whatever the KERNAL's reset left in them.
+
+**`window` is why the stream is padded.** The player DMAs a *fixed* number of
+bytes and only then reads the count byte to learn how long the record was, so the
+window has to cover the longest record in the stream — and the last record's
+fetch therefore runs off the end by design. `sidstream.py` appends `window` bytes
+of padding for exactly that, and `wad2reu.py`'s validator checks the padding is
+there. `MUSWINDOW` in `src/defs.asm` is the ceiling the player can offer (40 B);
+`musInit` rejects a stream asking for more rather than replaying truncated
+records as noise. `DooM_Medley` asks for 39.
+
+#### What it costs the frame
+
+Four ticks per 39.9 ms frame at 100.25 Hz. Each is an interrupt (1.7 µs, §14
+measured on hardware), a 40-byte DMA and a mean of 3.3 register writes — about
+**0.17 ms a frame, ~0.4% of the budget**, and most of it is the DMA. REU DMA is
+1 µs/byte and does not scale with the turbo clock (§1), so the window is the one
+part of this that a faster CPU does not make cheaper.
+
+**`make stats` over-reports this by roughly sixty times, and will keep doing
+so.** It measured 2307 → 2438 ms/frame, +5.7%, which is real arithmetic about
+the emulator and says nothing about the machine. The tick rate is fixed in *real*
+time — 100.25 Hz is a CIA latch — while VICE's 1 MHz frame lasts 2.3 emulated
+seconds instead of 39.9 ms. So an emulated frame absorbs ~231 ticks where the
+Ultimate absorbs 4. The handler's ~350 cycles are also 350 µs at 1 MHz and 5.5 µs
+at 64 MHz. Every other change to this engine can be judged in VICE and converted
+(`IMPLEMENTATION_PLAN.md` §12); this one cannot, and `make u64-fps` is the only
+honest measurement of it.
+
+The rendered frame is **bit-identical** with the player running —
+`make framehash` gives `c5d78e65…` with and without it, which is the same
+standard §13/§15 held optimisations to. That is the useful thing VICE can still
+say here: the interrupt lands inside the BSP walk's bank windows and inside the
+renderer's REU setup thousands of times per frame, and changes not one pixel.
+
+#### The two hazards the handler exists to survive
+
+Both come from the engine having been written with `sei` held for its whole run,
+which is no longer true — `main.asm` now does a `cli` once `musInit` returns.
+
+1. **`$01`.** The BSP walk reads the node and sector tables with `$34` banked in
+   (§6.1). The handler saves `$01`, forces `$35`, and restores what it found.
+   `src/irqtest.asm` measured this on hardware with a positive control: zero
+   mismatches over thousands of interrupts landing inside those windows, and the
+   deliberately-broken variant failing immediately.
+2. **The REU transfer registers.** A transfer is "fill in `$DF02-$DF08`, then
+   write `$DF01`", and an interrupt between those two writes would otherwise
+   return to a command register holding *the music's* parameters. The handler
+   saves and restores `$DF02-$DF0A` around its own DMA. `$DF00` is excluded on
+   purpose — reading the status register clears it. The DMA itself cannot be
+   interrupted, because the REU halts the CPU for its duration, so the setup
+   window is the whole hazard.
+
+#### How it is verified
+
+`tools/vicedbg/probe.py`'s `check_music`, run by `make check`, reads `musPtr` and
+all 25 SID registers from the running machine **without leaving the monitor in
+between**, then walks the stream from its start to that pointer in Python and
+compares. A match proves the whole path at once: the tick fires, the DMA lands,
+the pointer arithmetic stays on record boundaries, and every write reaches the
+chip. The boundary check is the one that matters most — a replay head half a
+record out of step still writes plausible bytes to the SID and merely sounds
+wrong, which no screenshot and no checksum would catch.
+
+**That exact test is VICE-only, for two independent reasons**, and
+`tools/u64push.py`'s `verify_music` is the weaker hardware version:
+
+- The SID is write-only, and the Ultimate's `machine:readmem` is a DMA into a
+  *running* machine. `$D400-$D418` reads back as `$40` in every register —
+  open bus, not chip state.
+- Even if it did read back, there is nothing to stop time between the two
+  reads. Four music ticks land per frame, so the pointer and the registers
+  would be sampled from different ticks.
+
+So on hardware the check is: the header was accepted (`musErr == 0`), and the
+pointer is inside the block and advancing. Measured on a C64 Ultimate: 487
+stream bytes in 0.5 s, which at the medley's mean record length of 9.1 B is
+~107 ticks/s against the tune's 100.25 Hz — the tick rate is right, and it is
+right because the CIA runs at 1 MHz whatever the CPU's turbo setting is.
+
 ---
 
 ## 5. `SSECDATA` — the streamed subsector slots
@@ -303,8 +445,10 @@ $0E70-$0EEE  collision helpers   segNear / padClass, out of line
 $0F00-$0F3F  BSP stack        32 x 16-bit, the address the portal stack had
 $0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
 $0F51-$0FC3  seg backface     segFacing, the world-space cross product
-$0FC4-$0FF1  sphere transform sphereVisible
-$1000-$7DFF  MATRIX           ... and MAPHDR stages at $5000, before frame 1
+$0FC4-$0FF7  music state      musBuf (the per-tick DMA window), the three
+                              stream pointers, musBank/musOK/musErr
+$1000-$7DFF  MATRIX           ... and MAPHDR stages at $5000, the map loader
+                              at $5100 and musInit at $5300, before frame 1
    ...
 $9740-$97BF  SEGBUF           128 B, DMA target for one subsector's segs
 $97C0-$98E3  bsp node test    sideOf / nodeStep / bspFindSsec
@@ -317,6 +461,10 @@ $DB40-$DBFF  free, 192 B                         ]  under the I/O space:
 $DC00-$DE3F  SECTORS          resident block 2   ]  visible only with
 $DE40-$DEFF  free, 192 B                         ]  $01 = $34
 $DF00-$DFFF  REU registers    never used as RAM
+   ...
+$FF40-$FFE3  music handler    musIrq, copied there by musInit -- NOT in the
+                              PRG image, which still ends at $CFDA (§4.6)
+$FFFA-$FFFF  CPU vectors      NMI -> an rti inside that block, IRQ -> musIrq
 ```
 
 `SEGBUF` is in `TABLES_FREE` rather than next to `MAPINFO` because the main
@@ -348,10 +496,19 @@ Both states keep RAM at `$A000` and `$E000` where `BITMAP0`/`BITMAP1` live, so
 switching never changes what a bitmap write does. `main.asm` sets `$01 = $35`
 once at boot, and the KERNAL is never called after that.
 
-Interrupts are masked for the whole run (`main.asm` opens with `sei` and never
-clears it), so a bank switch cannot be interrupted halfway. **If an interrupt
-handler is ever added, every `$34` window becomes a hazard** — the handler would
-vector through `$FFFE` in RAM.
+**Interrupts are no longer masked, and every `$34` window is therefore live.**
+`main.asm` still opens with `sei`, but it now clears it once `musInit` returns
+(§4.6), so the music tick lands inside those windows about four times a frame.
+The handler is what makes that safe: it saves `$01`, forces `$35` for the I/O it
+needs, and restores exactly what it found. `src/irqtest.asm` measured that on
+hardware before the player was written, positive control included — thousands of
+interrupts landing inside the windows, zero mismatches, and the deliberately
+broken variant failing on the first one.
+
+Anything else added to the handler inherits the same rule: **nothing it touches
+may assume a banking state until `$01` has been forced.** The zero page and
+everything below `$D000` are RAM either way; the SID, the REU and the CIAs are
+not.
 
 ### 6.2 Why the boot load stages through MATRIX
 
@@ -434,6 +591,12 @@ written:
    in its subtree. This is the one check that matters most: the engine rejects
    whole subtrees on these spheres, so a bound that is short by one unit deletes
    geometry from the frame, silently and only from some angles.
+10. The music stream, if the image has one: `miMusBase` points at block 5, the
+   block is non-resident and flagged `BF_PAGES`, its header is a v1 `MU` stream,
+   its DMA window fits `MUSWINDOW`, its loop point is inside it, and the padding
+   for the last record's over-read is present. An image with no music block must
+   have `miMusBase == 0` — a block that is present but unreachable sounds
+   exactly like a build with no tune in it, and is not.
 
 and writes `build/assets-map.png`, a top-down render of the *decoded* blocks —
 segs coloured by ramp, subsectors outlined — which is the check that the
@@ -570,8 +733,13 @@ it before the parameters it describes — and the stub issues the REU stash.
 matching REU **fetch** before moving on, because this is exactly the leg of the
 path that turned out not to be trustworthy.
 
-E1M1's image is ~36 KB of used bytes, so three chunks; the whole upload plus
-verification takes a few seconds and runs before `doom.prg`.
+E1M1's map blocks are ~36 KB of used bytes, so three chunks — but the music
+stream sits at `$010000` and runs to ~467 KB (§4.6), and the uploader sends one
+contiguous region from offset 0 up to the last byte any descriptor claims. So a
+`make run-u64` now moves **~29 chunks, not three**, and the gap between the map
+and the music is uploaded as zeros along with everything else. That is minutes
+rather than seconds, and it is the price of the tune being in the same artifact
+as the map. Building without `--music` puts it back to three chunks.
 
 **`go` = `$ff` means terminate, not "chunk done".** `rlDone` in `reuload.asm`
 is an infinite loop that performs no further transfers — and it keeps clearing
