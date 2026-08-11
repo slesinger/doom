@@ -8,6 +8,10 @@ build/*.png
 build/*.bin
 build/*.reu
 build/debug.log
+# Which REU chunks this host last uploaded, and the token that says whether the
+# machine still holds them (tools/u64push.py). Per-machine state, not a build
+# artifact -- and stale in a fresh checkout, where it must not be believed.
+build/.reu-upload-cache.json
 
 # KickAssembler is not vendored; see IMPLEMENTATION_PLAN.md
 tools/kickass/

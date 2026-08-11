@@ -369,8 +369,19 @@
 .const HFOCAL  = 80
 .const VFOCAL  = 160
 .const EYE     = 41                 // eye height above sector floor
-.const MOVE_SPEED = 14              // world units per frame
-.const TURN_SPEED = 3               // angle units (of 256) per frame
+// Both are per *frame*, not per second, so they are tied to FPS_CAP_TICKS
+// below: M2's frame is 1.5x longer than M1's (three raster frames, not two),
+// and these were 14 and 3 at 25 fps. Rescaling them is not optional -- the
+// same key held for the same second must move the player the same distance,
+// or the game feels wrong in a way no test catches.
+//
+// 14 x 1.5 = 21 exactly. 3 x 1.5 = 4.5 does not exist in an 8-bit angle
+// space, so turning is 4 units/frame: 67 deg/s where M1 turned at 75. The
+// fractional accumulator that would give the exact rate costs a zero-page
+// byte and six cycles a frame, and is the thing to reach for if 67 turns
+// out to feel sluggish.
+.const MOVE_SPEED = 21              // world units per frame (16.7 fps)
+.const TURN_SPEED = 4               // angle units (of 256) per frame
 .const MAXSTEP = 24                 // tallest step the player can climb
 .const MINHEAD = 56                 // headroom needed to fit through an opening
 .const PLRAD   = 16                 // player radius, Doom's own value
@@ -513,7 +524,8 @@
 // $90 upwards was untouched: the engine allocated $02-$8f and never calls the
 // KERNAL, so everything above it has been free RAM since boot.
 //------------------------------------------------------------
-.const msLast  = $90        // CIA2 Timer B at the last completed frame
+.const msLast  = $90        // free: was the pacer's reference until the
+                            // pacing moved to msFrame (see clock.asm)
 .const msNow   = $92        // scratch for a torn-read-safe timer read
 .const msFrame = $96        // ... at the last completed flip (see ftInt below)
 
@@ -656,25 +668,37 @@
 
 // Frame pacing. Without a cap the engine runs at whatever 50/n the frame
 // happens to cost, and everything that moves is per-frame, so a simple view
-// at 50 fps moves the player twice as fast as a complex one at 25 fps. The
-// cap makes 50 fps unreachable and pins the common case at 25.
+// at 50 fps moves the player twice as fast as a complex one. The cap makes
+// every faster rate unreachable and pins the common case at one number.
 //
 // THE UNIT IS A TIMER B TICK, NOT A MILLISECOND. PAL phi2 is 985248 Hz, not
 // 1 MHz, so a Timer A latch of 1000 underflows every 1.015 ms. Hardware
-// confirms it: `make u64-fps` measured 9871 CIA ticks against 10049 host
-// milliseconds, a ratio of 0.982 where PAL predicts 0.985.
+// confirms it: `make u64-fps` measured 19706 CIA ticks against 20044 host
+// milliseconds, a ratio of 0.983 where PAL predicts 0.985.
 //
-// That is what fixes this number at 39 and makes 39 the *maximum*:
+// **M2 runs at three raster frames, not two** (IMPLEMENTATION_PLAN.md §8.1).
+// M1 shipped 25.05 fps with ~2 ms of headroom; textures, doors and sprites
+// need ~15-20 ms that do not exist there, and 16.7 fps locked is preferable
+// to 25 fps that judders. The same arithmetic that made 39 the maximum at
+// two frames makes 58 the maximum at three:
 //
-//   39 ticks = 39.58 ms   <  two PAL frames (39.90 ms)   -- lands on the
-//   40 ticks = 40.60 ms   >  two PAL frames              second crossing
+// The wait is measured from the *last flip* (msFrame), not from the pacer's
+// own last release, so the reference resets at every raster crossing and the
+// phase cannot accumulate -- see the long comment on framePace, and the
+// hardware run where release-to-release pacing put 16 of 341 frames on the
+// wrong crossing. That is what makes this number uncritical rather than
+// exact: any wait that lands strictly between the two-frame crossing and the
+// three-frame one selects the three-frame one, every time.
 //
-// The wait hands over to flip's raster sync, which then lands on the next
-// line-251 crossing. At 40 every frame would miss that crossing and cost a
-// third raster frame -- 16.7 fps instead of 25. The 39.58 ms figure is already
-// the worst case: msLast is captured mid-tick, so the counter reaches 39
-// somewhere between 38 and 39 whole ticks after it, never later.
-.const FPS_CAP_TICKS = 39
+//   two PAL frames  = 39.90 ms = 39.3 ticks   ] the wait must land
+//   three PAL frames = 59.85 ms = 58.97 ticks ] strictly between these
+//
+// msFrame is captured mid-tick, so a cap of N releases somewhere between
+// N-1 and N whole ticks later: 41..58 all work, and 49 (49.7 ms) is the
+// middle, with ~10 ms of slack against each crossing.
+//
+// MOVE_SPEED and TURN_SPEED are 1.5x their M1 values because of this line.
+.const FPS_CAP_TICKS = 49
 
 //------------------------------------------------------------
 // Renderer instrumentation lives in src/instrument.asm, not here.

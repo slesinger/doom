@@ -83,7 +83,7 @@ uploader (`src/reuload.asm` + the host-driven mailbox protocol) unchanged —
 it already doesn't care what's playing the file, only that bytes land in REU
 RAM. The one thing it assumed was the engine's own `D64U` block-header
 format, to know how many of a padded image's bytes are worth uploading;
-`image_used_bytes` now falls back to trimming trailing zero padding for
+`image_regions` falls back to trimming trailing zero padding for
 images with no such header, which works here because 8-bit *unsigned* PCM
 silence sits at $80, not $00 — a run of zero bytes can only be the pad
 `mp3topcm.py` appended.

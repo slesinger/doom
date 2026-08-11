@@ -23,11 +23,12 @@ REU images take one of two other routes, selected by --reu-mode:
                    this mode uploads the file and tells you to do that;
                    it cannot finish the job on its own.
 
---verify-reu reads the whole used region of REU RAM back through the
-same stub and diffs it against the local image. That is the check that
-covers the *streamed* blocks; --verify-map only covers the three
-resident ones, and an image whose first 16 KB arrived and whose tail did
-not passes --verify-map while rendering garbage.
+--verify-reu reads every chunk the upload covers back through the same
+stub and diffs it against the local image. That is the check that covers
+the *streamed* blocks; --verify-map only covers the three resident ones,
+and an image whose first 16 KB arrived and whose tail did not passes
+--verify-map while rendering garbage. It is also the independent check on
+the skip cache below: a chunk that was skipped is read back all the same.
 
 --fps reads the engine's frame counter (frameCnt, see src/defs.asm) twice
 
@@ -44,6 +45,8 @@ quantises both to the same 59.85 ms -- and those two want opposite work.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import struct
 import sys
@@ -63,6 +66,16 @@ FT_ADDR = 0x02A0
 # on the machine -- it does not care what the CPU or the turbo are doing -- so
 # it is what calibrates everything else here.
 PAL_FRAME_MS = 19.9504
+
+# How many raster frames the engine is paced to. M1 ran at two (25 fps);
+# M2 runs at three, because textures, doors and sprites need ~15-20 ms that
+# two frames do not have (IMPLEMENTATION_PLAN.md §8.1). This has to track
+# FPS_CAP_TICKS in src/defs.asm -- 58 ticks is the largest wait that still
+# lands inside three raster frames -- and it is what decides which histogram
+# bucket "made the deadline" means. Reading the wrong bucket reports a
+# perfectly paced engine as 0% on time.
+TARGET_FRAMES = 3
+DEADLINE_MS = TARGET_FRAMES * PAL_FRAME_MS
 
 # One Timer B tick is a Timer A period, i.e. 1000 phi2 cycles at PAL's
 # 985248 Hz. Not a millisecond -- see FPS_CAP_TICKS in src/defs.asm.
@@ -97,6 +110,77 @@ RELOAD_BUF = 0x1000              # C64 staging buffer; free while the stub runs
 RELOAD_CHUNK = 16384
 
 GO_STASH, GO_FETCH, GO_DONE = 1, 2, 0xFF
+
+HEADER_SIZE = 64                 # docs/reu-format.md §2
+
+# --- the skip cache ---------------------------------------------------------
+#
+# REU RAM survives a reset -- that is how a stale image was identified in the
+# first place (docs/reu-format.md §9.2) -- so a chunk whose content has not
+# changed since the last upload does not have to be sent again. The music
+# stream is 405 KB of the 470 KB image and changes when the tune does, i.e.
+# almost never, so this is the difference between minutes and seconds on the
+# common rebuild-and-run.
+#
+# What it cannot assume is that REU RAM is still what this host last put there:
+# a power cycle clears it, and another machine, another checkout or a hand
+# upload from the Ultimate's menu can all have written it since. So the cache
+# is only believed when a random token it recorded is still sitting in REU RAM.
+# The token is written *after* a fully successful upload and cleared *before*
+# one starts, so an upload that dies halfway leaves no token, and the next run
+# sends everything rather than trusting a half-written image.
+#
+# The token lives just above reuProbe's 4-byte scratch at $00F000 (defs.asm
+# REU_PROBE_ADDR/BANK) -- inside the hole between the map blocks and MUSIC,
+# which no descriptor claims, no chunk above covers and the engine never reads.
+# wad2reu.py already refuses to build a map image that reaches $00F000, so the
+# same guard that protects the probe protects this.
+STAMP_OFFSET = 0x00F010
+STAMP_SIZE = 16
+CACHE_PATH = "build/.reu-upload-cache.json"
+
+
+def _cache_key(host: str, image: str) -> str:
+    return f"{host}|{os.path.basename(image)}|{RELOAD_CHUNK}"
+
+
+def load_cache(host: str, image: str) -> dict:
+    try:
+        with open(CACHE_PATH) as fh:
+            entry = json.load(fh).get(_cache_key(host, image))
+    except (OSError, ValueError):
+        return {}
+    return entry if isinstance(entry, dict) else {}
+
+
+def save_cache(host: str, image: str, entry: dict) -> None:
+    try:
+        with open(CACHE_PATH) as fh:
+            all_entries = json.load(fh)
+        if not isinstance(all_entries, dict):
+            all_entries = {}
+    except (OSError, ValueError):
+        all_entries = {}
+    all_entries[_cache_key(host, image)] = entry
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH) or ".", exist_ok=True)
+        with open(CACHE_PATH, "w") as fh:
+            json.dump(all_entries, fh, indent=1, sort_keys=True)
+    except OSError as exc:
+        print(f"  note: could not write {CACHE_PATH} ({exc}) -- the next "
+              f"upload will send everything")
+
+
+def read_stamp(u: Ultimate) -> str:
+    """Read the token out of REU RAM through the loader stub. Stub running."""
+    u.writemem(RELOAD_BUF, b"\0" * STAMP_SIZE)
+    _mbox(u, RELOAD_BUF, STAMP_OFFSET, STAMP_SIZE, GO_FETCH)
+    return u.readmem(RELOAD_BUF, STAMP_SIZE).hex()
+
+
+def write_stamp(u: Ultimate, token: bytes) -> None:
+    u.writemem(RELOAD_BUF, token)
+    _mbox(u, RELOAD_BUF, STAMP_OFFSET, STAMP_SIZE, GO_STASH)
 
 # NOTE (2026-08-11): most of what the machinery below was built for was one
 # bug, not the machine -- _stash_chunk sent GO_DONE after *every* chunk, and
@@ -140,20 +224,27 @@ STUB_RESTARTS = 6
 RESTART_COOLDOWN = 8.0
 
 
-def image_used_bytes(img: bytes) -> int:
-    """How much of a padded .reu image actually carries data.
+def image_regions(img: bytes) -> list[tuple[int, int]]:
+    """The regions of a padded .reu image that actually carry data.
 
     Two image shapes reach here: the engine's own D64U block format
-    (wad2reu.py), whose header says exactly how much is used, and a plain
+    (wad2reu.py), whose descriptors say exactly what is used, and a plain
     padded blob (tools/mp3topcm.py's PCM for the intro), which carries no
     header at all. The second is told apart by the missing magic and
     measured by trimming its trailing zero padding instead -- silence in
     8-bit *unsigned* PCM sits at $80, not $00, so trailing zero bytes can
     only be the pad mp3topcm.py itself appended, never audio content.
+
+    Regions rather than a single length, because `assets.reu` is not
+    contiguous: the map blocks end around 36 KB and MUSIC starts at a fixed
+    $010000 (docs/reu-format.md §3), so a `0 .. last claimed byte` upload
+    sends 28 KB of hole as zeros -- and, worse, `verify_reu` then demands
+    that the machine's REU hold zeros in a region no descriptor claims and
+    nothing ever reads.
     """
     if img[:4] != b"D64U":
-        return len(img.rstrip(b"\x00")) or 1
-    end = 64
+        return [(0, len(img.rstrip(b"\x00")) or 1)]
+    regions = [(0, HEADER_SIZE)]
     for i in range(img[5]):
         _bid, flags, o0, o1, o2, length, _hi = struct.unpack_from(
             "<BBBBBHB", img, 8 + i * 8)
@@ -163,8 +254,25 @@ def image_used_bytes(img: bytes) -> int:
         # a stream that is 0.4% present, which the engine would replay as noise.
         if flags & 0x02:
             length *= 256
-        end = max(end, (o0 | o1 << 8 | o2 << 16) + length)
-    return end
+        regions.append(((o0 | o1 << 8 | o2 << 16), length))
+    return sorted(regions)
+
+
+def image_chunks(img: bytes) -> list[int]:
+    """The RELOAD_CHUNK-aligned offsets an upload of `img` has to cover.
+
+    A fixed global grid, not a per-region one: a chunk's offset is then a
+    property of the image alone, which is what lets the skip cache below key
+    on it across builds. A chunk any claimed region touches is sent whole,
+    padding included -- it is already in the image and splitting a chunk to
+    save a few hundred bytes would cost the alignment.
+    """
+    want: set[int] = set()
+    for ofs, length in image_regions(img):
+        first = ofs // RELOAD_CHUNK
+        last = (ofs + max(length, 1) - 1) // RELOAD_CHUNK
+        want.update(range(first, last + 1))
+    return [i * RELOAD_CHUNK for i in sorted(want)]
 
 
 def _mbox(u: Ultimate, c64: int, reu: int, length: int, go: int) -> None:
@@ -208,19 +316,46 @@ def start_stub(u: Ultimate) -> None:
     time.sleep(RELOAD_SETTLE)
 
 
-def upload_reu(u: Ultimate, image: str) -> None:
+def upload_reu(u: Ultimate, image: str, host: str, use_cache: bool = True
+               ) -> None:
     with open(image, "rb") as fh:
         img = fh.read()
-    used = image_used_bytes(img)
-    total_chunks = (used + RELOAD_CHUNK - 1) // RELOAD_CHUNK
-    print(f"uploading {used} of {len(img)} bytes into REU RAM "
-          f"({total_chunks} chunks)")
+    offsets = image_chunks(img)
+    claimed = sum(n for _, n in image_regions(img))
+    print(f"uploading {claimed} claimed of {len(img)} image bytes into REU RAM "
+          f"({len(offsets)} chunks)")
+
+    want = {f"{ofs:06X}": hashlib.sha256(
+        img[ofs:ofs + RELOAD_CHUNK]).hexdigest() for ofs in offsets}
 
     start_stub(u)
+
+    # The token says whether REU RAM is still what this host last put there;
+    # the cached hashes then say which chunks that leaves alone. Clearing it
+    # first is what makes a failed upload fail safe -- see the comment on
+    # STAMP_OFFSET.
+    have: dict = {}
+    if use_cache:
+        cache = load_cache(host, image)
+        stamp = read_stamp(u)
+        if cache.get("stamp") and cache["stamp"] == stamp:
+            have = cache.get("chunks", {})
+        elif cache.get("stamp"):
+            print("  cache: the machine's token does not match the one this "
+                  "host recorded -- REU RAM was cleared or written elsewhere, "
+                  "so everything is being sent")
+        write_stamp(u, b"\0" * STAMP_SIZE)
+
     restarts = 0
-    ofs = 0
-    while ofs < used:
+    sent = skipped = 0
+    i = 0
+    while i < len(offsets):
+        ofs = offsets[i]
         chunk = img[ofs:ofs + RELOAD_CHUNK]
+        if have.get(f"{ofs:06X}") == want[f"{ofs:06X}"]:
+            skipped += 1
+            i += 1
+            continue
         try:
             _stash_with_retries(u, ofs, chunk)
         except U64Error as exc:
@@ -236,8 +371,19 @@ def upload_reu(u: Ultimate, image: str) -> None:
             start_stub(u)
             continue                # retry this same chunk on the fresh stub
         print(f"  ${ofs:06X} +{len(chunk):<6} stashed and verified")
-        ofs += RELOAD_CHUNK
+        sent += 1
+        i += 1
+
+    if use_cache:
+        token = os.urandom(STAMP_SIZE)
+        write_stamp(u, token)
+        if read_stamp(u) != token.hex():
+            print("  note: the token did not read back -- not caching this "
+                  "upload, so the next one will send everything")
+        else:
+            save_cache(host, image, {"stamp": token.hex(), "chunks": want})
     finish_stub(u)
+    print(f"reu: {sent} chunk(s) sent, {skipped} unchanged and skipped")
 
 
 def _stash_with_retries(u: Ultimate, ofs: int, chunk: bytes) -> None:
@@ -292,7 +438,11 @@ def finish_stub(u: Ultimate) -> None:
 
 
 def verify_reu(u: Ultimate, image: str) -> int:
-    """Diff the whole used region of REU RAM against the local image.
+    """Diff every chunk the upload covers against the local image.
+
+    Regions no descriptor claims are not diffed, because they are not
+    uploaded either (see image_regions) and the machine is free to hold
+    whatever a previous image left there.
 
     verify_map covers the three resident blocks, which all live in the
     first 4 KB of the image; the streamed blocks -- SSECDATA and NODESPH,
@@ -307,13 +457,14 @@ def verify_reu(u: Ultimate, image: str) -> int:
     """
     with open(image, "rb") as fh:
         img = fh.read()
-    used = image_used_bytes(img)
-    print(f"reu: reading back {used} bytes and diffing against {image}")
+    offsets = image_chunks(img)
+    print(f"reu: reading back {len(offsets)} chunks and diffing against "
+          f"{image}")
 
     start_stub(u)
     rc = 0
-    for ofs in range(0, used, RELOAD_CHUNK):
-        n = min(RELOAD_CHUNK, used - ofs)
+    for ofs in offsets:
+        n = min(RELOAD_CHUNK, len(img) - ofs)
         u.writemem(RELOAD_BUF, b"\0" * n)
         _mbox(u, RELOAD_BUF, ofs, n, GO_FETCH)
         got = u.readmem(RELOAD_BUF, n)
@@ -654,15 +805,15 @@ def report_frame_stats(u: Ultimate) -> None:
               "frame since the accumulators were cleared", file=sys.stderr)
         return
 
-    deadline = 2 * PAL_FRAME_MS
     print(f"frame: compute {comp * TICK_MS:.1f} ms last, "
           f"{cmin * TICK_MS:.1f} min, {cmax * TICK_MS:.1f} max "
-          f"(deadline {deadline:.2f} ms)")
+          f"(deadline {DEADLINE_MS:.2f} ms)")
     total = sum(hist) or 1
     parts = " ".join(f"{n}x{h}" if n < 4 else f"4+x{h}"
                      for n, h in enumerate(hist, start=1))
     print(f"frame: raster frames {parts} -- "
-          f"{100.0 * hist[1] / total:.0f}% made the 25 fps deadline")
+          f"{100.0 * hist[TARGET_FRAMES - 1] / total:.0f}% made the "
+          f"{1000.0 / DEADLINE_MS:.1f} fps deadline")
 
     # A frame spanning four or more raster frames is not the renderer being
     # slow; nothing it does varies by a factor of four. It is the post-reset
@@ -675,17 +826,18 @@ def report_frame_stats(u: Ultimate) -> None:
               f"and measure again before believing the fps line above ***")
         return
 
-    if cmax * TICK_MS <= deadline:
-        print("frame: ok -- every frame's compute fits in two raster frames, "
-              "so any miss is pacing, not the renderer")
-    elif cmin * TICK_MS > deadline:
+    if cmax * TICK_MS <= DEADLINE_MS:
+        print(f"frame: ok -- every frame's compute fits in {TARGET_FRAMES} "
+              f"raster frames, so any miss is pacing, not the renderer")
+    elif cmin * TICK_MS > DEADLINE_MS:
         print(f"frame: *** every frame overruns by at least "
-              f"{cmin * TICK_MS - deadline:.1f} ms -- the renderer is the "
-              f"whole story, and 25 fps needs that much off it ***")
+              f"{cmin * TICK_MS - DEADLINE_MS:.1f} ms -- the renderer is the "
+              f"whole story, and {1000.0 / DEADLINE_MS:.1f} fps needs that "
+              f"much off it ***")
     else:
         print(f"frame: *** compute straddles the deadline: "
-              f"{deadline - cmin * TICK_MS:.1f} ms under it at best, "
-              f"{cmax * TICK_MS - deadline:.1f} ms over it at worst -- "
+              f"{DEADLINE_MS - cmin * TICK_MS:.1f} ms under it at best, "
+              f"{cmax * TICK_MS - DEADLINE_MS:.1f} ms over it at worst -- "
               f"the spread is what costs the frames, not the average ***")
 
 
@@ -741,6 +893,10 @@ def main(argv=None) -> int:
                     const=10.0,
                     help="after starting, measure the frame rate over this "
                          "many seconds (default 10)")
+    ap.add_argument("--no-reu-cache", action="store_true",
+                    help="send every chunk of the REU image, instead of "
+                         "skipping the ones a previous upload from this host "
+                         f"left in place (see {CACHE_PATH})")
     ap.add_argument("--verify-reu", action="store_true",
                     help="before running, read the whole used region of REU "
                          "RAM back and diff it against the image (covers the "
@@ -769,7 +925,8 @@ def main(argv=None) -> int:
                 if args.reu_mode == "preload":
                     push_reu(u, args.reu, args.reu_remote)
                 else:
-                    upload_reu(u, args.reu)
+                    upload_reu(u, args.reu, args.host,
+                               use_cache=not args.no_reu_cache)
             else:
                 print(f"note: {args.reu} does not exist yet -- "
                       f"running without an REU image")

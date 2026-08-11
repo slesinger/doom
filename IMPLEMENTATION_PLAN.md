@@ -1,1794 +1,812 @@
-# Doom C64U — Implementation Plan to Milestone 1
+# Doom C64U — Implementation Plan
 
-**Written:** 2026-08-09. Supersedes the `IMPLEMENTATION_PLAN.md` deleted in
-`5e83cb3` (that one described the black-screen bug, which is fixed).
+**Milestone 1 is closed** on real hardware: E1M1, walkable, flat-shaded, with
+music, at a measured **25.05 fps with 100% of frames on the deadline**.
+
+This document is now in two parts. **Part I** is the compacted record of M1 —
+the architecture as built, the constraints that are still binding, and the
+hard-won facts that cost a session each to learn. **Part II** is the plan for
+**Milestone 2**: textures, doors and moving sectors, sprites, and a HUD.
+
+> **Renumbered 2026-08-11.** Part I compacts what was 1400 lines of session log.
+> A dozen source files cite the old section numbers; they are not stale, they
+> point at a document that no longer carries the text. The map:
+>
+> | Old | Now |
+> |---|---|
+> | §3 BSP decision, §4 memory and residency | §2, §3 |
+> | §6 risks, §7 sequencing | §5 |
+> | §8-§18 session logs | §6's index — the findings worth keeping are in §4 |
+>
+> **The full untruncated logs are in this file's git history**, newest revision
+> `1ae6533`. A citation of the form "IMPLEMENTATION_PLAN.md §13" in `src/` or
+> `tools/` means that session's log, and `git show 1ae6533:IMPLEMENTATION_PLAN.md`
+> is where to read it.
 
 ---
 
-## 1. Where we actually are
+# Part I — Milestone 1, as built
 
-Verified on this machine today, not inherited from the docs:
+## 1. What M1 was, and what it delivered
 
-| Check | Result |
+> **Walk around E1M1, flat-shaded, on real Ultimate 64 hardware, at a measured
+> frame rate.**
+
+| | Delivered |
 |---|---|
-| `make` (KickAssembler 5.25) | builds `build/doom.prg`, 50901 B |
-| `make shot` | **renders a visible frame** — floor, dithered ceiling, lit far room through the portal |
-| `make debug` (live RAM vs PRG diff) | **clean** — 0 unexpected writes; only MATRIX, bitmaps, screens, converter self-mod, portal stack differ |
-| `make check` (added in Phase 0) | **green** from a clean tree, four consecutive runs |
+| Geometry | Real E1M1 from `DOOM1.WAD` via `tools/wad2reu.py` → `build/assets.reu` |
+| Traversal | BSP front-to-back, bounding-sphere culled (§2) |
+| Shading | Flat `ramp\|intensity`, WAD light level → intensity, depth falloff |
+| Collision | Against the destination subsector's segs; no BLOCKMAP, no linedefs |
+| Input | WASD + joystick 2 |
+| Audio | A SID register stream replayed from REU — *not* in M1's scope, landed anyway |
+| Target | C64 Ultimate at 64 MHz; VICE as the inner loop |
 
-The black-screen era is over. `1e5eb32` (the `BPL` init-loop bug) was the last
-blocker, and the three memory-safety fixes from `8345112` are holding — the
-diff probe reports nothing outside the engine's own buffers.
-
-The docs that still said "does not reach a visible frame" — the README,
-`pipeline.md`'s status caveat and §13, `design.md`'s preface,
-`3d-renderer-design.md` — were corrected in Phase 0.
-
-### What exists
-
-| Subsystem | File | State |
-|---|---|---|
-| VIC setup, frame loop, HUD blank | `src/main.asm` | complete |
-| Memory map / ZP allocation | `src/defs.asm` | complete |
-| Fixed-point math, `spanFill` | `src/math.asm` | complete, bounds-checked |
-| WASD + joy2, movement, subsector containment | `src/input.asm` | complete — segs, not BLOCKMAP (Phase 5) |
-| BSP traversal, subsector streaming, point lookup | `src/render/bsp.asm` | complete (Phase 4) |
-| Seg projection, column spans, occlusion | `src/render/walls.asm` | complete — E1M1, not the test map |
-| Chunky→multicolor, double buffer, flip | `src/render/chunky2mc.asm` | complete |
-| Test map (3 sectors, 16 walls) | `tools/wad2reu.py` `--map TEST` | complete — the hand-assembled `src/testmap.asm` is deleted |
-| VICE monitor client + diff probe | `tools/vicedbg/` | complete, single-step capable |
-| Regression gate (`make check`) | `Makefile`, `tools/checkshot.py` | complete — see §8 |
-| Ultimate REST/FTP client | `tools/u64.py` | complete |
-| Turbo config, push+run, hardware screenshot | `tools/u64config.py`, `u64push.py`, `u64shot.py` | complete — see §9 |
-
-### What does not exist at all
-
-*(This list is from the start of the session. Everything in it has since
-landed — see §11. What is left is Phase 4's BSP renderer and Phase 5's player.)*
-
-- ~~**No REU code.**~~ `src/reu.asm`, `src/mapload.asm`, `src/reuload.asm`.
-- ~~**No `tools/wad2reu.py`.**~~ Written; `make assets` produces E1M1 and the
-  test map through the same packers.
-- ~~**The renderer still draws `testmap.asm`.**~~ It draws E1M1 — see §12.
-
----
-
-## 2. Milestone 1, as agreed
-
-> **Walk around E1M1, flat-shaded, on real Ultimate 64 hardware, at a
-> measured frame rate.**
-
-| Decision | Answer |
-|---|---|
-| Geometry | **Real E1M1 from `DOOM1.WAD`**, via a Python → `.reu` pipeline |
-| Traversal | **BSP front-to-back** (see §3) — replaces portal traversal |
-| Shading | **Flat** (`ramp\|intensity`). Textures are M2. |
-| Input | WASD + joystick 2 (done) |
-| Target | **Real U64 hardware**, VICE as the fast inner loop |
-| Audio | **Deferred.** No SID in M1. |
-
-Explicitly out of scope for M1: textures, sprites/enemies, doors and moving
-sectors, lighting from the WAD's sector light levels, PVS/REJECT, quality
-scaling, deferred floor/ceiling spans, weapons, HUD content.
-
----
-
-## 3. The one architectural change: BSP traversal
-
-The current renderer walks a **portal graph of convex sectors**. E1M1's 85
-sectors are not convex, so that graph does not exist in the WAD. The WAD does
-ship the thing we need — the BSP tree, whose 237 subsectors *are* convex by
-construction.
-
-**Decision: walk `NODES` front-to-back like real Doom, and delete the portal
-stack.**
+**The final hardware reading**, `make u64-fps`:
 
 ```
-renderFrame:
-    descend from root node
-      side = pointOnSide(camX, camY, node)     ; sign of a 2D cross product
-      recurse near child first
-      recurse far child  (M1: unconditionally; bbox rejection is an option later)
-    at a SSECTOR leaf:
-      DMA its segs from REU
-      doWall(seg) for each
-```
-
-What this buys, and what it costs:
-
-- **`doWall`, `lineSetup`, `clampAcc`, `spanFill` are reused unchanged.** The
-  per-wall geometry path is not affected by how we got to the wall.
-- **Horizontal occlusion changes shape.** Today a child sector inherits a
-  narrowed `[zXL, zXR]` window from its portal. In a BSP walk there is no such
-  window; instead a column is dead when `colTop[x] >= colBot[x]`, which
-  `colTop`/`colBot` already express. So: delete `zXL`/`zXR`, add an
-  `openCols` counter, and end the frame early when it hits zero. This is
-  *simpler* than what is there now, not harder.
-- **`checkSector` gets faster.** Player sector lookup becomes a ~9-level BSP
-  descent instead of a cross product per wall of the current sector.
-- **Floors and ceilings keep working.** They are drawn inline per convex
-  region today; a subsector is a convex region. No visplanes needed at M1.
-- **Cost:** roughly 200 lines of new traversal code and a rewrite of
-  `checkSector`. `walls.asm`'s portal-stack section (`popLoop`, `pStk*`,
-  `visitedSec`) is deleted.
-
-The alternative — closing subsector polygons offline against BSP partition
-lines to synthesise a portal graph — keeps the engine unchanged but moves all
-the difficulty into Python, where it is *harder* to debug because the failure
-shows up as garbage on a C64 screen three layers away from the bug.
-
----
-
-## 4. Memory: where E1M1 actually goes
-
-E1M1's lumps, measured:
-
-| Lump | Entries | WAD bytes |
-|---|---|---|
-| VERTEXES | 467 | 1868 |
-| LINEDEFS | 475 | 6650 |
-| SIDEDEFS | 648 | 19440 |
-| SECTORS | 85 | 2210 |
-| SEGS | 732 | 8784 |
-| SSECTORS | 237 | 948 |
-| NODES | 236 | 6608 |
-| BLOCKMAP | — | 6922 |
-
-Free RAM in the current build is scarce, and now measured exactly (Phase 0 is
-done, see §8): `$0B60-$0FFF` (1184 B), `$9740-$98FF` (448 B, `TABLES_FREE`,
-which includes the reclaimed `rowLo`/`rowHi`) and `$CED4-$CFFF` (300 B) —
-**1932 bytes total.** Everything else is MATRIX, bitmaps, screens, tables and
-code.
-
-**One reclaim remains, and it is the big one:**
-
-1. **`$D000-$DFFF` is 4 KB of RAM under the I/O space** and nothing claims it.
-   `renderFrame` touches no I/O register, so it can run with `$01` bit 2
-   cleared and read the node table directly. `flip` and `readInput` bank I/O
-   back in. This is the single biggest free resource left in the machine.
-2. ~~`rowLo`/`rowHi` in `chunky2mc.asm` are dead; 352 B.~~ **Done** — deleted,
-   and the resulting `$9740-$98FF` is named `TABLES_FREE` in `defs.asm` with an
-   `.errorif` guarding it. The residency table below spends 984 B of the 1184 B
-   below MATRIX on SECTORS + SSECTORS, so these 448 B are where the seg staging
-   buffer, the BSP node/side stack and the collision scratch go — none of which
-   may live in `$0200-$03FF` (see `pipeline.md` §13.4).
-
-**Residency, as built** (frozen in `docs/reu-format.md`, which is authoritative):
-
-| Data | Packed form | Size | Lives at |
-|---|---|---|---|
-| NODES | 12 SoA arrays of 240 | 2880 B | `$D000` under I/O |
-| SECTORS | 6 SoA arrays of 96 | 576 B | `$DC00` under I/O |
-| MAPINFO | counts, root, spawn, SSECDATA base | 32 B | `$0E00` |
-| SSECDATA | `[segCount, sectorId, segs…]` in a 128 B slot per subsector | 30336 B | **REU**, streamed per subsector |
-
-Three changes from what this section originally proposed, all of them
-simplifications:
-
-- **There is no resident SSECTORS table.** It was to be 237 entries × 4 arrays
-  = 948 B of RAM plus a 16-bit multiply per subsector visit. Instead each
-  subsector owns a fixed 128-byte REU slot at `ssecReuBase + (i << 7)` holding
-  its seg count, its sector id and its segs. One shift, no multiply, no table —
-  30 KB of REU (which is free) traded for 948 B of RAM (which is not).
-- **Everything resident fits under `$D000`.** With SSECTORS gone, nodes and
-  sectors together are 3456 B of the 4 KB there, so the whole `$0BC6-$0DFF`
-  free block stays available for Phase 4's BSP stack. `MAXNODES = 240` and
-  `MAXSEC = 96` are round numbers chosen so the two blocks end at `$DEFF`,
-  one page short of the REU registers.
-- **BLOCKMAP and the collision linedefs are gone entirely** — see Phase 5.
-
-Node bounding boxes are still dropped at M1 (16 B/node saved). Without them the
-walk visits every node, relying on column occlusion for rejection — correct,
-just not maximally culled. Add them back in M2 if profiling says so.
-
-Per frame the engine DMAs one subsector slot per visit, in two transfers: 2
-bytes of header, then `segCount × 10`. At E1M1's mean of 3.09 segs that is 33
-bytes rather than the 82 a fixed-size slot fetch would cost, so ~40 visible
-subsectors is **~1.3 KB/frame ≈ 1.3 ms** of halted CPU at the measured
-1 byte/µs.
-
----
-
-## 5. The plan
-
-Six phases. Phases 0 and 1 are small and must come first — 0 because every
-later phase is verified through the same loop, 1 because it is the only
-unbounded unknown in the whole milestone.
-
-### Phase 0 — Make the verification loop trustworthy ✅ DONE (2026-08-09)
-
-Small, mechanical, unblocks everything. All four items landed; §8 is the
-session log with the details and the two surprises found along the way.
-
-1. ✅ **`make shot`'s exit code.** The recipe now ignores VICE's status (which
-   `-limitcycles` always makes non-zero) and asserts on the artifact instead.
-2. ✅ **`make check`** = build + `shot` + content assertion
-   (`tools/checkshot.py`) + `debug`. Green from a clean tree, and green four
-   runs back to back.
-3. ✅ **Stale status text** updated in `README.md`, `pipeline.md` (status
-   caveat, §12.2 memory map, §13 rewritten, §14), `design.md`,
-   `3d-renderer-design.md`, `data_structures.md`.
-4. ✅ **`rowLo`/`rowHi` reclaimed** → `TABLES_FREE` = `$9740-$98FF`, 448 B,
-   with an `.errorif` in `main.asm`.
-
-*Done when:* `make check` is green from a clean tree and its failure modes are
-understood. — **met.**
-
-### Phase 1 — Hardware truth (needs the U64) ✅ DONE (2026-08-09)
-
-Do this before writing a byte of REU-dependent engine code. The whole data
-layout in §4 rests on an assumption nobody has measured.
-
-1. ✅ **`tools/u64push.py`** — pushes the PRG over the **REST API**, not the
-   legacy TCP-64 command socket: `POST /v1/runners:run_prg` resets the
-   machine, DMAs the image in and starts it. `make run-u64` is wired, along
-   with `make u64-config` and `make u64-fps`. See §9.
-2. ✅ **REU image delivery is solved: FTP + REU Preload.** The Ultimate's FTP
-   service takes the `.reu` (anonymous login, `/Usb0/...`), and the config
-   items `REU Preload Image` / `REU Preload Offset` / `REU Preload` point the
-   machine at it; the image is loaded into REU RAM on the next reset, which
-   `run_prg` performs anyway. `u64push.py --reu` does all of it. Tested end to
-   end with a 64 KB pattern file. **Phase 3 is unblocked, and its output
-   format is just "the raw REU image", same as VICE's `-reuimage`.**
-   *Caveat:* that the file reaches the device and the setting arms is
-   verified; that the bytes land in REU RAM cannot be confirmed until Phase 2
-   has code that reads `$DF00`.
-3. ✅ **REU DMA benchmarked** — `make reubench`, and the answer is flat:
-   **exactly 1 byte/µs at every size, and it does not scale with the CPU
-   clock.** See §10.
-4. ✅ **Frame rate measured on real hardware: 50.1 fps, vsync-locked**, with
-   the speed sweep that proves turbo is engaged. `pipeline.md` §12.3 has the
-   table. Frame compute is 15-22 ms at 64 MHz — the test map is *at* the PAL
-   frame boundary, not comfortably inside it.
-
-*Done when:* `make run-u64` works, and `pipeline.md` gains a measured
-bytes-per-millisecond table and a real FPS number. — **FPS met; the
-bytes-per-millisecond table is item 3 and moves to Phase 2.**
-
-### Phase 2 — The REU layer ✅ DONE (2026-08-09)
-
-1. ✅ **`src/reu.asm`** — the `reuSet` macro fills `$DF02-$DF08`, a store to
-   `$DF01` fires the transfer, and `reuProbe` round-trips a signature through
-   REU address 0 at boot. `main.asm` records the verdict in `reuOK`.
-   *Deliberately not fatal yet:* nothing reads the REU, so refusing to run
-   would only break machines the engine currently works on. It becomes fatal
-   in Phase 4, when the map lives there.
-   `make check` now **asserts** `reuOK == 1` — see §10 for why that assertion
-   is not paranoia.
-2. ✅ **Boot-time resident load** — `src/mapload.asm`. Reads the 64-byte
-   header from REU offset 0, checks magic and version, then walks the block
-   descriptors and copies each resident block to its home. It checks the load
-   address in the image against `defs.asm` and the length against the space
-   reserved, and sums each block into `mapSum` as it copies.
-   Blocks cannot be DMA'd straight to `$D000` — with I/O banked in the transfer
-   would hit the registers, with it banked out `$DF01` is unreachable — so each
-   one is staged through MATRIX and block-copied under `BANK_RAM`.
-3. ✅ **I/O banking discipline** — `$01 = $35` is the engine's default state,
-   set once at boot; `$34` is entered only to touch the node and sector tables
-   and always restored. Both keep RAM at `$A000`/`$E000` where the bitmaps
-   live, so a bank switch never changes what a bitmap write does. Safe only
-   because interrupts are masked for the whole run. `docs/reu-format.md` §6.1.
-4. ✅ **Delivery to real hardware**, which turned out to be the hard part —
-   REU Preload does not work. See §11.
-
-*Done when:* the PRG loads a signature block from REU at boot, verifies its
-magic, and `make debug` is still clean. — **met, and then some**: all three
-resident blocks are verified byte-for-byte in VICE and by checksum on real
-hardware, `make check` asserts it, and `make u64-map` is the hardware
-equivalent.
-
-### Phase 3 — `tools/wad2reu.py` ✅ DONE (2026-08-09)
-
-The offline half. Emits `build/assets.reu` in the §4 layout, with a header
-carrying magic, version, and each block's REU offset and length. All five items
-below landed; the format is frozen in `docs/reu-format.md` and §11 has the
-numbers.
-
-1. Parse `VERTEXES`, `LINEDEFS`, `SIDEDEFS`, `SECTORS`, `SEGS`, `SSECTORS`,
-   `NODES`, `THINGS`, `BLOCKMAP` for E1M1.
-2. Pack to the on-device formats. Doom's coordinates fit signed 16-bit
-   directly — no rescaling, which keeps the existing projection math intact.
-   Sanity-check the largest intermediate against `ssmul32`'s range.
-3. **Texture name → ramp id mapping.** Flat shading still needs a ramp per
-   surface. A table in the tool maps texture/flat name families
-   (`STARTAN*`, `BROWN*`, `FLOOR4_*`, …) to the 16 ramps, with a default.
-   This is the art-direction knob for M1 and it lives in Python, not asm.
-4. Emit sector floor/ceiling bytes the same way.
-5. **Validation harness in the tool**: render the decoded blocks as a
-   top-down PNG and compare against a known-good E1M1 map image; assert the
-   BSP is well-formed (every child index resolves, every subsector's segs are
-   contiguous); byte-exact round-trip test.
-
-*Done when:* `make assets` produces a `.reu` whose top-down render is
-recognisably E1M1, with the validator green. — **met.** `build/assets-map.png`
-is unmistakably E1M1. `make assets` also emits `build/testmap.reu`, the
-3-sector map of `testmap.asm` run through a BSP builder in the same tool, which
-is Phase 4.4's input.
-
-### Phase 4 — The BSP renderer ✅ DONE (2026-08-09, §12)
-
-The core of the milestone. Do it in this order so each step is separately
-verifiable.
-
-1. **`src/render/bsp.asm`**: iterative BSP descent with an explicit
-   node/side stack. `pointOnSide` = sign of `dx*(py-y0) - dy*(px-x0)`, reusing
-   `ssmul32`.
-2. **Replace the occlusion model** in `walls.asm`: delete `zXL`/`zXR` and the
-   portal stack; a column is closed when `colTop[x] >= colBot[x]`; maintain
-   `openCols` and terminate the frame when it reaches zero.
-3. **Subsector rendering**: DMA the subsector's segs into a small RAM buffer
-   (64 B covers the common case; loop for larger), then `doWall` per seg.
-   One-sided seg → solid wall; two-sided → upper/lower steps against the back
-   sector's heights, exactly as the current portal path already does.
-4. **Keep testmap.asm working as a BSP** — have `wad2reu.py` also emit the
-   3-sector test map through the same pipeline. That gives a tiny,
-   hand-verifiable input for the new traversal before E1M1's 732 segs are
-   involved. This step is worth its cost twice over in debugging time.
-5. Switch to E1M1 and iterate.
-
-*Done when:* the E1M1 spawn view renders recognisably (the entry room, then
-the courtyard through the door opening), `make check` is green, and a scripted
-30-second walk under `make debug` reports zero unexpected writes.
-
-### Phase 5 — The player in E1M1 — 1-4 done, no sliding (§12)
-
-1. **Sector lookup** = BSP descent to a leaf → subsector → sector. Replaces
-   `checkSector`'s convex containment walk.
-2. **Collision against the destination subsector's segs, not BLOCKMAP.**
-   Descend the BSP with the destination point to find its subsector, then test
-   the move against that subsector's segs — which the renderer already streams,
-   in the format it already uses. Blocking = a one-sided seg, or a two-sided
-   one with a floor step > 24 units or headroom < 56. Keep the existing
-   undo-the-move response for M1 (no sliding).
-
-   This drops BLOCKMAP, LINEDEFS and SIDEDEFS from the image entirely — about
-   10 KB and a whole second geometry format to keep in sync — and it makes
-   `checkSector` a generalisation of what it already does rather than a rewrite:
-   subsectors are convex, so the existing sign-only cross product works
-   unchanged.
-
-   The one thing to get right: a subsector's boundary includes edges along BSP
-   partition lines that are **not** in `SEGS`, because those are interior
-   boundaries between subsectors, not walls. Not blocking there is the correct
-   behaviour, not a gap. What this shares with the current code is the
-   limitation in `pipeline.md` §5.3 — a single frame's motion crossing two
-   boundaries — and it wants the same fix, looping with an iteration cap.
-3. **Spawn** from `THINGS` type 1 (player 1 start) — position and angle —
-   instead of the `START_*` constants.
-4. **Eye height follows the floor**, including step up/down.
-
-*Done when:* you can walk from the E1M1 spawn, out the door, around the
-courtyard and back without leaking through a wall or falling through a floor.
-
-### Phase 6 — Milestone gate
-
-1. Measure frame time on the U64 with E1M1 loaded; record it against the
-   25 fps target in `pipeline.md` §12. Expect the two byte-per-pixel passes to
-   still dominate.
-2. `make run-u64` end to end, assets included.
-3. Documentation pass: `pipeline.md` §14's "grows next" table updated,
-   `data_structures.md` reconciled with the formats Phase 3 actually emitted.
-4. Tag the milestone.
-
-**1-3 are done (§16).** Measured 25.05 fps with 37.6 ms of compute against a
-39.90 ms deadline, `make u64-map` verifying all three resident blocks on the
-machine, and `make check` green. 4 is the user's call.
-
----
-
-## 6. Risks, in order of how much they could cost
-
-| # | Risk | Early warning | Response |
-|---|---|---|---|
-| 1 | ~~REU DMA is slow *and* doesn't scale with turbo~~ | Phase 1's benchmark | **Closed.** 1 byte/µs flat, no setup penalty, so per-subsector streaming needs no batching (§10). ~1.3 KB/frame = ~1.3 ms |
-| 2 | ~~No clean way to get a `.reu` image onto real hardware~~ | Phase 1.2 | **Closed the hard way.** REU Preload does not deliver on firmware 1.1.0; `src/reuload.asm` + `machine:writemem` does, and verifies every chunk (§11) |
-| 3 | 40+ visible subsectors per frame blows the frame budget where 3 sectors did not | First E1M1 frame in Phase 4 | **Arrived and answered.** E1M1 measured 17.6 fps on hardware (§13). Response was the designed one — streamed per-node bounds — plus a seg backface test the plan had not anticipated. Frame down 33%, subsectors visited 235 → 39 |
-| 4 | ~~`$D000-$DFFF` banking interacts badly with the converter or `flip`~~ | Phase 2.3, caught by `make debug` | **Closed.** The BSP walk banks RAM in and out per node and per sector read; `make debug` stays clean |
-| 5 | Flat shading over 85 sectors of real geometry looks like undifferentiated mush | First E1M1 frame | **Arrived, twice.** The start room's floor and ceiling landed on the same byte (fixed in the Python table, §12), and distance falloff turned out never to have worked at all (`sta` sets no flags — §12) |
-| 6 | The existing projection math has range bugs that three hand-built sectors never exercised | Phase 4.4's test map, then E1M1 | **Not seen.** `make debug` is clean on E1M1 and the projected rows match the arithmetic to the pixel (§12) |
-
----
-
-## 7. Sequencing note
-
-Phases 0 and 1 are each an afternoon. Phase 3 (the Python converter) and
-Phase 4 (the BSP renderer) are the bulk of the work and are the two that can
-proceed in parallel if you want them to — the interface between them is the
-§4 binary layout, which is worth freezing in writing before either starts.
-
-Phase 4 step 4 — running the existing 3-sector test map through the new
-BSP pipeline before touching E1M1 — is the highest-leverage item in this plan.
-It separates "the converter is wrong" from "the traversal is wrong", which is
-exactly the distinction that cost the last debugging session six hypotheses
-and a set of custom single-step tooling.
-
----
-
-## 8. Session log
-
-### 2026-08-09 — Phase 0
-
-**Changed:**
-
-| File | What |
-|---|---|
-| `Makefile` | `.DEFAULT_GOAL := all`; `shot` ignores VICE's status and asserts on the PNG; new `check` target; `debug` reaps the emulator and randomises the monitor port; `clean` takes `debug.log` |
-| `tools/checkshot.py` | new — asserts the 320×176 viewport is ≥30% non-black and has ≥3 colours |
-| `tools/vicedbg/probe.py` | `connect()` retries for 30 s instead of the Makefile guessing with `sleep 4`; missing monitor now reports itself instead of a traceback |
-| `src/render/chunky2mc.asm` | `rowLo`/`rowHi` deleted, `tablesEnd` label added |
-| `src/defs.asm`, `src/main.asm` | `TABLES_FREE` = `$9740-$98FF` (448 B) + `.errorif`; header map updated |
-| `README.md`, `pipeline.md`, `design.md`, `3d-renderer-design.md`, `data_structures.md` | status text, memory maps, §13 rewritten around what is now enforced |
-
-**Two things worth knowing before touching the harness again.** Both cost real
-time to find and neither is visible from the code:
-
-1. **`make debug` was flaky ~50% of the time, and it lied when it failed.**
-   x64sc binds the binary-monitor port without `SO_REUSEADDR`, so the previous
-   run's closed connection sits in `TIME-WAIT` on 127.0.0.1:6510 for ~60 s and
-   the next VICE **fails to bind silently** — it boots, autostarts, runs the
-   engine normally, and simply has no monitor. `probe.py` then reports
-   connection-refused, which reads exactly like "the emulator did not start".
-   The port is randomised per run now (`ifndef MONPORT`). If this ever recurs,
-   check `ss -tan | grep <port>` before suspecting anything in `src/`.
-2. **A leaked emulator hangs any `make debug | …` pipeline**, because the
-   background `x64sc` keeps the recipe's stdout open. The recipe reaps it by
-   PID *and* by `pkill -P` (under `xvfb-run` the PID is xvfb-run, which does
-   not pass the kill on). Matching on the command line instead is a trap: the
-   recipe's own shell has the whole recipe text in its argv, so `pkill -f`
-   kills the recipe.
-
-**Measured, for the record:** the known-good test-map frame is 64.4% non-black
-in 4 colours. `make check` end to end takes ~11 s on this machine (~5 s of it
-`shot`, ~6 s `debug`, which is dominated by `probe.py`'s 8 s settle minus
-overlap). A clean-tree `make check` was run four times consecutively: green
-each time, no stray `x64sc`/`Xvfb` left behind.
-
-**Deliberately not done:**
-
-- The A/D turn-direction defect (`pipeline.md` §3) is *now testable* — the
-  build renders — but needs a human at `make run` or scripted key injection.
-  Left open; it is a one-line fix in either `input.asm` or `transformPoint` and
-  picking the wrong one hides the bug rather than fixing it.
-- The four-byte gap between the math tables (`$CA2C`) and `WALLSCODE`
-  (`$CA30`) still has no `.errorif`. Worth adding when `WALLSCODE` next moves.
-
-## 9. Session log — 2026-08-09, Phase 1
-
-### The machine
-
-**C64 Ultimate at `192.168.1.65`** — product string "C64 Ultimate", firmware
-1.1.0, FPGA 122, core 1.49, hostname `C64-Ultimate-3D82C5`. It does **not**
-advertise itself over mDNS, so `U64_HOST` in the `Makefile` is an IP, not a
-name. To find it again: `curl -s -m2 http://<ip>/v1/info` across the subnet —
-the Ultimate is the host that answers with a JSON `product` field.
-
-Everything is driven through the **REST API** (firmware ≥ 3.11), documented at
-`1541u-documentation.readthedocs.io/en/latest/api/api_calls.html`. That turned
-out to be far more capable than the TCP-64 command socket the old plan assumed:
-besides `runners:run_prg`, it offers `machine:readmem` / `machine:writemem`
-(DMA, no cooperation from the running program) and full read/write access to
-the configuration menu. Those three are what made the rest of this session
-possible.
-
-### Machine configuration is a build dependency, not a setup step
-
-The engine picks its CPU speed by writing `$D031`. That register **only exists
-when the machine's Turbo Control is set to "C64U Turbo Registers"**; in any
-other mode it reads `$FF`, the write is discarded, and the engine runs at 1 MHz
-with nothing to indicate it. This bit us immediately: the setting had reverted
-to `Off` between two runs an hour apart.
-
-So it is applied and verified from the build, by `make u64-config`, which
-`run-u64` and `u64-fps` depend on:
-
-| Setting | Value | Why |
-|---|---|---|
-| Turbo Control | `C64U Turbo Registers` | the only mode that takes the speed from the menu *and* lets `$D031` change it |
-| CPU Speed | `64` | speed index 15 on this machine |
-| Badline Timing | `Enabled` | keeps C64-compatible bus timing; the VIC has priority either way |
-| SuperCPU Detect (D0BC) | `Disabled` | nothing probes `$D0BC` |
-
-Now also saved to the Ultimate's flash, so it survives a power cycle.
-
-**Turbo must be toggled, not set.** Writing the target speed to `$D031` after a
-reset does not engage it; the register has to be walked down to 1 MHz and back
-up. `turboOn` in `main.asm` does exactly that, unconditionally, for six cycles.
-
-`$D031` is an unconnected VIC mirror on a stock C64 (`$31 mod $40 = 49`, past
-the last real register at `$2e`), so all of this is inert in VICE and `make
-check` is unaffected.
-
-### What the hardware said
-
-- **50.1 fps, PAL vsync-locked**, test map. The full speed sweep is in
-  `pipeline.md` §12.3. 1 MHz gives 0.83 fps, which is the control proving turbo
-  is genuinely on.
-- **Frame compute is 15-22 ms at 64 MHz** — bracketed from the 10 MHz and
-  24 MHz rows, which are quantised to the same 20 ms grid. The test map is
-  *at* the frame boundary, not inside it. §12.1's ~994k cycle estimate was low
-  by about a third.
-- **There is a ~1 s startup transient** after `run_prg` during which frames are
-  dropped — the Ultimate is still finishing its own post-reset housekeeping. A
-  0-5 s window reads 37.8 fps; every window after reads exactly 50.00.
-  `u64push.py` discards it. Any future benchmark must too, or it will report a
-  20% deficit that is not the engine's.
-
-### Two bugs the session found in passing
-
-1. **The main segment had three bytes of headroom and no guard.** It ended at
-   `$0B1C`; `pStkSec` was at `$0B20`. Adding strafing pushed it to `$0BC5`,
-   straight through the portal stack. The stack moved to `$0F00` and
-   `main.asm` now carries `.errorif * > pStkSec`. `tools/vicedbg/probe.py`'s
-   allowed-region table had to move with it — worth remembering that the
-   probe's table is a second, independent copy of the memory map.
-2. **The A/D turn-direction defect was real** and is fixed — see
-   `pipeline.md` §3. It was resolved by looking at the machine rather than by
-   argument, which mattered: the competing fix would have mirrored the world.
-
-### `tools/u64shot.py` — screenshots from real hardware
-
-`machine:readmem` will DMA out the whole 28160-byte MATRIX in about a second,
-and the chunky format is trivially renderable off-device, so hardware frames
-can now be looked at without a capture card or the U64 video stream. It takes
-`--cam X,Y,A` to place the camera first, which makes it a scripted turntable.
-This is what settled the A/D question and it is the obvious way to check the
-first E1M1 frame in Phase 4.
-
-It renders the *chunky* buffer, i.e. the renderer's output before `chunky2mc`
-packs it — so it shows what the 3D code drew, not what the VIC displays.
-Attribute artefacts will not show up in it; wrong geometry will.
-
-A companion trick worth keeping: `machine:writemem` can patch the running
-engine. Overwriting `readInput` with `lda #bit / sta zInput / rts` forces a
-single intent bit, which is how all six directions were verified on hardware
-without anyone touching the keyboard.
-
----
-
-## 10. Session log — 2026-08-09, Phase 2 (partial)
-
-### REU DMA: 1 byte/µs, flat, and independent of the CPU clock
-
-`make reubench` builds `src/reubench.asm`, runs it on hardware and DMA-reads
-the results back. It times N back-to-back transfers with CIA 2 timer A — which
-keeps ticking at 1 MHz while the REU has the 6510 halted, and does not care
-about the turbo setting — then times the identical loop with the command store
-neutered and subtracts. Measured:
-
-| Size | 1 MHz | 64 MHz | µs/transfer | Rate |
-|---:|---:|---:|---:|---:|
-| 32 B | 4173 µs / 128 | 4096 µs / 128 | 32.0 | 1.00 B/µs |
-| 256 B | 8192 µs / 32 | 8192 µs / 32 | 256.0 | 1.00 B/µs |
-| 4096 B | 16384 µs / 4 | 16384 µs / 4 | 4096.0 | 1.00 B/µs |
-
-Three things fall out of this, in increasing order of how much they matter:
-
-1. **DMA does not scale with the turbo clock.** 64 MHz is 1.00× the 1 MHz
-   rate. This closes the open item in `3d-renderer-design.md` §REU usage.
-2. **There is no per-transfer setup penalty.** 32 bytes costs 32 µs, not
-   32 µs plus a fixed overhead — the cost is exactly linear in size down to
-   the smallest transfer measured. So §4's per-subsector streaming does *not*
-   need to be batched per node subtree. That contingency can be dropped.
-3. **REU DMA is far too slow to use as a memset.** `pipeline.md` §9.3 floats
-   filling spans by DMA instead of by CPU stores. At 64 MHz the CPU writes a
-   span byte every ~11 cycles = 0.17 µs; DMA takes 1.00 µs. **DMA fill would
-   be about 6× slower**, and it halts the CPU while it runs. That idea is
-   dead, and the note should stop suggesting it.
-
-The cost of the actual plan: ~1.2 KB/frame of seg streaming = **~1.2 ms per
-frame of halted CPU**. Against a 20 ms PAL frame that is 6% — affordable in
-isolation, but the test map already occupies 15-22 ms (§9), so it comes
-straight out of a budget that has no slack. Worth remembering when Phase 4's
-first E1M1 frame is slower than expected.
-
-### `-default` had been switching the REU off for the whole life of the project
-
-`reuProbe` failed in VICE while succeeding on hardware. The cause was the
-`x64sc` command line: `-reu -reusize 16384 ... -default`. **`-default` resets
-every setting to its factory value, including the REU enable**, and it was
-sitting after `-reu`. So no VICE run this project has ever made had an REU
-attached — and `-reuimage`, which Phase 3 was going to rely on for the whole
-inner development loop, would have been silently ignored too.
-
-Nothing indicates this from inside the C64: with no REU, `$DF00-$DF0A` read
-back `$00` (not `$FF`), stores go nowhere, and every transfer "succeeds"
-instantly. It is a perfectly silent failure, which is exactly why the fix is
-paired with an assertion rather than just a reordering: `tools/vicedbg/probe.py`
-now reads `reuOK` and `make check` fails if it is not 1.
-
-The general lesson, which cost a Makefile comment: **`-default` must come first
-on VICE's command line, before any setting it would otherwise undo.**
-
-### Next session: Phase 3 (`tools/wad2reu.py`)
-
-Everything it needed is now settled. The delivery format is a raw `.reu`
-image, identical for hardware (FTP + REU Preload) and for VICE
-(`-reuimage`, which now actually works). The transport cost is known and
-linear, so the §4 packing can be taken at face value. It is pure Python,
-verifiable by its own top-down PNG render, and needs no hardware.
-
-Phase 2's remaining two items (resident load, `$D000` banking) are blocked
-behind it and should follow immediately after.
-
----
-
-## 11. Session log — 2026-08-09, Phases 3 and 2 (completed)
-
-Phase 3 in full, then Phase 2's two blocked items, then the hardware
-verification that the whole delivery path actually works. `make check` is green
-and `make u64-map` passes on the C64 Ultimate.
-
-### What was decided before any code
-
-Four questions, answered up front because each one changes what gets built:
-
-| Question | Answer |
-|---|---|
-| Freeze the format first? | Yes — `docs/reu-format.md`, written before either half |
-| Emit the test map through the same pipeline? | Yes — `make assets` produces `build/testmap.reu` too |
-| Collision: BLOCKMAP or the BSP's own segs? | **Segs.** Drops ~10 KB and a second geometry format (Phase 5.2) |
-| Who picks the texture → ramp mapping? | Proposed in `RAMPS` at the top of `wad2reu.py`, yours to tweak |
-
-### `tools/wad2reu.py`
-
-E1M1, measured: 467 vertices, 475 linedefs, 85 sectors, 732 segs, 237
-subsectors, 236 nodes (root 235). Subsector seg ranges are contiguous and in
-order; the largest subsector has 8 segs; coordinates span x −768…3808,
-y −4864…−2048, so nothing needs rescaling and the projection math in
-`pipeline.md` §8 carries over untouched. Spawn is `(1056, −3616)` facing 90°,
-which is `camA = 64` in the engine's 8-bit angle space, in subsector 103 of
-sector 38.
-
-All 32 of E1M1's wall textures and all 24 flats are mapped to ramps by name
-family; nothing falls through to the default. Flat intensity comes from the
-sector's WAD light level mapped to 2…15 — a deliberate small step past M1's
-"no lighting from WAD light levels" exclusion, because the intensity nibble has
-to hold *something* and a constant flattens all 85 sectors into one brightness.
-
-The test map goes through a BSP builder in the same file: 14 linedefs → 16 segs
-→ 3 subsectors, 2 nodes, no splits. That the three convex sectors come out as
-exactly three leaves is the expected answer and a useful sanity check on the
-builder.
-
-Validation re-parses the finished image with a reader that shares no code with
-the packers, and checks the descent the engine will do against the one Python
-does. `build/assets-map.png` is a top-down render of the *decoded* blocks — it
-is unmistakably E1M1, which is the check that no structural assertion can make.
-
-### Three silent failures, found in a row
-
-Each one lets every REU read "succeed" and return the wrong bytes. That shape is
-now familiar enough to be the design assumption: **nothing on this path may be
-believed without an assertion.**
-
-1. **`reuProbe` was overwriting the header it was about to verify.** It
-   round-trips a signature through REU address 0, which is where the image's
-   magic lives, and it runs first. Moved to `$00F000`; `wad2reu.py` asserts the
-   image stays below that.
-
-   Bank 1 offset 0 was the first fix and had to be abandoned: with `$DF06 = 1`
-   the Ultimate stashed to REU `$000000` anyway, which VICE does not do.
-
-2. **VICE silently ignores a `-reuimage` whose size is not exactly the emulated
-   REU size.** It prints one line to stderr and boots with a zeroed REU. Images
-   are now padded to 128 KB and the Makefile runs `-reusize 128`; raise the two
-   together or neither. `+reuimagerw` also stops VICE writing the image back on
-   exit and stamping runtime state into a build artifact.
-
-3. **The Ultimate's REU Preload does not deliver the image** on firmware 1.1.0 /
-   FPGA 122 / core 1.49. The file uploads over FTP at the right size, all three
-   settings arm and read back correct, and REU offset 0 keeps whatever a running
-   program last wrote there, across any number of resets. Tried and did not
-   help: re-running with the setting already armed, `save_config_to_flash` plus
-   an explicit reset, toggling `RAM Expansion Unit` off and on, toggling
-   `REU Preload` off and on, and matching `REU Size` to the image size in case
-   preload wants an exact fit the way VICE does.
-
-   This is the answer to Phase 1.2's caveat — *"that the bytes land in REU RAM
-   cannot be confirmed until Phase 2 has code that reads `$DF00`"* — and the
-   answer is that they did not.
-
-### `src/reuload.asm` — the delivery that does work
-
-A standalone PRG with an 8-byte mailbox at `$0340`. The host DMAs a chunk into
-C64 RAM with `machine:writemem` and writes the mailbox in one call; the trigger
-byte is **last** in the mailbox, so the stub cannot see it before the parameters
-it describes. `tools/u64push.py` drives it in 16 KB chunks and reads every chunk
-back with a matching REU fetch before moving on. E1M1's 34688 used bytes take
-three chunks and a few seconds.
-
-The REU itself was never the problem — writes from the C64 persist across
-resets, which is exactly how the stale bytes were identified.
-
-### Verification, on both machines
-
-| | VICE (`make check`) | Ultimate (`make u64-map`) |
-|---|---|---|
-| MAPINFO `$0E00` +32 | byte-exact | byte-exact, sum `$06D2` |
-| NODES `$D000` +2880 | byte-exact | sum `$44FA` |
-| SECTORS `$DC00` +576 | byte-exact | sum `$9F92` |
-
-The two blocks under `$D000` cannot be read back from a host at all: the
-Ultimate's `machine:readmem` DMAs the bus as the engine has it banked, so a read
-of `$D000` returns the I/O registers. `mapload.asm` therefore sums each block
-into `mapSum` while it copies, under `BANK_RAM`, which is the only view of that
-RAM anything outside the engine can get. The sums agree with the image on both
-machines and with each other.
-
-`make u64-fps` still reports **50.01 fps**, so none of this costs a frame.
-
-### Two things to know before touching this again
-
-- **The main segment now ends at `$0DC6`, 58 bytes below `MAPINFO`.**
-  `main.asm`'s `.errorif` was checking against the portal stack at `$0F00`,
-  which no longer bounds anything; it checks `MAPINFO` now. Phase 4 gets about
-  250 B back by deleting `testmap.asm` and the portal stack.
-- **The memory map now has four independent copies**: `defs.asm`, the image's
-  own load-address bytes, `probe.py`'s allowed-region table, and
-  `docs/reu-format.md`. The first two are cross-checked at boot and the third
-  fails `make check` when it drifts. The document is the one nothing enforces.
-
-### Next session: Phase 4
-
-Everything it needs exists. `build/testmap.reu` is the input to bring the BSP
-walk up on before E1M1, `pointOnSide` is `checkSector`'s existing sign-only
-cross product with the wall delta swapped for the node delta, and MAPINFO
-carries a precomputed spawn subsector for the engine's first descent to check
-itself against. *(Done — §12.)*
-
----
-
-## 12. Session log — 2026-08-09, Phases 4 and 5
-
-Phase 4 in full, plus the parts of Phase 5 that deleting `testmap.asm` forces:
-with the hand-built map gone, `checkSector` has no arrays to walk and the
-spawn constants have nothing to mean.
-
-**The engine renders and walks E1M1.** `make check` is green, and the frame is
-the start room — ceiling, floor, the wall band, and the opening through it.
-
-### What landed
-
-| File | Change |
-|---|---|
-| `src/render/bsp.asm` | **new.** `renderFrame` (column reset + trig + the descent), `renderSsec`, `ssecFetch`, `secFront`/`secBack`, `setEyeZ`, `nodeStep`/`sideOf`, `bspFindSsec` |
-| `src/render/walls.asm` | `renderFrame`/`renderSector` deleted; `doWall` reads `SEGBUF` instead of the assembled wall arrays; the `[zXL,zXR]` window became a clamp to `[0,159]`; `openCols` accounting; the portal push at the end is gone |
-| `src/input.asm` | `checkSector` → `checkMove`: subsector segs, step/headroom test, `segNear`/`padClass` |
-| `src/main.asm` | spawns from `MAPINFO`; a rejected image is now fatal (`mapHalt`, `mapErr` in the border) |
-| `src/testmap.asm` | **deleted.** Its geometry lives in `wad2reu.py`'s `TEST` map and reaches the engine as a `.reu` like any other |
-| `tools/wad2reu.py` | ceilings darkened `CEIL_DARKEN` steps below floors |
-| `Makefile` | `REUIMG` is overridable, so `make shot REUIMG=build/testmap.reu` runs the whole engine on the 3-sector map |
-
-### Bringing it up on the test map first was worth it twice
-
-Phase 4.4 (`IMPLEMENTATION_PLAN.md` §7 called it the highest-leverage item in
-this plan) found both bugs before E1M1's 732 segs could hide them. The
-3-sector map through the BSP pipeline renders exactly what the arithmetic
-predicts, column for column:
-
-```
-col  10: 0-21:02  21-100:68  100-176:45      ceiling / east wall / moss floor
-col  80: 0-21:02  21-54:68  54-71:12  71-90:22  90-93:13  93-100:68 100-176:45
-```
-
-Column 80 is the doorway: room A's wall above the opening, corridor B's
-ceiling, room C's far wall, corridor B's floor, room A's wall below. Rows 21
-and 100 are where `88 - dz*160/ry` puts them for `ry = 513`, which is the
-distance to the east wall.
-
-### Three bugs, one of them years old
-
-1. **Depth shading has never worked.** `walls.asm` computed `(ry0+ry1)>>7`
-   into `A:zNum`, stored `A`, and branched on the result — but `sta` sets no
-   flags, so the `bne` was testing the last `ror zNum` instead. Every wall
-   beyond 128 units took the "too far" path and came out at the minimum
-   intensity. It is a one-instruction fix (`tax`) and it is the difference
-   between a flat frame and a lit one. This predates Phase 4 entirely.
-
-2. **Collinear segs broke collision.** Containment across a *line* is not the
-   same as crossing a *seg*, and a subsector whose boundary contains two
-   collinear segs blocks on whichever comes first in the slot. E1M1's start
-   room exit is exactly that shape: subsector 105's edge at `y = -3104` is a
-   two-sided seg from `x` 928 to 1184 and a solid one from 1184 to 1216, the
-   solid one is listed first, and the player walks into it from 250 units
-   away and stops in an open doorway. `segNear` fixes it with a bounding-box
-   test inflated by the player radius — exact for an axis-aligned seg, which
-   is nearly all of them, conservative for a diagonal.
-
-3. **Ceiling and floor rendered identically** in the start room: both flats
-   land on the stone ramp at intensity 9, so the room read as one grey field
-   with a wall floating in it. That is risk #5 arriving on schedule. Fixed in
-   the Python table, where the plan said it would be.
-
-### Frame time: risk #3 has arrived
-
-Measured in VICE at 1 MHz, which is the only comparison available without the
-hardware in front of you:
-
-| Map | Frame time at 1 MHz | Relative |
-|---|---|---|
-| Test map (3 sectors, 16 segs) | 1.25 s | 1.0 |
-| E1M1 spawn view | 4.0 s | **3.2** |
-
-The test map runs vsync-locked at 50.01 fps on the U64 (§9), so it has unknown
-headroom; E1M1 at 3.2x its cost extrapolates to roughly **12-16 fps** against
-the 25 fps target in `pipeline.md` §12. **This wants measuring on hardware
-with `make u64-fps` before anything is optimised** — the extrapolation assumes
-the cost scales with the turbo clock, and REU DMA does not.
-
-An occlusion early-out was added to `doWall`: before the twelve divisions that
-projection and `lineSetup` cost, scan `[zC0,zC1]` and return if every column is
-already closed. It measured no gain in the spawn view (4.0 s either way), which
-says the cost is *upstream* of it — in the two `transformPoint` calls and two
-`projSX` divisions every seg pays before its column range is even known, times
-however many subsectors the walk visits before `openCols` hits zero.
-
-So the answer is the one risk #3 named: **reject nodes by bounding box**. The
-twist is that the plan assumed the bbox would have to be resident, and there
-are only 384 free bytes under the I/O space against the 944 that 236 quantised
-boxes need. It should be *streamed* instead — 4 bytes fetched per node visit,
-in a new block. At 1 byte/µs that is under a millisecond per frame, and it is
-the same two-transfer pattern `ssecFetch` already uses.
-
-### What Phase 5 still owes
-
-- **No sliding along walls.** A blocked move is undone whole, as M1 specifies,
-  and in E1M1 that means walking into a wall at a shallow angle stops you dead
-  rather than sliding along it. It is the single biggest thing between "walks"
-  and "walks *well*".
-- **One boundary per frame.** `pipeline.md` §5.3's limitation, inherited
-  unchanged: a frame's motion crossing two subsector boundaries is only tested
-  against the first. The fix is the same loop-with-a-cap it always was.
-
-### How the walk was tested
-
-`checkMove` only runs when a movement key is down, and `readInput` rebuilds
-`zInput` from the CIA every frame, so a host cannot simply poke the camera and
-learn anything. The scratch harness sets a checkpoint at `movePlayer`, waits
-for the monitor's stop message, writes `zInput`, and resumes — which drives the
-real input path. Waiting for the stop message rather than sleeping matters:
-with a sleep, nine injections in ten land while the CPU is still running and
-are overwritten by the next `readInput`.
-
-From the spawn, forward: sector 38 → 37 → 39 → 38, eye height 41 → 33 → 25 →
-41 as the floor steps down and back up, and a hard stop at `y = -2888`, which
-is the solid part of the wall at `y = -2880`; the opening in that wall is at
-`x` 1216-1344 and the player was at 1056. That is the collision model working,
-not failing.
-
-
----
-
-## 13. Session log — 2026-08-10, frame time
-
-Phase 5's open item was frame time, and hardware had finally measured it:
-**352 frames in 20.04 s = 17.57 fps, 56.9 ms/frame** on a C64 Ultimate at
-64 MHz. Playable at the low end, but under the 25 fps target — and *over* it in
-simple views, where the engine ran at 50 fps and moved the player twice as fast
-as it did in complex ones, because everything that moves is per-frame.
-
-Three things came out of this session: a frame cap, a seg backface test, and
-bounding-sphere rejection of BSP subtrees. The frame went **3888 → 2589 ms** in
-VICE, a third, and by the ratio that held for the 56.9 ms hardware reading that
-is roughly **46 ms/frame ≈ 22 fps**. Hardware confirmation is the next session's
-first job.
-
-### The instrumentation came first, and it was right to
-
-§12 closed with a plan: reject nodes by bounding box, because `doWall`'s
-occlusion early-out had measured no gain and the cost was therefore upstream of
-it. That reasoning was sound but the conclusion was only half right, and there
-was no counter in the engine that could have said which half.
-
-So the first thing built was nine free-running 24-bit counters
-(`INSTRUMENT = 1` in `src/instrument.asm`, 27 bytes at the tail of
-`TABLES_FREE`) and
-`tools/vicedbg/stats.py` to read them over the VICE binary monitor. They are
-never reset, so a host divides two readings by the `frameCnt` delta between
-them and gets per-frame averages without having to catch a frame boundary.
-
-The spawn frame, before any change:
-
-| | per frame |
-|---|---:|
-| nodes descended | 234 |
-| subsectors drawn | 235 |
-| segs considered | 725 |
-| — rejected: near plane | 27.6 |
-| — rejected: off screen or backfacing | 92.2 |
-| — rejected: already occluded | 16.7 |
-| span pixels written | 28382 |
-
-Two facts in that table overturned the plan's assumption. **There is no
-overdraw**: 28382 span pixels against a 28160-pixel screen. And of 725 segs,
-**219 — 69% — were rejected as back-facing**, each after two `transformPoint`
-calls and two `projSX` divisions, because `doWall`'s backface test is
-`sx0 < sx1` and needs both endpoints projected before it can compare them.
-
-The frame was almost entirely geometry front-end, and the single biggest waste
-was not un-culled subtrees at all.
-
-### Fix 1 — the seg backface test in world space
-
-Facing is a world-space property and needs no projection:
-
-```
-cross = dx*(camY - y0) - dy*(camX - x0)
-```
-
-is Doom's `R_PointOnSide` with the seg standing in for the partition line, and
-`cross < 0` means the camera is on the seg's right, which is where its front
-sector is by the winding rule. Two `ssmul32` calls, no divisions — and it is the
-same arithmetic `sideOf` already runs on nodes.
-
-`doWall`'s own test stays. It costs nothing that is not already paid by then,
-and it still catches what this one cannot see: a seg that faces the camera but
-lands entirely off the side of the screen.
-
-**3888 → 3191 ms/frame, 18%.** Verified pixel-identical against a stashed
-baseline: 0 of 104448 pixels differ.
-
-One bug on the way, worth recording because it is a whole class: `segFacing`
-runs through `ssmul32` → `mul8`, which clobbers X, and `doWall` needs X as the
-seg's byte offset. The fix is `ldx zWIdx` after the call and *before* the
-`bcs` — `ldx` does not touch carry.
-
-### Fix 2 — bounding spheres, not boxes
-
-The plan said quantised bbox, 4 B/node, streamed. What was built is a
-**bounding sphere**: centre x, centre y, radius, 6 bytes, streamed as block 4
-(`NODESPH`) with an 8-byte stride so the record offset is `index << 3` rather
-than a multiply. Format version 2. The same record is also inlined into every
-subsector slot header, which is why that header grew from 2 bytes to 8.
-
-A sphere over a box, because a box is 8 bytes of payload against 6 and its
-frustum test is four compares against three — and a *node's* bound is loose
-anyway, since it wraps a whole subtree, so the extra tightness buys much less
-than the arithmetic costs.
-
-The test itself is deliberately *not* the exact sphere test. At 90° the frustum
-planes are `rx = ±ry`, whose normals carry a `1/sqrt(2)`. Treating the sphere as
-the axis-aligned camera-space box `[rx±r] × [ry±r]` needs no such factor: the
-box contains the sphere, the test stays conservative, and all three compares are
-16-bit adds and subtracts.
-
-```
-ryMax < 0              -> behind the eye
-ryMax < rxMin          -> off the right edge
-rxMax + ryMax < 0      -> off the left edge
-```
-
-It hooks in at two places: `bspLoop` rejects a whole subtree before descending,
-and `renderSsec` rejects a subsector after its 8-byte header arrives but
-**before** the second transfer fetches a single seg — which is the second
-reason the two-transfer split earns its keep.
-
-**3191 → 2589 ms/frame.** Again pixel-identical, verified by building with
-`sphereVisible` stubbed to `sec / rts`: 0 of 104448 pixels differ.
-
-| | before | after |
-|---|---:|---:|
-| nodes descended | 234 | **71.7** |
-| subsectors drawn | 235 | **39.3** |
-| segs considered | 725 | **122.1** |
-| — skipped: backfacing | — | 53.6 |
-| — rejected: off screen | 92.2 | 15.2 |
-| — rejected: near plane | 27.6 | 4.0 |
-| subtrees sphere-culled | — | 10.2 |
-| subsectors sphere-culled | — | 10.1 |
-
-Ten rejected subtrees is what removes 162 node descents: rejecting a node
-removes everything below it.
-
-The validator earns a mention. `wad2reu.py --validate` now checks that **every
-sphere contains every seg endpoint below it**, walking the packed tree
-recursively. A bound short by one unit does not crash — it deletes geometry from
-some camera angles and not others, which is the hardest kind of bug to see in a
-rendered frame and the easiest to assert offline.
-
-### Fix 3 — the 25 fps cap
-
-`flip` syncs to raster line 251, so the frame rate is quantised to `50/n`.
-Without a cap a simple view ran at 50 and a complex one at 25, and the player
-moved at two different speeds.
-
-`framePace` holds each frame to at least `FPS_CAP_TICKS = 39` milliseconds before
-handing over to `flip`. The threshold is *just under* two PAL frames
-(2 × 19.95 = 39.9 ms): set it to 40 and every frame would miss the line-251
-crossing by 0.1 ms and cost a third raster frame — 16.7 fps instead of 25.
-
-The clock is CIA2's Timer B cascaded off a Timer A running at 1000 phi2 cycles,
-i.e. a 16-bit millisecond counter running *down* from `$FFFF` and wrapping every
-65.5 s. CIA phi2 stays 1 MHz whatever the CPU is doing, which is the point: the
-raster only says "somewhere in this 20 ms frame", and the CPU clock is 1 MHz in
-VICE and 64 MHz on the Ultimate. `sei` does not mask NMI and CIA2 is the C64's
-NMI source, hence `lda #$7f / sta $DD0D` in `msInit`.
-
-That last claim looked like the session's one open hardware question, and it
-turned out to have been answered in Phase 2. **`reubench` already proves the
-CIA timebase is turbo-invariant** (§10): it timed DMA with CIA2 Timer A and
-reported the same tick counts at 1 MHz and at 64 MHz — 4096 B in 16384 ticks
-per 4 transfers, both passes. Had the CIA scaled with the CPU, the 64 MHz pass
-would have counted 64x as many ticks and overflowed the 16-bit timer into
-garbage. It did not.
-
-What that argument does *not* close is the absolute rate: it calibrates the CIA
-against the REU's assumed 1 byte/µs, which is the same constant it was
-measuring. So `u64push.py --fps` now reads `$DD06/$DD07` alongside `frameCnt`
-and prints CIA milliseconds against the **host's** wall clock — a calibration
-that leans on nothing inside the machine. `make u64-fps` reports it as a
-`cia: ... x` line, and a ratio outside 0.95-1.05 means `FPS_CAP_TICKS` is wrong by
-exactly that factor.
-
-### Where the RAM came from
-
-There was no free block below MATRIX big enough for any of this, so the sphere
-test lands in three pieces and the backface test in a fourth, each in whatever
-hole existed:
-
-| | | |
-|---|---|---|
-| `$0DBC-$0DFF` | `sphereTest` | the main segment's last headroom |
-| `$0E20-$0E5C` | `nodeSphere` | `MAPHDR`'s old home — it stages inside MATRIX now |
-| `$0F51-$0FC3` | `segFacing` | between the BSP stack and MATRIX |
-| `$0FC4-$0FF1` | `sphereVisible` | the rest of that gap |
-
-`$0200-$07FF` and the stack page look free and are not: the PRG loads from
-`$0801`. `sphereTest` now starts exactly one byte above where the main segment
-ends, and `BSPCODE` moved down to `$CE08` — the alignment slack between `doWall`
-and the traversal — to fit the node hook. Every block is bounded by an
-`.errorif` against what follows it, so the next thing that grows fails the build
-by name rather than by symptom. **There is no low-RAM headroom left.**
-
-Three bytes came back from chaining `nodeSphere` into `sphereVisible` rather
-than calling both: they are never wanted apart.
-
-
-
-### Confirmed on hardware
-
-```
-fps: 223 frames in 10.05 s = 22.19 fps (45.1 ms/frame)
-cia: 9871 CIA ms in 10049 host ms = 0.982 x
-```
-
-**17.57 → 22.19 fps.** Both questions the session left open are answered.
-
-**The CIA timebase is real, and PAL's, not 1 MHz.** 0.982 is not 1.000 and was
-never going to be: PAL phi2 is 985248 Hz, so a Timer A latch of 1000 underflows
-every **1.015 ms**, predicting 0.985. Measured 0.982 — 0.3% below, which is
-host-side network jitter on a 10 s window. So the clock is turbo-invariant
-*and* absolutely calibrated, and `reubench`'s indirect argument (§10) holds.
-
-That has a consequence the code did not state. `FPS_CAP_MS` counted ticks, not
-milliseconds, and 39 ticks is 39.58 ms rather than 39. The constant is now
-`FPS_CAP_TICKS`, and 39 turns out to be not merely a good value but the
-**maximum**:
-
-| ticks | real | vs two PAL frames (39.90 ms) |
-|---:|---:|---|
-| 39 | 39.58 ms | fits — lands on the second line-251 crossing |
-| 40 | 40.60 ms | misses it, costs a third raster frame → 16.7 fps |
-
-39.58 ms is already the worst case: `msLast` is captured mid-tick, so the
-counter reaches 39 somewhere between 38 and 39 whole ticks later, never more.
-
-**The frame time reconciles exactly, and the reconciliation is the useful
-part.** VICE predicted 56.9 × 2589/3888 = **37.9 ms of compute**. Delivered is
-45.1. The gap is not error — it is `flip`'s raster quantisation. Frame time can
-only be a multiple of 19.95 ms, and 45.1 decomposes as
-
-    39.90 ms x 74%  +  59.85 ms x 26%  =  45.1 ms
-
-i.e. **roughly three frames in four now make the 25 fps deadline and one in
-four misses it.** 37.9 ms of compute sits just under the 39.90 ms boundary, so
-frames land either side of it depending on what is on screen.
-
-That is the worst place on the curve to be — small variations flip a frame
-between 25 and 16.7 fps, and that is judder rather than slowness. It is also
-the cheapest place to be: **another ~10% off the frame would put nearly every
-frame under the boundary and lock the game at a solid 25 fps**, turning a
-22.2 fps average into a stable 25. A 10% gain is worth 13% of frame rate here,
-not 10%, and it is worth more than that in how the game feels.
-
-*(§16 revisits this paragraph. The decomposition assumes the only outcomes are
-two and three raster frames; the frame timer built later shows a third one —
-2.30 s startup frames the Ultimate's post-reset housekeeping causes — that a
-20 s average cannot distinguish from many slightly-late frames. How much of
-the 45.1 was really judder and how much was one slow frame is no longer
-recoverable; that it was mostly judder is consistent with the fact that §15's
-9.4% moved the reading to a clean 25.05.)*
-
-### What this session did not do
-
-- **Sliding along walls** and **one-boundary-per-frame** — Phase 5's two open
-  items, untouched.
-- **Quality scaling.** The clock the feedback loop needs now exists. Nothing
-  reacts to a frame that overran.
-
----
-
-## 14. Session log — 2026-08-10, the two audio unknowns
-
-Audio is deferred to M2 (§2), but two of its assumptions are *hardware*
-questions, and answering them after a player is written means debugging a
-player and a machine at the same time. Both are now measured. Neither costs
-the engine a byte: `src/sidtest.asm` and `src/irqtest.asm` are standalone
-PRGs, like `reubench.asm`, and `make check` is still green.
-
-**Both answers are yes**, and the interesting part is what the numbers say
-about where the real cost of music is — which is not where the worry was.
-
-### The compute worry was misplaced by two orders of magnitude
-
-| measured on the C64 Ultimate at 64 MHz | |
-|---|---:|
-| interrupt taken and returned, handler saving and restoring `$01` | **1.7 µs** (110 cycles) |
-| the same, plus 25 SID registers written back to back | **9.1 µs** (585 cycles) |
-| two of those per 39.9 ms frame, i.e. a 50 Hz player against 25 fps | **0.018 ms — 0.05% of the frame** |
-
-The 25-register burst costs 475 cycles, about 19 a write. That number is the
-answer to the question behind the question: **the Ultimate does not stall the
-CPU down to the SID's 1 MHz bus.** Had it done so, 25 writes would have cost
-25 µs on their own, and the burst would have been three times the whole
-interrupt.
-
-So a music player is not a frame-budget problem. §13's judder — three frames
-in four making the 39.90 ms boundary and one missing it — is untouched at
-this scale. The blockers for audio are RAM and the memory map, which is an
-M2-shaped project, not a frame-time one.
-
-### Interrupts are safe in the banking scheme, and the test proves it can fail
-
-`defs.asm` warns that the `$34`/`$35` windows are only safe because interrupts
-are masked for the whole run. They are safe with interrupts *unmasked* too,
-provided the handler saves `$01` and restores what it found:
-
-```
-                      mode     irq/s    loops/s  in-window  mismatches
-        0  correct handler      1966      41185        98%           0
-         2  interrupts off         0      41325          -           0
-    3  correct + SID burst      1966      40583        98%           0
-    1  wrong bank restored      1966      39330       100%        3951
-0  correct handler (again)      1966      41186        98%           0
-```
-
-9701 of 9851 interrupts landed *inside* a `BANK_RAM` window and not one
-corrupted a read. The mode-1 row is why that means something: with the
-handler restoring `$35` unconditionally the same run produces 3951 canary
-mismatches in two seconds. Without that positive control, mode 0's zero would
-only have proved the test was blind.
-
-Two things fall out that the plan did not know:
-
-- **`$ff40-$ffff` is 192 bytes of free RAM, and it holds the CPU vectors.**
-  BITMAP1 ends at `$ff3f`; nothing in the memory map claims what follows. Both
-  banking states have HIRAM = 0, so the KERNAL is out and `$fffe` is read from
-  that RAM in both — one write serves the whole engine. This is where an IRQ
-  vector goes.
-- **The handler needs no `sei` fencing around the bank windows.** Saving `$01`
-  is sufficient and costs 110 cycles all-in.
-
-### SID writes survive turbo, including the patterns a player uses
-
-Voice 3's oscillator is readable at `$d41b` while bit 7 of `$d418` keeps it
-out of the audio path, so the chip can be interrogated in silence. Four write
-patterns — spaced, tight, all 25 registers in one run, and eight of those
-bursts back to back — at 1 MHz and again at 64 MHz:
-
-| | step per tick, freq `$0400` | predicted |
-|---|---:|---:|
-| 1 MHz, all four patterns | 15.57 – 15.71 | 15.62 |
-| 64 MHz, all four patterns | 15.57 – 15.71 | 15.62 |
-
-Spread across the four patterns is 0.14 units at both speeds. **A player may
-write the SID at full turbo with no pacing.**
-
-The half- and double-frequency controls (`$0200` and `$0800`, read as 0.495x
-and 2.000x the reference) are what make that a result rather than a
-coincidence: a run in which every write was dropped would show four identical
-rows and be reported as a pass. That failure mode is this project's recurring
-one — §11 found three silent failures in a row on the REU path — and it is
-worth building the control in from the start every time.
-
-### VICE cannot be used for either of these, and fails misleadingly
-
-`$d031` is inert in VICE, so both "speed passes" are 1 MHz passes and the
-question simply goes unasked. Worse, **VICE's `$d41b` does not track the
-frequency register at all**: it reads as a counter advancing one unit per CPU
-cycle whatever is written, which the raw trace shows as three identical ramps
-for `$0200`, `$0400` and `$0800`. A run there looks like a catastrophic
-hardware failure and is an emulation artefact.
-
-`tools/sidtest.py` therefore checks the raw trace *first* and refuses to
-interpret anything if the three frequencies are not in a 1 : 2 : 4 ratio.
-That check cost one iteration to write and saved the whole result from being
-read backwards.
-
-### What this does not answer
-
-- **Where the ~1.5 KB a player and its tune need is going to live.** The free
-  holes total roughly 360 usable bytes (`$ff40-$ffff`, the instrumentation
-  tail, `$0770-$07ff`), and the 384 under the I/O space are unusable for code
-  that has to reach `$d400`. Song data streamed from REU is the obvious shape
-  — 90 KB is free there and the transport is 1 byte/µs — but the player
-  itself has to be resident and there is nowhere to put it yet.
-- **Tempo.** The main loop runs at 25 fps and a player wants 50 Hz. That is
-  what the interrupt is for, and the interrupt is now known to work; nothing
-  has been built on it.
-
----
-
-## 15. Session log — 2026-08-10, the last 10%
-
-§13 closed by naming the prize precisely: frame compute was 37.9 ms against a
-39.90 ms raster boundary, so **another ~10% off the frame would put nearly
-every frame under it and turn a 22.2 fps average into a stable 25**. This
-session took it. **VICE, spawn view, 1 MHz: 2551 → 2311 ms/frame, −9.4%**, and
-every step of it verified as *0 of 104448 pixels* differing from the build
-before it.
-
-Bit-identical was the constraint, chosen deliberately: the frame is the only
-oracle this engine has, and an optimization that changes it by a pixel cannot
-be told from one that broke it.
-
-### The profiler came first, again, and again it was right to
-
-§13 built counters because guessing had cost a session. The same thing happened
-here one level down: the workload counters say how much *geometry* the
-traversal touched, and by this point the frame was not geometry-bound but
-arithmetic-bound. Nothing in the engine could say which arithmetic.
-
-`tools/vicedbg/profile.py` is the answer, and it costs the engine nothing: it
-sets a **non-stopping exec checkpoint** on each hot routine's entry and reads
-the hit counter VICE maintains itself. No `Count` macros, no RAM — which
-matters, because instrument.asm's nine counters already fill `TABLES_FREE` to
-its last byte and `doWall` has nineteen spare bytes in its whole segment.
-
-The spawn frame, before any change:
-
-| routine | calls/frame | ≈ share of the frame |
-|---|---:|---|
-| `mul8` (via `umul16`) | 8648 | ~35% |
-| `spanFill` | 2593 calls / 28.4k px | ~27% |
-| `udiv` + `sdiv` | 628 | ~18% |
-| `convert` | 1 | ~13% |
-| `clampAcc` | 2385 | ~3% |
-
-And the fact that reframed the problem: **`transformPoint` ran 326 times a
-frame and 153 of those — 47% — were the bounding-sphere test, not a seg
-endpoint.** The sphere test was the single largest consumer of the engine's
-most expensive routine, and it is the one caller whose arithmetic does not have
-to be exact.
-
-### Fix 1 — `spanFill`'s cell step, inlined
-
-`spanNextCell` was a subroutine that preserved A across itself with `pha`/`pla`
-— 29 cycles, against the 64 that the eight stores it serves are worth, entered
-about 4600 times a frame. Both call sites reload A from `zSCol` immediately
-afterwards anyway, so inlined it is 10 cycles and needs no save at all.
-
-**2551 → 2495 ms, 2.2%.** One byte of code.
-
-### Fix 2 — `udiv` skips half its loop when the quotient is a byte
-
-The hottest routine in the engine, and it always ran sixteen iterations. But
-most of what it divides is a screen row or a screen column, not a 16-bit
-number, and there is an exact test for that:
-
-```
-(zD+2:zD+1) < zV   <=>   zD < 256*zV   <=>   quotient < 256
-```
-
-When the quotient's top eight bits are all zero, the first eight iterations
-**cannot subtract** — all they do is shift the dividend's top byte into the
-remainder. Skipping them leaves the remainder at exactly `(zD+2:zD+1)`, which
-is where `udiv8` starts. Same quotient, bit for bit; half the loop.
-
-**2495 → 2360 ms, 5.4%**, and it is the cheapest change here by a wide margin:
-one 16-bit compare and a fifty-byte second loop.
-
-### Fix 3 — the frustum test was throwing away 0.59r
-
-§13 chose the axis-aligned box `[rx±r] × [ry±r]` over the exact sphere test,
-because at 90° the frustum planes are `rx = ±ry` and their normals carry a
-`1/sqrt(2)` the box does not need. That reasoning was sound and the conclusion
-was too expensive: the box makes the side tests `rx - ry >= 2r`, where a sphere
-actually clears a 45° plane at `sqrt(2)·r = 1.41r`. **The test was demanding
-0.59 of a radius more clearance than geometry requires, on two of its three
-planes.**
-
-`1.5 >= sqrt(2)`, so `k = r + (r >> 1)` is still conservative — it can never
-reject something visible — and it is r plus one shift where the exact constant
-would want a multiply. The plane at `ry = 0` was exact already and is unchanged.
-
-**2360 → 2311 ms, 2.4%.**
-
-### The one that measured slower, and what it taught
-
-The obvious target was the 153 sphere-test `transformPoint` calls. A coarse
-replacement was written in full: 1.7 trig instead of 2.14, axis deltas rounded
-to 32 units, four 8×8 `mul8` where `transformPoint` runs sixteen. It works, and
-it is **~680 cycles a call cheaper — 4.4% of the frame.**
-
-It is also, measured end to end, **2% slower**, and the reason is the thing
-worth keeping:
-
-| `SPH_SLOP` | ms/frame |
-|---:|---:|
-| 0 (not conservative — measurement only) | 2256 |
-| 128 (the error bound the coarse transform actually needs) | 2408 |
-
-A coarse transform has to grow every sphere by its own error bound or it starts
-deleting geometry. **128 units of radius cost 6.7% of the frame — more than
-the transform saved.** The frame is far more sensitive to how tightly the
-spheres bound the geometry than to what the transform costs, which is the exact
-opposite of what the call-count profile suggested, and it is what turned the
-session toward Fix 3. Accuracy in the culling test is worth more than speed in
-it; the same lever, pulled the other way, is where the win came from.
-
-The code is gone but the measurement is why `sphereVisible` still says
-`jsr transformPoint`.
-
-### Where the RAM came from
-
-None of this fitted. §13 ended with "there is no low-RAM headroom left", and
-the exact frustum test needs about 35 bytes more than the box test.
-
-**`mapLoad` moved into MATRIX** (`BOOTCODE = MATRIX + $4100`). It has one
-caller, main.asm's boot path; it runs before the first frame; and `spanFill`
-overwrites it during that frame. `MAPHDR` had already staged inside MATRIX on
-exactly this argument — this just takes the argument to its conclusion. **411
-bytes of low RAM, contiguous**, which is what let the sphere test be shaped by
-what is correct rather than by what fits in sixty bytes.
-
-| | |
-|---|---|
-| `$0c30-$0cb2` | `sphereVisible` + `sphereTest` |
-| `$0d00-$0d31` | `udiv`'s short path |
-| `$0cb3-$0cff`, `$0d32-$0dff`, `$0fc4-$0fff` | free — the largest unclaimed RAM below MATRIX |
-
-(§16 has since spent `$0d40-$0de7` of that on the frame timer.)
-
-**`$ff40-$fff9` (186 B) was used and then deliberately given back.** `udiv8`
-was assembled there first — it is genuine free RAM above BITMAP1, and both
-banking states have HIRAM = 0 so it is reachable either way. But reaching past
-`$cfda` extends the PRG image across `$d000-$dfff`, so loading it writes 4 KB
-of filler over the I/O space. Harmless under VICE's RAM injection; unverified
-on the U64's DMA path, and not worth finding out for a change that measured
-identically from low RAM. **That block stays free for M2's audio interrupt,
-which is the one thing that has to reach `$fffe`.**
-
-### What this predicts, and the one thing not yet measured
-
-§13's reconciliation gives the conversion: 37.9 ms of hardware compute at VICE's
-2551. At 2311 that is **~34.3 ms**, about 5.6 ms clear of the 39.90 ms
-boundary — so nearly every frame should now make it and the game should sit at
-a stable **25 fps** instead of averaging 22.2.
-
-**This has not been confirmed on hardware.** The C64 Ultimate was not reachable
-at the end of this session — nothing on 192.168.1.0/24 answers `/v1/info` — so
-`make u64-fps` and `make u64-map` are the outstanding Phase 6 items, and the
-milestone is not tagged until they run. Everything else in Phase 6 is done:
-`make check` is green, the frame is pixel-identical, and the documentation is
-this section.
-
-> **Confirmed: 25.05 fps, every frame on the deadline.** The compute figure
-> was optimistic — 37.6 ms measured against 34.3 predicted, so ~2 ms of margin
-> rather than 5.6 — but the conclusion held: this is what locked the frame. §16
-> has the reading, and the first run of it that said 22.73 and was wrong.
-
-### For M2's sound task
-
-Three things this session leaves deliberately in place for it:
-
-- **`$ff40-$fff9`, 186 bytes**, free and reachable from both banking states,
-  with the CPU vectors at `$fffa` intact. §14 measured a 50 Hz player at
-  0.018 ms/frame, so the budget is not the problem; a home for the handler was,
-  and this is one.
-- **~5.6 ms of frame headroom** rather than the ~2 ms §13 left. A 50 Hz
-  interrupt against a 25 fps frame is two interrupts a frame, which at §14's
-  measured 9.1 µs each is 0.05% — but it now has room to be sloppy.
-  *(§16: measured, it is ~2 ms, not 5.6. Still ample for a 50 Hz player at
-  0.018 ms/frame, but not room to be sloppy.)*
-- **The frame is locked to a multiple of 19.95 ms**, so a 50 Hz player ticking
-  twice per rendered frame is exactly in step. That only holds while compute
-  stays under the boundary, which is what the headroom is for.
-  *(§16: measured over 502 consecutive frames, every one of them two raster
-  frames. `ftHist` is the alarm that says it has stopped being true.)*
-
----
-
-## 16. Session log — 2026-08-10, the 25 fps lock, and the two frames that hid it
-
-**Milestone 1 is closed on hardware: a measured 25.05 fps, every frame on the
-deadline.**
-
-```
-boot: 2 frame(s) before the window cost up to 2.30 s each -- the Ultimate's
-      post-reset bus stealing, now sat out
 fps: 502 frames in 20.04 s = 25.05 fps (39.9 ms/frame)
 cia: 19706 CIA ms in 20044 host ms = 0.983 x
 frame: compute 37.6 ms last, 37.6 min, 38.6 max (deadline 39.90 ms)
 frame: raster frames 1x0 2x502 3x0 4+x0 -- 100% made the 25 fps deadline
-frame: ok -- every frame's compute fits in two raster frames
 ```
 
-`make u64-map` passes too: `mapOK=1`, all three resident blocks verified by
-checksum against `build/assets.reu`. Both Phase 6 gates are met.
+`make u64-map` passes: `mapOK=1`, all three resident blocks verified by checksum
+against the image. `make check` is green. The rendered frame hashes
+`c5d78e65…` with and without music.
 
-### The session started with the opposite reading
+How it got there, in frame time: 56.9 ms → 45.1 → 39.9, via a world-space seg
+backface test, streamed bounding spheres, a frame cap, and an arithmetic pass
+worth 9.4%. Every step was verified **bit-identical** — 0 of 104448 pixels
+differing — which is the standard M2 inherits.
 
-The first hardware run of §15's build said **22.73 fps, 44.0 ms/frame** — the
-9.4% VICE win delivering 2.4% on hardware, and no lock. The obvious
-decomposition made it worse: frame time is quantised to 19.95 ms, and 44.0
-reads as `39.90 x 79% + 59.85 x 21%`, i.e. one frame in five missing the
-deadline where §13 had one in four. Every part of that was wrong, and the way
-it was wrong is the lesson.
+## 2. The architecture, as built
 
-**The decomposition assumed the only possibilities were two and three raster
-frames.** They were not. Nothing in the average could have said so, because an
-average of quantised frames cannot distinguish *many frames slightly over* from
-*one frame catastrophically over* — and those two want completely opposite
-work. Chasing the first would have meant another optimisation pass on a
-renderer that was already fast enough.
+**BSP front-to-back, not portals.** E1M1's 85 sectors are not convex, so the
+portal graph the original engine walked does not exist in the WAD; the 237
+subsectors *are* convex by construction. `renderFrame` descends `NODES` with an
+explicit stack, near child first, and at each leaf DMAs the subsector's segs and
+calls `doWall` per seg. There is no `[zXL,zXR]` window: a column is closed when
+`colTop[x] >= colBot[x]`, and `openCols` reaching zero ends the frame.
 
-### So the engine times itself now
+**Three rejection tests, in the order they pay off:**
 
-Two reference points a frame, off the CIA millisecond clock §13 calibrated:
-`frameMark` at the flip, `frameStat` at the moment the renderer hands over to
-the pacer — before it waits, because after the wait every frame reads the same.
+| Test | Where | What it removes |
+|---|---|---|
+| Bounding sphere vs frustum | `bspLoop` before descending, `renderSsec` after the 8-byte header | whole subtrees — 234 node descents → 71.7, 235 subsectors → 39.3 |
+| World-space backface | `segFacing`, before any projection | 53.6 segs/frame, each of which used to cost two `transformPoint` + two `projSX` |
+| Column occlusion | `doWall` | 15-19 segs/frame |
 
-| | |
-|---|---|
-| `ftInt` | the last flip-to-flip interval |
-| `ftComp` | the last frame's compute |
-| `ftCMin`, `ftCMax` | compute, min and max over the run |
-| `ftHist` | 4 × 16-bit: frames costing 1, 2, 3, 4+ raster frames |
+The sphere test is deliberately **not** the exact sphere-plane test: the frustum
+planes at 90° are `rx = ±ry`, and `k = r + (r>>1)` is conservative because
+`1.5 >= sqrt(2)` while costing one shift instead of a multiply. Accuracy here
+is worth more than speed — a coarse transform that needed 128 units of slop cost
+6.7% of the frame while saving 4.4%.
 
-16 bytes at **`$02a0`**, in colTop's unused tail — the renderer touches columns
-0-159 only — and deliberately *outside* the PRG image, so a runtime write there
-never shows in `probe.py`'s live-RAM diff. 168 bytes of code at `$0d40`, from
-the block §15 freed. Three `msRead`s and about sixty cycles a frame: under a
-microsecond at 64 MHz, a thousandth of what it measures, which is why it is not
-behind `INSTRUMENT`. **A measurement you need a special build for is a
-measurement you make once.**
+**Frame pacing.** `flip` syncs to raster line 251, so frame time is quantised to
+`50/n` fps. `framePace` holds every frame to `FPS_CAP_TICKS` so the player moves
+at one speed regardless of what is on screen. The clock is CIA2 Timer B cascaded
+off Timer A at 1000 phi2 cycles — a millisecond counter that is **turbo-invariant
+and absolutely calibrated** (measured 0.983× against the host's wall clock;
+PAL phi2 predicts 0.985).
 
-Seeding it is worth a line, because the first version got it wrong invisibly:
-`ftInit` is called after the spawn descent, not next to `msInit`. Its reference
-point is the last flip, and before the first flip that is the boot sequence, so
-frame 1 reported `reuProbe` + `mapLoad` as compute — 2396 ticks against a true
-2269 — and poisoned `ftCMax` for the whole run.
+**The engine times itself** (`src/clock.asm`, `ftInt`/`ftComp`/`ftCMin`/`ftCMax`/
+`ftHist` at `$02a0`). This exists because an average frame rate cannot
+distinguish *many frames slightly over the deadline* from *one frame
+catastrophically over* — and those two want opposite responses. It cost ~60
+cycles a frame and it overturned a whole session's conclusion the day it landed.
 
-### What it said, immediately
+## 3. Memory, and why it is the binding constraint
 
-The histogram from boot, sampled once a second:
+**Resident blocks** (frozen in `docs/reu-format.md`, which is authoritative):
 
-```
-t= 3.0s  comp=37 min=37 max=2268  hist=[0, 12, 0, 2]
-t= 9.1s  comp=38 min=37 max=2268  hist=[0, 164, 0, 2]
-```
+| Data | Form | Size | Lives at |
+|---|---|---|---|
+| NODES | 12 SoA arrays of 240 | 2880 B | `$D000`, under I/O |
+| SECTORS | 6 SoA arrays of 96 | 576 B | `$DC00`, under I/O |
+| MAPINFO | counts, root, spawn, block bases | 32 B | `$0E00` |
+| SSECDATA | `[segCount, sectorId, sphere, segs…]` in a 128 B slot per subsector | 30 KB | **REU**, two transfers per visit |
+| NODESPH | node bounding spheres, 8 B stride | 2 KB | **REU**, streamed per node visit |
+| MUSIC | SID register delta stream | 405 KB | **REU**, streamed per tick |
 
-**Two frames, and only ever those two, cost 2268 ticks — 2.30 s each.** Every
-other frame from the third onwards is 37-38 ms and lands on the second raster
-crossing; the `3` bucket never leaves zero. There was no judder and there were
-no marginal frames. There were two enormous ones at startup.
+There is no resident SSECTORS table: each subsector owns a fixed 128-byte REU
+slot at `ssecReuBase + (i<<7)`, so the address is one shift and no multiply.
+30 KB of REU (free) bought 948 B of RAM (not free). The same trade recurs
+throughout — **REU space is abundant, REU bandwidth is 1 byte/µs flat, and RAM
+is the thing that runs out.**
 
-2.30 s is, to within 0.4%, the 1 MHz frame time (VICE measures 2311 ms). That
-looks exactly like a turbo that has not engaged yet — so `turboOn` was called
-from `mainLoop` on every frame and it changed nothing: still two frames, still
-2269 ticks. The Ultimate is holding the bus for its own post-reset
-housekeeping, which is the transient `u64push.py`'s `WARMUP_SECONDS` already
-existed to sit out. The call was reverted; the finding is now a comment on
-`turboOn`, because the next person to see 2.30 s will reach for the same
-register.
+**Free RAM, as of the end of M1:**
 
-One of those frames inside a 20 s window is 2.3 s of it, which turns 502 frames
-into 456 and 25.0 fps into 22.7 — the original reading, exactly. The warmup is
-3 s and the wait is for `frameCnt` to move, but `frameCnt` does not move until
-the first of the two slow frames has *finished*, so 3 s cleared it about as
-often as not. That is why §13 and §15 measured clean and this one did not.
+| Where | Size | Usable for |
+|---|---|---|
+| `$0cb3-$0cff` | 77 B | code |
+| `$0d33-$0d3f` | 13 B | code |
+| `$02b0-$02ff` | 80 B | data only (page-aligned tail of `colTop`) |
+| `$03a0-$03ff` | 96 B | data only (tail of `colBot`) |
+| `$0400-$07ff` | 1024 B | data only — **unclaimed, unverified**, see §8.1 |
 
-### The measurement is self-diagnosing now
+**About 90 bytes of code RAM exist.** Everything else is MATRIX, bitmaps,
+screens, tables and code. `$ff40-$fff9` was held open for M2's audio for two
+sessions and is now `MUSCODE`. Anything below `$0801` cannot hold code — the PRG
+loads from there — but is fine for runtime data, which is why `colTop`,
+`colBot` and the frame-time block live there.
 
-`WARMUP_SECONDS` is 6.0, and `make u64-fps` reports the transient it sat out
-rather than silently discarding it. If a `4+` frame ever lands inside the
-window, the report says so and refuses to interpret the fps line — no frame the
-renderer produces varies by a factor of four, so that bucket is never about the
-renderer.
+Two mechanisms bought the RAM that exists: **boot-only code lives inside
+MATRIX** (`BOOTCODE = MATRIX + $4100`; `spanFill` overwrites `mapLoad` during
+the first frame), and every block is bounded by an `.errorif` against what
+follows it, so the next thing that grows fails the build by name rather than by
+symptom.
 
-### What the numbers actually were
+**Banking.** `$01 = $35` is the default; `$34` is entered only to touch the node
+and sector tables and always restored. Both keep RAM at `$a000`/`$e000` where the
+bitmaps live, so a bank switch never changes what a bitmap write does. Interrupts
+are safe inside these windows provided the handler saves and restores `$01` —
+measured, with a positive control that produced 3951 corruptions when the handler
+restored the wrong bank.
 
-§15 predicted ~34.3 ms of compute. Measured: **37.6 ms steady, 38.6 ms worst**,
-about 2 ms under the 39.90 ms boundary rather than the 5.6 ms projected. So the
-conversion *was* optimistic — REU DMA is 1 byte/µs on both machines and so is a
-far larger share of the hardware frame than of the VICE frame, which makes a
-whole-frame ratio over-credit every CPU-side saving. It was optimistic by 3 ms,
-not by the 10 the bad reading implied, and the conclusion it drew was right:
-**the last 9.4% is what locked the frame.** Without it compute is ~41 ms, i.e.
-at the boundary rather than 2 ms under it, and a reading that mixes 39.90 and
-59.85 ms frames is exactly what that looks like.
+## 4. What M1 taught, and what will bite again
 
-Two ms of margin is not much. The frame timer is what will notice when M2's
-audio, or anything else, spends it.
+These cost a session each. They are not derivable from the code.
 
-### For M2
+**Nothing on the REU or hardware path may be believed without an assertion.**
+Three silent failures were found in a row on the delivery path alone, each of
+which let every read "succeed" and return wrong bytes: `reuProbe` overwriting the
+header it was about to verify; VICE ignoring a `-reuimage` whose size is not
+exactly the emulated REU size; and the Ultimate's REU Preload not delivering at
+all on firmware 1.1.0. With no REU attached, `$DF00-$DF0A` read back `$00`, stores
+go nowhere and every transfer succeeds instantly.
 
-- **`$ff40-$fff9`, 186 bytes**, still free with the CPU vectors intact.
-- **~2 ms of frame headroom**, measured rather than projected — §14's 50 Hz
-  player at 0.018 ms/frame fits with room to spare, but the room is 2 ms and
-  not 5.6.
-- **Every frame is exactly two raster frames**, so a 50 Hz player ticks exactly
-  twice per rendered frame, in step. The `ftHist` `3` bucket is the alarm that
-  says it has stopped being true.
+**Build a positive control into every measurement.** A run in which every write
+was silently dropped looks like a clean pass. The SID test's half- and
+double-frequency cases, the sphere test stubbed to `sec/rts`, the IRQ test's
+deliberately-wrong bank restore — each is what makes the corresponding zero mean
+something.
 
----
+**VICE and the Ultimate disagree in specific, known ways.**
 
-## 17. Session log — 2026-08-10, the 6-byte seg record
+| | VICE | Ultimate |
+|---|---|---|
+| `$d031` turbo | inert, always 1 MHz | real; must be *toggled* down to 1 MHz and back, and needs `Turbo Control = C64U Turbo Registers` in the menu or it reads `$FF` and the write is discarded |
+| `$d41b` (voice 3 osc) | advances one unit per CPU cycle regardless of frequency | tracks the frequency register |
+| REU DMA share of the frame | tiny (a 1 MHz frame is 2.3 emulated seconds) | 1 byte/µs — the same absolute cost, so a far larger share |
+| `-default` | **resets every setting, including the REU** — must come first on the command line | — |
 
-§10 of `docs/georam-vs-reu.md` listed this as the fallback if the answer to
-GeoRAM was "stay on the REU", which it was: **shrink the seg record from 10
-bytes to 6**, storing endpoints relative to the subsector's bounding-sphere
-centre — already in the slot header — with an escape for what does not fit.
-Its estimate was 488 B/frame ≈ 0.5 ms against ~20 cycles of adds, "so it pays
-for itself 3:1".
+The consequence that matters for M2: **a change that trades CPU cycles for REU
+bytes is judged wrongly by `make stats`**, in either direction. So is anything
+driven by a real-time interrupt — the music tick costs +5.7% in VICE and nothing
+measurable on hardware, because an emulated frame absorbs ~231 ticks where the
+Ultimate absorbs 4.
 
-It was built, it was pixel-exact, and **it was worth 0.06 ms/frame**. Both
-halves of the estimate were wrong, in the same direction, and the way they were
-wrong is the reusable part. **It was then reverted** — see "The decision"
-below. This section is the record of a measurement, not of shipping code; the
-engine and `docs/reu-format.md` are back at format version 2.
+**The Ultimate steals the bus for ~2.3 s after reset.** Two frames, always
+exactly two, cost 2268 ticks each. Inside a 20 s window that turns 25.0 fps into
+22.7 — which is a plausible-looking regression, and was believed for half a
+session. `WARMUP_SECONDS = 20` in `u64push.py` sits it out and the report names
+the transient rather than silently discarding it.
 
-### What it was
-
-Format version 3. A subsector whose seg endpoints all lie within ±128 of its
-sphere centre sets bit 7 of its slot's `segCount` and stores each endpoint as
-one `+128`-biased byte (`docs/reu-format.md` §5.2). E1M1: 171 of 237
-subsectors, 495 of 732 segs.
-
-The flag is per subsector rather than per seg because `SEGBUF`'s stride has to
-stay uniform — `doWall` indexes it by byte offset — and per-seg granularity
-reaches 71.6% of segs against 67.6%, which does not buy a variable stride.
-
-`segExpand` widens the record into the *identical* 10-byte layout before
-anything reads it. That is the design decision that matters: `doWall` and
-`segFacing` are untouched, so pixel-exactness is structural rather than tested
-for. The alternative — teaching both routines to read biased bytes and folding
-the centre into the camera instead, which would have cost almost no cycles —
-needs two variants of each, and `doWall` has nineteen spare bytes in its whole
-segment. The RAM decided the design.
-
-The compact records are DMA'd to the *top* of `SEGBUF`, at `SEGBUF + 128 - 6n`,
-not to its base. Expanding in place from a common base clobbers a record's own
-source bytes two records in; from the top, every 10-byte record written lands
-strictly below the 6-byte records still unread, for every `n` up to the slot's
-cap of 12 (`10i+10 ≤ 128-6n+6i` holds iff `10n ≤ 122`).
-
-### The measurement, and the two errors in the estimate
-
-| | estimated | measured |
-|---|---:|---:|
-| compact segs fetched per frame | 122 | **46.6** |
-| bytes saved per frame | 488 | **186** |
-| DMA saved, 1 µs/byte | 0.49 ms | **0.19 ms** |
-| CPU cost per record | ~20 cycles | **140 cycles** |
-| CPU cost per frame at 64 MHz | 0.03 ms | **0.12 ms** |
-| net | +0.46 ms, 3:1 | **+0.06 ms, 1.5:1** |
-
-**Error one: not every fetched seg is compact.** 67.6% of E1M1's segs are, but
-the spawn view fetches 46.6 compact records against 115.2 segs considered —
-40%. The subsectors the camera is standing in are the big ones; the compact
-ones are disproportionately the small far cells the sphere test rejects before
-their segs are ever fetched. The static ratio is not the fetched ratio, and
-only the fetched one is worth anything.
-
-**Error two: the cost is not the adds.** Four 16-bit adds is indeed ~20 cycles
-of *arithmetic*. But reconstructing into a fixed 10-byte record is eight
-stores, four loads, four loads of the origin high byte, and two index advances:
-140 cycles, seven times the estimate. The add was never the expensive part.
-
-### What the instruments could and could not say
-
-`make stats` — VICE at 1 MHz — is structurally the wrong instrument for this
-change and says so: the CPU cost is 64× overweighted against a DMA cost that
-does not scale, so it reports 2296 → 2328 ms/frame, a 1.4% *regression* that is
-also inside its ±17 ms run-to-run noise. The Makefile already warns that a
-change trading CPU for DMA bytes "looks better here than it will on hardware";
-this is the same warning read backwards.
-
-On the Ultimate: **37.6 ms min / 38.6 ms max, 100% of frames on the deadline,
-before and after, identical.** The predicted 0.06 ms is one sixteenth of the
-frame timer's 1.015 ms tick. This change cannot be measured by any instrument
-this project has; it can only be modelled, from a per-record cycle count and a
-profiler hit count.
-
-The hit count is how the model was closed: a `profile.py` checkpoint on
-`segExpLoop`, which fires once per compact record — 46.6/frame. That number
-times 140 cycles is the whole cost, and it is the only reason the 0.06 ms
-figure is worth more than the 0.5 ms one it replaced. The general move is
-reusable and cost the engine nothing: **put a non-stopping checkpoint on the
-new routine's inner loop and let VICE count it**, then multiply by a
-hand-counted cycle cost. It is the only way to price a change smaller than an
+**Price a small change with a profiler hit count, not an estimate.** The 6-byte
+seg record was estimated at +0.46 ms/frame and measured +0.06 — both halves of
+the estimate were wrong in the same direction. The static ratio is not the
+fetched ratio (67.6% of segs are compact, but only 40% of *fetched* segs are,
+because the sphere test rejects exactly the small far cells), and the cost of
+unpacking is the stores, not the arithmetic (140 cycles, not 20). It was
+complete, correct, pixel-exact, and reverted: 135 bytes of fragmented low RAM for
+0.16% of a frame. `tools/vicedbg/profile.py` sets non-stopping checkpoints and
+costs the engine nothing; it is the only way to price a change smaller than an
 instrument's resolution.
 
-### The low-RAM trap, for whoever needs those bytes next
+**`make framehash`, not `make shot`, is the acceptance test.** `-limitcycles`
+stops mid-flip often enough that two runs of the same build differ by ~30 pixels.
+`framehash` reads the renderer's own 28160-byte buffer at a frame boundary and
+prints its sha256.
 
-`segExpand` was 135 bytes and would not fit in one piece: the largest free
-block below `MATRIX` is 77 bytes. The first placement used `$0eef-$0f3f`,
-which reads as free in the memory map between the collision helpers and the
-backface test. It is not free — it is the BSP stack (`bspStkLo = $0f00`,
-`bspStkHi = $0f20`). It assembled clean, linked clean, and rendered the first
-frame as character-mode garbage: 96410 of 104448 pixels. Anything placed below
-`MATRIX` needs `bspStkLo`/`bspStkHi` checked by hand; the map comments do not
-cover them.
+**Anything placed below MATRIX must be checked against `bspStkLo`/`bspStkHi`
+by hand.** `$0eef-$0f3f` reads as free in the memory map and is the BSP stack; it
+assembles clean, links clean, and renders character-mode garbage.
 
-### `make framehash`, and why `make shot` was not enough
+**`make debug`'s port is randomised for a reason.** x64sc binds the monitor port
+without `SO_REUSEADDR`, so the previous run's socket sits in `TIME-WAIT` and the
+next VICE fails to bind *silently* — it boots and runs normally with no monitor,
+which reads exactly like "the emulator did not start".
 
-The acceptance test for every frame optimization since §13 is "0 of 104448
-pixels differ". Taking it with `make shot` turns out to be sloppy: `-limitcycles`
-stops wherever it stops, which is mid-flip often enough that **two runs of the
-same build differ by ~30 pixels**. Chasing that as if it were the change would
-have been a wasted session.
+## 5. The M1 risk register, closed out
 
-`make framehash` reads the renderer's own 28160-byte output buffer at a frame
-boundary over the binary monitor and prints its sha256. The camera does not
-move without input, so every frame writes the identical bytes and the digest is
-exact. Baseline and compact build: `c5d78e65…` both. The hardware frame,
-DMA-read with `tools/u64shot.py`, is also identical, 0 of 56320 pixels.
+| # | Risk | Outcome |
+|---|---|---|
+| 1 | REU DMA slow and not turbo-scaled | **Real, and priced.** 1 byte/µs flat, no setup penalty, so per-subsector streaming needs no batching. ~1.3 KB/frame ≈ 1.3 ms |
+| 2 | No way to get a `.reu` onto hardware | **Closed the hard way.** REU Preload does not deliver; `src/reuload.asm` + `machine:writemem` does, verifying every chunk |
+| 3 | 40+ visible subsectors blows the frame budget | **Arrived.** 17.6 fps at first light. Answered by spheres + backface test |
+| 4 | `$D000` banking breaks the converter or `flip` | **Never seen.** `make debug` stays clean |
+| 5 | Flat shading looks like mush | **Arrived twice** — two flats on one ramp, and depth falloff that had never worked (`sta` sets no flags) |
+| 6 | Projection math has range bugs real geometry exposes | **Never seen.** Projected rows match the arithmetic to the pixel |
 
-`WARMUP_SECONDS` in `tools/u64push.py` went 6 → 20 s in the same session, and
-for a related reason: at 6 s the first hardware run of this build reported
-16.46 fps and 52.8 ms of compute — a reading entirely made of the Ultimate's
-post-reset bus stealing, which the tool warns about but which is easy to read
-as a catastrophic regression in the change under test. At 20 s the same build
-reports 37.6 ms, flat.
+## 6. Session index
 
-### The decision: reverted
+Full logs are in this file's git history. One line each:
 
-The change was complete, correct, and worth about 0.16% of a frame that is
-already 2 ms inside its deadline. Against that: 135 bytes of low RAM in three
-fragments (`$0cb3`, `$0de8`, `$0fc4` — the free space below MATRIX is that
-fragmented), a format version bump, and a permanent second representation of
-the engine's hottest record. **The measurement said this was a wash; the RAM
-said it was a loss.** So `src/defs.asm`, `src/render/bsp.asm`,
-`tools/wad2reu.py` and `docs/reu-format.md` were reverted, returning 135 bytes
-to M2 — which has 186 at `$ff40` and needs a music player.
+| Date | What | Commit |
+|---|---|---|
+| 08-09 | Phase 0 — `make check`, the monitor-port and leaked-emulator traps | — |
+| 08-09 | Phase 1 — the Ultimate at `192.168.1.65`, REST API, turbo as a build dependency, 50.1 fps on the test map | — |
+| 08-09 | Phase 2 — `reu.asm`, REU benchmarked at 1 byte/µs, `-default` found switching the REU off | — |
+| 08-09 | Phases 3+2 — `wad2reu.py`, the format frozen, three silent failures, `reuload.asm` | — |
+| 08-09 | Phases 4+5 — the BSP renderer, E1M1 on screen and walkable, depth shading fixed after years | `2aa06fe`, `5229310` |
+| 08-10 | Frame time — backface test, bounding spheres, the 25 fps cap. 56.9 → 45.1 ms | `4228b1e` |
+| 08-10 | The two audio unknowns — interrupts are bank-safe, SID survives turbo | — |
+| 08-10 | The last 10% — `profile.py`, `spanFill` inlining, `udiv`'s short path, the exact frustum test. −9.4%, bit-identical | `5f79f8e` |
+| 08-10 | The 25 fps lock — the frame timer, and the two boot frames that hid it | `a5d4602`, `832c699` |
+| 08-10 | The 6-byte seg record — built, measured at 0.06 ms, reverted | `4603944` |
+| 08-11 | Music — no player on the C64; a SID register stream replayed from REU | `1ae6533` |
 
-What survived, because none of it depends on the change: **`make framehash`**
-(the acceptance test is now exact instead of approximately exact), the
-**20-second hardware warmup**, and this section. `docs/georam-vs-reu.md` §10's
-seg-record fallback should be read as closed, with the number 0.06 ms rather
-than 0.5 ms.
+## 7. Carried into M2
 
-Its remaining fallback — folding `NODESPH` into the parent's slot, 164 B/frame
-— is smaller than this one was and is subject to exactly the same two
-corrections: the static ratio is not the fetched ratio, and the cost is the
-stores, not the arithmetic. **Model it, with a profiler hit count, before
-building it.** On this evidence the whole class of "trade CPU for REU bytes"
-optimizations is close to exhausted at this frame size; the next real gain is
-more likely to be structural than arithmetic.
+Named here so nothing has to be rediscovered:
+
+- **Sliding along walls** and **one boundary per frame** — Phase 5's two open
+  items, untouched. Now §9.2.
+- **`data_structures.md` has never been reconciled** with the formats
+  `wad2reu.py` actually emits. Now §9.3.
+- **The uploader sends one span from offset 0**, so the 405 KB music block makes
+  every `make run-u64` a multi-minute upload. Now §9.1, and it is a blocker.
+- **Quality scaling.** The clock a feedback loop needs exists; nothing reads it.
+  Not in M2.
+- **One unexplained hardware reading**: 24.10 fps / 93% on deadline, taken
+  immediately after a 470 KB upload, never reproduced.
 
 ---
 
-## 18. Session log — 2026-08-11, the music
+# Part II — Milestone 2
 
-M2's first piece: `DooM_Medley.sid` plays under the engine, on hardware, with
-`make check` green and the rendered frame bit-identical.
+## 8. Scope, and the budget decision that shapes it
 
-### There is no player on the C64, and that is the whole design
+> **E1M1 with textured walls, working doors, sprites on screen, and a HUD —
+> on hardware, at a locked frame rate.**
 
-A `.sid` is 6502 code at fixed absolute addresses — `DooM_Medley` wants
-`$0FF6-$3E6A` — and that lands inside `MATRIX`. §14 counted the engine's free
-RAM at ~360 bytes in four holes. A resident player was never going to happen,
-and every previous plan for audio quietly assumed one would.
+| | M2 |
+|---|---|
+| Wall textures | **In.** Intensity-modulated within the surface's existing ramp (§10) |
+| Floor/ceiling textures | **Out.** Flats stay flat — perspective-correct span texturing is a different renderer |
+| Doors and moving sectors | **In.** Doors, platforms, switches, walkover triggers (§11) |
+| Sprites | **In, rendering only.** Things are drawn, sorted and clipped. **No AI, no combat** (§12) |
+| HUD | **In.** Status bar with live health/ammo/armour (§13) |
+| Enemy behaviour, weapons, damage, pickups | **Out.** M3 |
+| PVS/REJECT, quality scaling, visplanes | **Out** |
 
-But the SID chip only ever sees register writes. So the player runs **once, at
-build time**, in `tools/cpu6502.py`: `init` is called, `play` is called at the
-tune's own rate, and `$D400-$D418` is snapshotted after each call.
-`tools/sidstream.py` delta-encodes those snapshots — a count byte and that many
-`(register, value)` pairs per tick — into block 5 of `assets.reu`. What runs on
-the machine is a replay head: fetch a record, write the registers it names,
-advance a 24-bit pointer. Chip-identical by construction, no resident player
-code, and the loop is a pointer rewind rather than a second `init`.
+### 8.1 The frame budget triples the room, and that is the whole plan
 
-405 KB for 7:22, against 1.11 MB of raw snapshots. That ratio is not about REU
-space, which is free; it is about upload time, and it is not enough — see the
-cost section below.
+> **Landed 2026-08-11.** `make u64-fps` on hardware:
+> `fps: 335 frames in 20.04 s = 16.71 fps (59.8 ms/frame)`,
+> `raster frames 1x0 2x0 3x335 4+x0 -- 100% made the 16.7 fps deadline`,
+> compute 37.6 min / 38.6 max against 59.85. `make framehash` is unchanged at
+> `c5d78e65…` and `make check` is green. **~21 ms of budget is now free.**
+>
+> `FPS_CAP_TICKS` is **49, not the 58 this section predicted**, and the pacer's
+> reference point moved — see the drift note at the end of this section.
 
-### The interrupt, and the two things it had to survive
+**Decision: M2 targets three raster frames — 16.7 fps, a 59.85 ms deadline.**
+25 fps with textures and sprites is not reachable on this hardware without
+giving up one of them, and 16.7 fps locked is preferable to 25 fps that judders,
+which is the trap M1 spent two sessions climbing out of.
 
-`main.asm` had held `sei` since its first instruction. It now clears it once
-`musInit` returns, so the tick lands inside the BSP walk's `$34`/`$35` bank
-windows and inside the renderer's REU transfer setup about four times a frame.
+| | M1 | M2 |
+|---|---:|---:|
+| Deadline | 39.90 ms | **59.85 ms** |
+| `FPS_CAP_TICKS` | 39 | **49** |
+| Measured compute | 37.6 ms | 37.6-38.6 ms measured |
+| **Available** | ~2 ms | **~21 ms** |
 
-Both hazards were measured before the player was written (§14), which is the
-only reason this was a day's work rather than a week's: the handler saves and
-restores `$01`, and saves and restores `$DF02-$DF0A` around its own DMA. The
-second one is the subtle half — a transfer is "fill in the registers, then
-write the command", and an interrupt in that gap would otherwise return to a
-command register holding the music's parameters.
+**The cap is 49, and the reason it is not 58 is a phase drift M1 could not
+show.** 58 was chosen here as the largest wait that still fits inside three
+raster frames, by the same argument that made 39 the maximum at two. Built and
+measured, it gave **95%, not 100%**: `2x16 3x325`, sixteen frames landing a
+raster frame *early* in an otherwise perfect run.
 
-**The frame is bit-identical with the player running.** `make framehash` gives
-`c5d78e65…` with and without it — the same standard §13/§15 held optimisations
-to. That is the evidence that both hazards are actually handled, and it is
-worth more than the reasoning above it.
+That is a beat, not jitter. `framePace` measured from its own last *release*,
+so release-to-release was pinned at 58 ticks = 58.87 ms against a raster grid
+of 59.85 ms. The phase walks back 0.98 ms every frame, and every ~20th frame it
+crosses a raster line and `flip` catches the earlier one. **M1 had exactly the
+same drift and it was invisible**: at 39 ticks the drift is 0.32 ms/frame, and
+37.6 ms of compute makes a 39.90 ms flip-to-flip physically impossible, so the
+beat was floored away rather than absent.
 
-### The bug the silent path found
+The fix is the reference point, not the number: `framePace` now measures from
+`msFrame`, the last flip, which `frameMark` re-seeds at every raster crossing —
+so the phase resets each frame and cannot accumulate. That also makes the cap's
+exact value uncritical, because `flip` does the quantising and any wait landing
+strictly between the two-frame crossing (39.3 ticks) and the three-frame one
+(58.97 ticks) selects the same crossing every time. **41…58 all work; 49 is the
+middle, with ~10 ms of slack against each.** Hardware then read 335 of 335.
 
-`build/testmap.reu` carries no music, which is a supported configuration:
-`miMusBase == 0` means "render in silence". The first version returned early on
-that, before installing the vectors — and `main.asm`'s `cli` then took the
-KERNAL's still-running CIA 1 jiffy IRQ through `$FFFE`, which held whatever the
-reset left in it. **The engine hung before frame 1 on an image that was merely
-silent**, and nothing about that failure looks like an audio bug.
+The general lesson is the one §4 keeps making: the instrument decided the
+answer. An average frame rate reads 16.96 fps and 16.71 fps as the same engine
+running well; only `ftHist` separates "paced" from "paced except every
+twentieth frame", and only the second reading is a lock.
 
-`musInit` now installs the handler and the vectors and turns off every
-interrupt source *first*, unconditionally, and only a stream that checks out
-switches CIA 1 back on. Every exit is now `cli`-safe. This was found by running
-the test-map image, not by reading the code.
+**Three consequences, all of which must land in the same commit as the cap:**
 
-### What it costs: nothing measurable on hardware, and 5.7% in VICE
+1. **Everything that moves must be rescaled by 1.5×**, because the frame period
+   is 1.5× longer and every motion in this engine is per-frame. `MOVE_SPEED`
+   14 → **21**, exactly. `TURN_SPEED` 3 → 4.5 is not representable in an 8-bit
+   angle space, and **it is 4**: 67°/s where M1 turned at 75. The fractional
+   accumulator that would give the exact rate costs a zero-page byte and six
+   cycles a frame, and is the thing to reach for if 67 feels sluggish in play.
+   Nothing tests this — it is a feel judgement, deliberately deferred to one.
+2. **`ftHist`'s target bucket moves from 2 to 3.** Done: `TARGET_FRAMES` in
+   `u64push.py`, which derives the deadline, the percentage and the bucket
+   index from one number. The `4+` alarm stays the alarm. The buckets in
+   `frameMark` did **not** move — they count raster frames, which is a property
+   of the VIC, not of the cap.
+3. **The music tick is unaffected** — it is CIA-driven, in real time, not
+   per-frame. It simply fires 6 times per rendered frame instead of 4, which is
+   0.26 ms of DMA and register writes instead of 0.17.
 
-| | fps | on deadline | compute max |
-|---|---:|---:|---:|
-| no player | 24.99 | 100% | 38.6 ms |
-| player running (x2) | 24.99 | 100% | 38.6 ms |
+Do this **first**, before any feature work. Measuring M2's features against M1's
+deadline would report false failures all milestone, and rescaling the movement
+constants twice means tuning the game's feel twice.
 
-Predicted 0.17 ms/frame — four ticks, each an interrupt (1.7 µs, §14), a
-40-byte DMA and a mean of 3.3 register writes — and the measurement cannot
-resolve it, because a Timer B tick is 1.015 ms. Consistent, not confirmed.
+### 8.2 The budget, allocated
 
-**`make stats` is useless for this one change and will stay useless.** It
-reports +5.7% (2307 → 2438 ms/frame), which is real arithmetic about the
-emulator: the tick rate is a CIA latch, i.e. fixed in *real* time, while VICE's
-1 MHz frame lasts 2.3 emulated seconds. An emulated frame absorbs ~231 ticks
-where the Ultimate absorbs 4. Every other change to this engine can be judged
-in VICE and converted (§12); this one cannot.
+22 ms available, ~2 ms held back as margin — M1 shipped on 2 ms of margin and
+that was uncomfortably tight.
 
-**One reading said 24.10 fps and 93%, and it is unexplained.** It was taken
-immediately after a 470 KB `make u64-map`, and the three clean readings were
-taken standalone. §16's lesson is exactly this shape — a hardware number
-believed for half a session that was an artifact of what ran before it — so the
-attempt to reproduce it was made rather than assumed. It could not be
-completed: see below.
+| | Estimate | Basis |
+|---|---:|---|
+| Wall textures | 6-9 ms | §10.4 |
+| Doors and moving sectors | < 0.5 ms | §11; the renderer needs no change |
+| Sprites | 6-8 ms | §12.4, dominated by REU streaming |
+| HUD | < 0.5 ms | §13; redrawn only when a value changes |
+| Margin | 2 ms | |
+| **Total** | **15-20 ms** | against 22 |
 
-### The upload got 13x bigger, and the Ultimate did not like it
+It fits, with little room for a surprise. **Every phase reports `ftComp` before
+and after** — the frame timer already exists and this is what it is for. A phase
+that overruns its estimate stops the milestone rather than eating the next
+phase's budget.
 
-The image went from ~36 KB used to ~470 KB, because the uploader sends one
-contiguous region from offset 0 to the last byte any descriptor claims. Three
-chunks became 29, and `make run-u64` went from seconds to minutes.
+### 8.3 RAM is still the binding constraint, and the first job is to find some
 
-Then, after several such uploads in one session, **`POST /v1/runners:run_prg`
-started answering `404 Cannot open file` — for every PRG, including paths that
-had worked minutes earlier**, and it survived a `machine:reset`. The Ultimate
-needs a power cycle. This is correlation, not a proven cause, and it is not
-something the C64 side can see; but the only thing that changed about this
-machine's workload is a 13x larger upload repeated several times.
+M1 ended with **~90 bytes of code RAM**. M2 needs, at minimum, a texture
+sampling inner loop, a moving-sector thinker list, a sprite list with a sort, a
+per-column depth array for sprite clipping, and a HUD blitter. That is
+kilobytes, not bytes, and no amount of clever will fit it into 90.
 
-**Worth doing before this is trusted for routine use:** teach the uploader to
-send only the regions descriptors actually claim, instead of one span from
-zero. The 28 KB hole between the map and `MUSIC_OFFSET` is uploaded as zeros
-today, and more importantly the music never changes between builds — a
-content hash per chunk, skipped when it matches, would take the common
-rebuild-and-run back to three chunks.
+**The candidate was `$0400-$07ff`, and it is gone.** *(Checked 2026-08-11,
+before anything was designed around it — which is the entire reason §9.1 asked
+for the check.)* It is **`COLBUF`**, the colour-RAM staging buffer:
+`.const COLBUF = $0400` in `defs.asm`, written per cell by `chunky2mc`'s
+self-modifying `colSta`, and burst-copied to `$D800` by `flip` every frame.
+`probe.py` has always listed it in `ALLOWED`; a `dump` run reads 880 of 896
+bytes non-zero. The claim in an earlier draft of this section — "nothing in
+`defs.asm` claims it" — was simply false, and a `grep` would have said so.
 
-### Verified, and how
+What is actually there:
 
-`make check` gained a check that is exact rather than indicative: it reads
-`musPtr` and all 25 SID registers from the running machine **without leaving
-the monitor in between**, then replays the stream in Python up to that pointer
-and compares. A match proves the tick fires, the DMA lands, the pointer stays
-on record boundaries and every write reaches the chip. The boundary half is the
-one that matters — a replay head half a record out of step still writes
-plausible bytes to the SID and merely sounds wrong, which no screenshot and no
-checksum would catch.
+| Range | Size | State |
+|---|---:|---|
+| `$0400-$076f` | 880 B | `COLBUF`, live every frame. **Unavailable.** |
+| `$0770-$07e7` | 120 B | written once at boot by `clearHudRows`; `flip` copies only the first 880 B, so nothing reads it back |
+| `$07e8-$07ff` | 24 B | genuinely free |
 
-That test is VICE-only: the SID is write-only and the Ultimate's `readmem` is a
-DMA into a running machine, so `$D400-$D418` reads back `$40` in every
-register, and there is nothing to stop time between the two reads anyway. On
-hardware the check is `musErr == 0` plus a pointer that is inside the block and
-advancing — measured at 487 stream bytes in 0.5 s, ~107 ticks/s against the
-tune's 100.25 Hz.
+**So M2 has ~90 bytes of code RAM and ~200 bytes of data RAM, not 1 KB**, and
+risk #1 in §14 has arrived on day one. Two consequences, both already priced:
 
-`docs/reu-format.md` §4.6 is the format contract and §2/§3 carry the version
-bump to 3 and the `BF_PAGES` flag the 400 KB length field needed.
+- **§12's per-column depth array needs a different home** — and there is a
+  better one than any free block. See §12.1.
+- **Stage B textures are that much less likely.** A per-frame texel cache
+  needs a scratch region; the only one that exists is MATRIX, staged the way
+  `mapLoad` stages, which is what §10.2 already proposed.
+
+For code, the remaining levers are the two M1 already used:
+
+- **More boot-only code into MATRIX.** `mapLoad` went there and returned 411
+  bytes. `reuProbe`, `musInit`'s stream validation and the sphere-table setup
+  are all boot-only and all currently resident.
+- **Accept fragmentation.** M1's sphere test lives in four pieces across three
+  holes because that is what existed. M2 should expect the same and design
+  routines that split cleanly at a `jsr`.
+
+## 9. Phase 7 — Clear the ground
+
+Nothing here is a feature. All of it makes the rest of the milestone possible or
+cheaper, and the first item is a hard blocker.
+
+### 9.1 The uploader must stop sending 470 KB *(blocker — closed 2026-08-11)*
+
+> **Done.** `make run-u64` is **8 seconds**, of which most is `u64config` and
+> the loader stub's 3 s settle: `0 chunk(s) sent, 28 unchanged and skipped`.
+> A first upload after a power cycle still sends all 28. `make u64-map` then
+> read every one of those 28 chunks back off the machine and matched — the
+> independent check that the cache is not lying about what is in REU RAM.
+>
+> **The 404 did not recur.** Twelve `run_prg` calls in ~40 s, a higher rate
+> than the ~10-per-minute that wedged the machine before, all clean. So the
+> cause was upload volume rather than a per-call resource leak, and the fix is
+> the fix — but risk #6 stays in the register, because a negative result over
+> 40 s is weaker than the positive one that motivated it.
+>
+> The three items below landed as: claimed-region chunking (28 chunks instead
+> of 29 — the hole was worth less than it looked), a content-hash skip cache in
+> `build/.reu-upload-cache.json` (this is the win), and the deliberate 404
+> re-run. `--no-reu-cache` forces a full send.
+
+The image went from ~36 KB to ~470 KB when music landed, because `u64push.py`
+sends one contiguous region from offset 0 to the last byte any descriptor claims.
+Three chunks became 29 and `make run-u64` went from seconds to minutes. Worse:
+after several such uploads in one session, `POST /v1/runners:run_prg` began
+answering `404 Cannot open file` for every PRG, survived `machine:reset`, and
+needed a power cycle. That is correlation, not proven cause — but M2 is a
+milestone of many iterations and this is not usable as it stands.
+
+1. **Send only the regions descriptors actually claim.** The 28 KB hole between
+   the map and `MUSIC_OFFSET` is currently uploaded as zeros.
+2. **Content-hash each chunk and skip the ones that match.** The music never
+   changes between builds; the common rebuild-and-run should be back to three
+   chunks and seconds.
+
+   The cache cannot simply be believed: REU RAM survives a reset but not a
+   power cycle, and another checkout or a hand load from the Ultimate's menu
+   can have written it since. So a random 16-byte token goes into REU RAM at
+   `$00F010` — in the unclaimed hole above `reuProbe`'s scratch, which no
+   descriptor covers and no chunk touches — and the cache is trusted only when
+   the token still reads back. It is **cleared before an upload and written
+   after** a fully successful one, so an upload that dies halfway leaves no
+   token and the next run sends everything. `--verify-reu` reads back every
+   chunk regardless, skipped ones included, which is what keeps the whole
+   mechanism falsifiable.
+3. **Re-run the `404` scenario deliberately** once the upload is small, and
+   record whether it recurs. If it does, it is a firmware constraint the whole
+   project needs to know about; if it does not, the cause was upload volume and
+   the fix is the fix.
+
+Also verify `$0400-$07ff` here, since it gates §8.3. **Done, and it failed:**
+the block is `COLBUF` and always was — `probe.py` already listed it, and a
+`dump` run reads 880 of 896 bytes non-zero. §8.3 carries the numbers. The check
+cost twenty minutes and it was asked for by name in this plan, which is the
+only reason a kilobyte of imaginary RAM did not end up underneath §12's sprite
+design.
+
+### 9.2 Sliding along walls, and the two-boundary loop
+
+M1's single biggest gameplay defect: a blocked move is undone whole, so walking
+into a wall at a shallow angle stops you dead. Both open items want the same
+change to `checkMove`, so they are one job:
+
+```
+for attempt in 0..2:                     ; iteration cap
+    descend BSP with the destination point
+    find the blocking seg, if any
+    if none: commit the move, done
+    project the remaining motion onto the seg's direction
+    retry with the projected destination
+undo the move
+```
+
+The projection is `d - n(d·n)` with `n` the seg normal — two `ssmul32` calls
+and a shift, reusing the arithmetic `segFacing` already runs. The iteration cap
+is what also fixes `pipeline.md` §5.3's "a frame's motion crossing two subsector
+boundaries is only tested against the first": each iteration re-descends from the
+new destination, so crossing two boundaries is two iterations rather than a
+missed test.
+
+Two things this must keep: `segNear`'s bounding-box test inflated by the player
+radius (without it, collinear segs in one subsector block on whichever is listed
+first — which is exactly the shape of E1M1's start-room exit), and the existing
+step/headroom rules (floor step > 24 blocks, headroom < 56 blocks).
+
+*Done when:* you can walk the length of a wall at 20° without stopping, and a
+scripted diagonal run into an inside corner neither leaks nor sticks.
+
+### 9.3 `data_structures.md` reconciled
+
+It has described a format the tool does not emit since Phase 3, and M2 changes
+the formats again (§10.2, §11.2). Reconcile it once now, against
+`docs/reu-format.md`, which is authoritative — or delete it and redirect, if
+everything in it is now said better there. Deciding that is part of the job.
+
+The memory map has **four independent copies**: `defs.asm`, the image's own
+load-address bytes, `probe.py`'s allowed-region table, and `docs/reu-format.md`.
+The first two are cross-checked at boot and the third fails `make check` when it
+drifts. The document is the one nothing enforces, which is why it is the one that
+rots.
+
+## 10. Phase 8 — Textured walls
+
+The defining feature of M2 and the one with the real risk in it.
+
+### 10.1 The insight the format hands us
+
+The chunky buffer is one byte per pixel, `ramp << 4 | intensity`. `chunky2mc`
+packs it into multicolor, where a 4×8 cell may hold only three colours plus
+background — and the reason M1's frames are clean is that a whole surface shares
+one ramp, so a cell's colours are consistent by construction.
+
+**A texture must therefore modulate the intensity nibble and leave the ramp
+alone.** That is not a compromise dressed up as a design: it is the only form of
+texture that cannot break the attribute constraint, it costs one `ora` per pixel
+because the ramp is already in a register, and it is exactly what Doom's own
+textures mostly carry at this resolution — structure, not hue.
+
+The surface's ramp keeps coming from `wad2reu.py`'s `RAMPS` table, which stays
+the art-direction knob. Depth falloff, which currently sets the whole nibble,
+becomes a *bias* applied to the texel's intensity, clamped to 1-15.
+
+### 10.2 Do it in two stages, with a measurement between them
+
+**Stage A — resident 8×8 intensity tiles.** One 8×8 nibble-packed tile (32
+bytes) per texture family, indexed by `(u & 7, v & 7)`. E1M1 uses 32 wall
+textures across roughly 16 families → **512-1024 bytes, fully resident**, no
+streaming, no cache, no eviction. Generated in `wad2reu.py` by downsampling the
+real WAD texture to 8×8 and normalising its intensity range.
+
+This is not a placeholder for a "real" implementation — it is the version that
+is certain to fit in both RAM and the frame, and it delivers most of what
+texturing is *for* at 160×176: surfaces that are distinguishable and read as
+material rather than as flat colour.
+
+**Stage B — real texels, 64×64, streamed and cached.** Only if Stage A measures
+well inside its budget. A 64×64 4-bit texture is 2 KB, so a cache is 2-3
+textures at most and there is nowhere to put it; the honest form is a
+*per-frame* cache keyed on the fact that a frame draws few distinct textures,
+streamed into a MATRIX scratch region the way `mapLoad` staged through it.
+
+**Model Stage B before building it**, with a `profile.py` checkpoint on the
+sampler's inner loop and a hand-counted cycle cost. §4 is unambiguous that this
+class of estimate is wrong by 3-7× in this engine, in both directions.
+
+### 10.3 The u coordinate is where the cycles go
+
+`v` is nearly free: the wall column already steps a fixed-point row accumulator,
+and the texel row is that accumulator's high bits masked to the tile height.
+
+`u` is the perspective divide. Doing it per column is up to 160 extra `udiv`
+calls a frame against the 628 the whole engine currently makes — divides are
+~18% of the frame, so that alone is +1 to +2 ms.
+
+**Interpolate `1/z` and `u/z` linearly across the seg and divide once every
+8 columns**, affine within the subspan. This is what Doom does and the error at
+this resolution is sub-texel for anything but a wall nearly edge-on. It takes the
+divide count to ~20/frame — a rounding error — and turns the per-column work
+into two adds.
+
+The seg already computes `ry0`/`ry1` at both endpoints for projection, so the
+endpoints of the interpolation exist. What is new is the along-wall distance at
+each endpoint, which the seg record does not carry.
+
+### 10.4 What it should cost
+
+`spanFill` is 2593 calls / 28.4k pixels / ~27% of a 37.6 ms frame ≈ **22 cycles
+per pixel** at 64 MHz. A textured pixel adds a fixed-point `v` accumulate, a
+nibble fetch and unpack, and the `ora` — call it +18 cycles, so a textured pixel
+is ~1.8× a flat one.
+
+Walls are roughly 40% of the screen's pixels in a typical E1M1 view (floors and
+ceilings dominate, and they stay flat). So: 11.4k pixels × 18 cycles ≈ 3.2 ms,
+plus the subspan divides and setup, plus a nibble unpack that may want a
+256-byte lookup table instead of a shift.
+
+**Estimate: 6-9 ms.** Wide, deliberately. This is the number that decides whether
+Stage B ever happens, and §4's lesson is that the way to narrow it is a
+checkpoint on the real inner loop, not more arithmetic in this document.
+
+### 10.5 The acceptance test changes shape
+
+Every optimisation in M1 was verified as *0 of 104448 pixels differ*.
+Texturing changes the frame by design, so that oracle is gone for this phase and
+must be replaced deliberately:
+
+- **`make framehash` still applies within the phase** — capture a hash once the
+  first textured frame is judged correct by eye, and hold every subsequent change
+  to it.
+- **`wad2reu.py --validate` gains a texture check**: every surface resolves to a
+  tile, every tile's intensity range is within 1-15 after the depth bias is
+  applied at both extremes, and no surface maps to a tile of uniform intensity
+  (which would be a silently untextured wall).
+- **A known-good reference frame** at the spawn, committed as a PNG, compared by
+  eye at each step. The frame is still the only oracle this engine has.
+
+## 11. Phase 9 — Doors and moving sectors
+
+The cheapest feature in M2 by a wide margin, for two structural reasons.
+
+### 11.1 The renderer needs no change at all
+
+A door is a sector whose ceiling height animates. The renderer reads sector
+heights from the resident `SECTORS` block at `$DC00` every frame and draws
+upper/lower steps against them; a closed door is a two-sided seg whose upper step
+covers the whole opening, which `doWall` already draws as a solid band. **Change
+the height in RAM and the door renders.**
+
+And the bounding spheres stay valid: they are 2D, in x/y, and a moving sector
+moves in z. Nothing needs re-culling, nothing needs re-validating, and the
+offline sphere check in `wad2reu.py` is unaffected.
+
+Collision follows for free too — `checkMove`'s step and headroom tests already
+read the same live sector heights, so a closing door blocks and an open one does
+not, without a line of new collision code.
+
+### 11.2 What has to be built
+
+1. **A trimmed `LINEDEFS` block, resident.** M1 dropped linedefs entirely.
+   Only lines with `special != 0` or `tag != 0` need to come back — in E1M1 that
+   is a few dozen — as `[v0, v1, special, tag, frontSector, backSector]`.
+   Under 300 bytes; it wants a home under `$D000`, where `NODES` + `SECTORS`
+   leave 640 bytes.
+2. **A seg → linedef reference.** The seg record is 10 bytes and `doWall`
+   indexes `SEGBUF` by byte offset, so widening it is not free. Two options,
+   and this is the phase's one real design decision:
+   - **Widen to 11 or 12 bytes** — a format version bump, +1.5 KB of REU, and
+     ~90 more DMA bytes per frame. Simple, and the stride stays uniform.
+   - **Look the line up by geometry** — on "use", find the special line whose
+     endpoints the seg lies on. No format change, no per-frame cost, and it only
+     runs on a keypress.
+
+   **Prefer the lookup.** M1's evidence is that per-frame DMA bytes are the
+   scarce thing and a keypress is not; and §4's revert is a warning about
+   growing the hottest record for a cold feature.
+3. **A thinker list.** A fixed array of active moving sectors —
+   `[sector, target, speed, state, delay]` — updated once per frame before the
+   render. Eight entries is more than E1M1 ever has active. ~64 bytes of the
+   data RAM §8.3 is looking for.
+4. **Activation.** Two paths: the **use key**, which raycasts a short distance
+   ahead against the current subsector's segs (already streamed, already in
+   `SEGBUF`); and **walkover triggers**, which `checkMove` detects as a crossing
+   of a special line during its descent — the same test it already does to find
+   the blocking seg.
+5. **`wad2reu.py`** maps Doom's line specials to the subset M2 implements: door
+   open/close/stay, switch, platform, and lift. Anything else becomes a no-op
+   and the validator reports what it dropped, so the map does not silently lose
+   a mechanism.
+
+### 11.3 The one thing to watch
+
+**A door that closes on the player.** Doom's answer is to reverse the door;
+without it, `checkMove`'s headroom test starts failing every move and the player
+is stuck inside geometry with no way out. Handle it in the thinker — if the
+player's subsector is the moving sector and the headroom would drop below 56,
+reverse — not in the collision code.
+
+*Done when:* the E1M1 start-room door opens on use, closes behind you, and the
+first lift runs; `make framehash` differs between open and closed and is stable
+in each state; `make debug` is clean across a scripted walk that triggers both.
+
+## 12. Phase 10 — Sprites
+
+The hardest phase, and the one whose scope must stay narrow: **things are drawn,
+not animated and not intelligent.** Barrels, lamps, corpses, and the static
+props that make E1M1 read as a place rather than a maze.
+
+### 12.1 The clipping problem is the real work
+
+The renderer walks front-to-back and consumes `colTop`/`colBot` destructively as
+it closes columns. Sprites must be drawn *after* the walls, back-to-front, and
+clipped against the geometry that was drawn in front of them — and by then the
+information is gone.
+
+**So the wall pass must record a per-column depth.** 160 columns × one byte of
+quantised `ry` = 160 bytes, written once per closed column, which is a store the
+wall pass mostly already performs. A sprite column is drawn where its `ry` is
+nearer than `colDepth[x]`.
+
+**Where those 160 bytes come from, now that `$0400-$07ff` turned out to be
+`COLBUF` (§8.3): `colTop` itself.** No new RAM at all.
+
+A column is closed when `colTop[x] >= colBot[x]`, and once closed neither value
+is read for anything else — the wall pass only ever re-tests the predicate. So
+when the pass closes column *x*, write `colBot[x] = 0` and `colTop[x] =` the
+quantised `ry` of the seg that closed it. The predicate still holds for every
+depth (`d >= 0` always), so occlusion is unchanged; and after the pass,
+`colTop[]` **is** the depth array, with `colBot[x] != 0` marking the columns
+nothing ever closed (sky, or an unfinished frame) where a sprite is always
+visible. Both arrays are page-aligned and indexed by column already.
+
+This wants proving against the real `doWall` and `spanFill` before §12 depends
+on it — floors and ceilings read the same two arrays — but it is one store on a
+path that already stores there, in the one place that has no RAM to spend.
+
+**Deliberately simpler than Doom**, which stores per-seg opening ranges and
+clips each sprite column against a list of them. One depth per column mis-clips
+a sprite that straddles a window opening — a sprite behind a wall with a hole in
+it may show through the hole's column range, or be hidden in it. At 160 columns,
+with M2 drawing no enemies that move behind windows, that is the right trade.
+Revisit it in M3 with combat, not before.
+
+### 12.2 What has to be built
+
+1. **A `THINGS` block**, resident: `[x, y, sector, type, angle]` per thing,
+   ~6 bytes × the things M2 draws. Pre-sorted by subsector at build time so the
+   BSP walk can pick them up per leaf, which is how Doom does it and it avoids
+   a per-frame scan of every thing on the map.
+2. **A visible-thing list**, built during the wall pass: as each subsector is
+   drawn, append its things with their transformed `rx`/`ry`. `transformPoint`
+   is already paid for the subsector's sphere.
+3. **A distance sort**, back-to-front, over that list. Insertion sort over
+   ~10 entries is a few hundred cycles and needs no scratch.
+4. **A masked, scaled blit.** Column stepping is the wall path's fixed-point
+   accumulator; row stepping is a second one. Transparency is a reserved
+   intensity value (intensity 0 is available — the ramp nibble makes it
+   distinguishable from a legitimate black), tested per pixel.
+5. **Sprite graphics in REU**, streamed per visible sprite per frame. A 32×32
+   4-bit sprite is 512 bytes ≈ 0.5 ms of DMA. This is why the phase's budget is
+   dominated by streaming, not by pixels.
+
+### 12.3 The scaling that keeps it honest
+
+Sprite scale is `VFOCAL / ry`, one divide per sprite — negligible. But **a
+sprite near the camera is enormous**, and a full-height 176-row sprite at
+32 columns is 5.6k pixels of masked blit, which is a fifth of the screen at
+roughly twice `spanFill`'s per-pixel cost.
+
+Cap it: clip the sprite to the viewport (it must be clipped anyway) and accept
+that a barrel pressed against the camera costs a frame. If that turns out to be
+common, the answer is a near-distance cap on drawn sprites, not a faster blitter.
+
+### 12.4 What it should cost
+
+Streaming dominates: 5-8 visible sprites × 512 B = 2.5-4 ms of DMA, at
+1 byte/µs, unaffected by the 64 MHz clock. Pixels: ~3-5k drawn sprite pixels at
+~40 cycles each (masked, with two accumulators) ≈ 2-3 ms. Sort and list build:
+under 0.5 ms.
+
+**Estimate: 6-8 ms.** The obvious optimisation, if it overruns, is a per-sprite
+REU cache keyed on the fact that consecutive frames draw the same things — but
+§4's revert says model it with a hit count first, because "trade CPU for REU
+bytes" has been close to exhausted in this engine at this frame size.
+
+## 13. Phase 11 — The HUD
+
+Cheap, independent of everything else, and the thing that most makes the game
+look finished. **It can jump the queue** — it shares no code with textures,
+doors or sprites, and it is the obvious phase to do while a hardware question
+from an earlier phase is waiting on the machine.
+
+1. **The status bar area is already blanked** by `main.asm` — the viewport is
+   160×176 of a 200-row screen, so ~24 rows exist below it.
+2. **Draw it once, patch digits on change.** Nothing in the HUD changes per
+   frame; a redraw costs nothing amortised. A dirty flag per field is the whole
+   mechanism.
+3. **Graphics from REU at boot**, blitted into the bitmap once: the STBAR
+   background, a digit font (12 glyphs), and the face frames if they are wanted.
+   No per-frame streaming, no resident graphics, no RAM cost beyond a few dozen
+   bytes of state.
+4. **Values are engine state that mostly does not exist yet** — health, armour
+   and ammo have no source until M3's combat. M2 should draw the bar with fixed
+   plausible values and wire the fields to variables, so that M3 changes a
+   number and not a renderer.
+
+*Done when:* the bar renders on hardware, `ftComp` is unchanged from before it,
+and changing a health variable over the monitor updates the display.
+
+## 14. M2 risk register
+
+| # | Risk | Early warning | Response if it arrives |
+|---|---|---|---|
+| 1 | ~~**There is nowhere to put M2's state.**~~ **Arrived, day one.** `$0400-$07ff` is `COLBUF` and always was | §9.1's watched-region run, before any design depends on it — which is exactly what caught it | ~200 B of data RAM and ~90 B of code RAM is the real budget (§8.3). Sprite depth moves into `colTop` (§12.1), Stage B textures get less likely, boot-only code goes into MATRIX |
+| 2 | **Textures overrun 9 ms.** The per-pixel estimate is 3-7× wrong, as it has been before | `ftComp` after the first textured wall, measured on hardware | Tile size 8×8 → 4×4; texture only one-sided segs; last resort, texture only walls within a depth threshold |
+| 3 | **Multicolor cells break anyway.** Intensity-only texturing still crosses a cell boundary where two surfaces meet, and always did | The first textured frame, by eye | This is M1's risk #5 returning; the fix is the same, in `wad2reu.py`'s ramp table |
+| 4 | **Sprite clipping mis-draws through openings** (§12.1's known simplification) | A sprite visible through a window in E1M1 | Accept for M2. It is a per-seg opening list in M3, which needs RAM M2 does not have |
+| 5 | **Three raster frames still is not enough.** Everything lands and compute exceeds 59.85 ms | `ftHist`'s `4+` bucket leaving zero | Four frames is 12.5 fps and that is below playable. Cut sprites to a near-distance cap first, then Stage A textures on fewer surfaces |
+| 6 | **The Ultimate's `404 Cannot open file` recurs** after §9.1's fix | Any `make run-u64` in a long session. Deliberately re-run 2026-08-11 — 12 `run_prg` calls in 40 s, clean — but 40 s is not a session | Then it is not upload volume, and the milestone needs a reliable reset procedure before it needs features |
+
+## 15. Sequencing
+
+**§9.1 first and alone.** It is a blocker, it is host-side Python, and every
+subsequent phase iterates through it. §8.1's cap change lands with it, or
+immediately after, so that all M2 measurement is against M2's deadline.
+
+Then **§9.2 and §9.3** — small, self-contained, and they clear M1's debts while
+the texture design is being thought about.
+
+Then **§10 (textures)**, which is the milestone's centre of gravity and the one
+whose measurement decides how much room the rest has. **Stop after Stage A and
+measure on hardware before deciding whether Stage B exists.**
+
+**§11 (doors)** is independent of textures and is the phase most likely to
+finish early. **§13 (HUD)** is independent of everything and is the right thing
+to pick up whenever the Ultimate is unreachable — which has happened twice.
+
+**§12 (sprites)** last, because it is the only phase whose RAM requirement is
+firm and whose budget has no fallback smaller than "draw fewer things".
+
+The M1 lesson worth repeating in every phase: **build the instrument first.**
+Three sessions in a row, the profiler or the counter or the frame timer
+overturned the plan's assumption within an hour of existing, and each time the
+plan's reasoning had been sound and its conclusion wrong.

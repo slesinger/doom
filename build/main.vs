@@ -16,7 +16,7 @@ al C:534f .miHaveStream
 al C:9d79 .spanEnd
 al C:965 .movePlayer
 al C:9d6a .spanTail
-al C:9fbb .msRead
+al C:9fb0 .msRead
 al C:9d92 .clampAcc
 al C:528e .mapLoadHi
 al C:ce4d .bspLoop
@@ -43,7 +43,7 @@ al C:9b7b .m8b
 al C:5268 .mapCopyByte
 al C:9b72 .m8a
 al C:cf31 .ssecSegs
-al C:9fcd .framePace
+al C:9fc2 .framePace
 al C:9b08 .flip
 al C:5300 .musInit
 al C:97f9 .sideFront

@@ -272,9 +272,9 @@ the 50 Hz a vertical-blank player would use.
 A count byte, then that many `(register, value)` pairs for the registers that
 changed since the previous tick. `DooM_Medley` changes a mean of 3.3 of 25, so
 this is 9.1 bytes where a raw snapshot is 25 — 405 KB against 1.11 MB for the
-whole 7:22. That ratio is not about REU space, which is free; it is about upload
-time, because `u64push.py` re-sends and verifies the used region on every
-hardware run.
+whole 7:22. That ratio was about upload time rather than REU space, which is
+free; since §9.3's skip cache the stream is uploaded once and skipped on every
+later run, so it is now mostly about the first upload after a power cycle.
 
 **The chip must start at zero.** The encoder's "previous" frame begins as 25 zero
 bytes, so a register the tune never writes is never in any record. `musInit`
@@ -292,9 +292,11 @@ records as noise. `DooM_Medley` asks for 39.
 
 #### What it costs the frame
 
-Four ticks per 39.9 ms frame at 100.25 Hz. Each is an interrupt (1.7 µs, §14
-measured on hardware), a 40-byte DMA and a mean of 3.3 register writes — about
-**0.17 ms a frame, ~0.4% of the budget**, and most of it is the DMA. REU DMA is
+Six ticks per 59.85 ms frame at 100.25 Hz — the tick is CIA-driven, in real
+time, so M2's longer frame absorbs more of them at the same cost per second.
+Each is an interrupt (1.7 µs, §14 measured on hardware), a 40-byte DMA and a
+mean of 3.3 register writes — about **0.26 ms a frame, ~0.4% of the budget**,
+and most of it is the DMA. REU DMA is
 1 µs/byte and does not scale with the turbo clock (§1), so the window is the one
 part of this that a faster CPU does not make cheaper.
 
@@ -734,12 +736,33 @@ matching REU **fetch** before moving on, because this is exactly the leg of the
 path that turned out not to be trustworthy.
 
 E1M1's map blocks are ~36 KB of used bytes, so three chunks — but the music
-stream sits at `$010000` and runs to ~467 KB (§4.6), and the uploader sends one
-contiguous region from offset 0 up to the last byte any descriptor claims. So a
-`make run-u64` now moves **~29 chunks, not three**, and the gap between the map
-and the music is uploaded as zeros along with everything else. That is minutes
-rather than seconds, and it is the price of the tune being in the same artifact
-as the map. Building without `--music` puts it back to three chunks.
+stream sits at `$010000` and runs to ~467 KB (§4.6), so a full upload is
+**28 chunks**, which is minutes rather than seconds.
+
+**Two things keep that off the common path** (2026-08-11):
+
+- **Only the chunks a descriptor claims are sent.** `image_regions` walks the
+  block descriptors instead of taking one span from 0 to the last claimed byte,
+  so the 28 KB hole between the map and `MUSIC_OFFSET` is no longer uploaded as
+  zeros. Worth one chunk of 29 — less than it looks, because the hole is
+  smaller than the stream by a factor of fifteen.
+- **A chunk whose content has not changed is not sent again.** REU RAM survives
+  a reset, so the previous upload's bytes are still there; `u64push.py` hashes
+  each chunk into `build/.reu-upload-cache.json` and skips the matches. The
+  music never changes between builds, so the rebuild-and-run case sends **zero
+  chunks** and `make run-u64` takes about 8 seconds.
+
+The cache is only believed when a random 16-byte token it recorded still reads
+back from REU `$00F010` — in the hole above `reuProbe`'s scratch (§9.4), which
+no descriptor claims and no chunk covers. The token is cleared *before* an
+upload and written *after* a successful one, so a power cycle, a hand load from
+the machine's menu, or an upload that died halfway all fail the check and send
+everything. `--verify-reu` reads back every chunk regardless, skipped ones
+included; `--no-reu-cache` forces a full send.
+
+This is the same discipline as everything else on this path: the mechanism that
+makes the upload fast is not trusted to be correct, it is checked by a
+mechanism that does not share its assumptions.
 
 **`go` = `$ff` means terminate, not "chunk done".** `rlDone` in `reuload.asm`
 is an infinite loop that performs no further transfers — and it keeps clearing

@@ -43,12 +43,8 @@ msInit:
         sta CIA2_CRA
         lda #%01010001              // B: force load, start, continuous,
         sta CIA2_CRB                //    counting A's underflows
-        jsr msRead                  // seed the pacer's reference point
-        lda msNow
-        sta msLast
-        lda msNow+1
-        sta msLast+1
-        rts
+        rts                         // the pacer's reference is msFrame,
+                                    // which ftInit seeds a few lines later
 
 //------------------------------------------------------------
 // msRead — Timer B into msNow, without a torn read.
@@ -85,26 +81,43 @@ msRead:
 // proportional to elapsed milliseconds is the real one, and now that
 // there is a clock it is possible (IMPLEMENTATION_PLAN.md §13).
 //
-// The timer counts down, so elapsed = (msLast - now) mod 65536. A frame
+// **The reference point is the last flip, not the last release**, and that
+// is the whole of what makes the pacing stable. Pacing release-to-release
+// pins the interval at FPS_CAP_TICKS, which is a whole number of 1.015 ms
+// ticks and therefore never a whole number of 19.95 ms raster frames: the
+// phase walks by the difference every frame until it crosses a raster line,
+// and one frame in every (raster period / drift) lands one crossing early.
+// Measured on hardware at 58 ticks: 58.87 ms against a 59.85 ms grid drifts
+// 0.98 ms a frame, and 16 of 341 frames came back at 25 fps inside an
+// otherwise perfect run. M1 had the same drift and could not show it --
+// 37.6 ms of compute made a 39.90 ms frame physically impossible, so the
+// beat was floored away rather than absent.
+//
+// Measuring from msFrame instead resets the reference at every raster
+// crossing, so the phase cannot accumulate. It also makes the cap's exact
+// value uncritical: `flip` does the quantising, and any wait that lands
+// strictly between two crossings picks the same one every time. Hence 49
+// ticks -- the middle of the window, ~10 ms of slack on either side --
+// rather than the largest value that fits.
+//
+// The timer counts down, so elapsed = (msFrame - now) mod 65536. A frame
 // slower than 65.5 s would alias, which is not a case worth code.
 //------------------------------------------------------------
 framePace:
         jsr frameStat               // what the frame cost before any waiting
 !wait:  jsr msRead
-        lda msLast                  // elapsed = msLast - msNow
+        lda msFrame                 // elapsed = msFrame - msNow
         sec
         sbc msNow
         tax
-        lda msLast+1
+        lda msFrame+1
         sbc msNow+1
         bne !done+                  // >= 256 ms: long past the cap
         cpx #FPS_CAP_TICKS
         bcc !wait-
-!done:  lda msNow                   // the new reference is *now*, not
-        sta msLast                  // msLast+cap: a frame that overran its
-        lda msNow+1                 // budget must not bank the overrun and
-        sta msLast+1                // sprint the next one
-        rts
+!done:  rts                         // no reference to update: frameMark
+                                    // re-seeds msFrame at the flip itself,
+                                    // so an overrun cannot be banked
 
 .errorif * > BITMAP0, "clock code overflows into BITMAP0"
 
@@ -199,6 +212,10 @@ frameStat:
 // The interval is bucketed by how many raster frames it spans. A tick is
 // 1.015 ms, so one raster frame is 19.65 ticks, two are 39.3 and three are
 // 59.0; the thresholds sit in the gaps, where nothing legitimate lands.
+//
+// The buckets do not move with FPS_CAP_TICKS -- they count raster frames,
+// which is a property of the VIC. What moves is which bucket means "on
+// time": two in M1, three in M2 (TARGET_FRAMES in tools/u64push.py).
 //------------------------------------------------------------
 frameMark:
         jsr msRead
