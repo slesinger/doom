@@ -44,7 +44,9 @@ from collections import Counter
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 2                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+VERSION = 3                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+                                # 3 added the music stream (block 5) and the
+                                #   page-unit length flag it needs
 
 HEADER_SIZE = 64
 BLOCK_ALIGN = 256
@@ -70,6 +72,17 @@ NODESPH_STRIDE = 8
 NODESPH_SHIFT = 3
 
 BLK_MAPINFO, BLK_NODES, BLK_SECTORS, BLK_SSECDATA, BLK_NODESPH = 0, 1, 2, 3, 4
+BLK_MUSIC = 5
+
+# Block descriptor flags (docs/reu-format.md §2).
+#
+# BF_PAGES exists for exactly one reason: the music stream is ~400 KB and the
+# descriptor's length field is 16 bits. Resident blocks never set it -- they
+# are all under 3 KB and mapload.asm reads their length in bytes -- so the
+# 6502 side needs no change, but `u64push.py` sizes the upload from these
+# descriptors and does.
+BF_RESIDENT = 1
+BF_PAGES = 2
 
 # reuProbe (src/reu.asm) round-trips a 4-byte signature through REU RAM at boot,
 # before the loader runs. The image's used region must not reach that address,
@@ -87,11 +100,21 @@ REU_PROBE_OFFSET = 0x00F000
 # switching the REU off (IMPLEMENTATION_PLAN.md §10), and it is caught the same
 # way: mapload.asm verifies the magic and `make check` asserts mapOK.
 #
-# 128 KB is VICE's smallest REU and the smallest real 1750, so the Makefile
-# runs -reusize 128 and one artifact serves both VICE and the Ultimate (whose
-# REU Preload does not care about the size). It leaves the probe scratch at
-# 64 KB comfortably inside. Raise both together if the image ever outgrows it.
-REU_IMAGE_SIZE = 128 * 1024
+# It used to be 128 KB, VICE's smallest REU and the smallest real 1750. The
+# music stream took it to 512 KB: DooM_Medley is 7:22 of delta-encoded SID
+# registers, 405 KB, and it goes above the probe scratch at 64 KB rather than
+# below it (MUSIC_OFFSET). The Makefile runs -reusize 512 to match, and one
+# artifact still serves both VICE and the Ultimate.
+#
+# The size is fixed rather than fitted to the content on purpose: VICE demands
+# an exact match against -reusize, and a size that moved with the tune would
+# put a number in a build artifact that the Makefile has to guess.
+REU_IMAGE_SIZE = 512 * 1024
+
+# The music stream starts on a bank boundary above reuProbe's scratch, so the
+# map image below it keeps the whole 64 KB it had and nothing has to move when
+# a tune changes length.
+MUSIC_OFFSET = 0x010000
 
 LOAD_MAPINFO = 0x0E00
 LOAD_NODES = 0xD000

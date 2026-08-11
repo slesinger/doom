@@ -58,6 +58,7 @@ The five documents divide along one axis: **what we intend to build** versus
 | **[`pipeline.md`](pipeline.md)** | **The end-to-end compute path**, from a key press to pixels in VIC-II memory — as built, with formulas, cycle counts, a fully worked frame, and the reasoning behind each optimization. If you read one document, read this one. |
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | What is built, what is missing, and the phase-by-phase route to Milestone 1 — with the session log of what each pass changed. |
 | [`docs/reu-format.md`](docs/reu-format.md) | The frozen `assets.reu` map-image format: header, block layouts, the subsector slots streamed per frame, where it all lands in the machine, and how the image gets there on each of the two targets. |
+| [`docs/intro.md`](docs/intro.md) | The title screen (`src/intro/`) — a separate program from the engine, its koala picture, and its music: the C64 Ultimate's hardware PCM sampler, not a SID player. |
 
 ### Target architecture
 

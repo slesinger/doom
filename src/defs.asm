@@ -200,14 +200,67 @@
 // six bytes above it, $fffa-$ffff, are the NMI/RESET/IRQ vectors, read from
 // exactly this RAM when an interrupt is taken with HIRAM = 0.
 //
-// Nothing is put there, and that is a decision rather than an oversight.
-// Reaching past $CFDA extends the PRG image over $D000-$DFFF, so loading it
-// writes 4 KB of filler across the I/O space -- harmless under VICE's RAM
-// injection, but it depends on how the loader banks memory, and the U64 path
-// is a DMA whose behaviour there nobody has tested. udiv's short path was
-// assembled here first and moved back down once mapLoad's relocation freed
-// low RAM; the measurement was identical either way. This block is M2's, for
-// the audio interrupt that has to reach $fffe.
+// Nothing is put there *by the PRG image*, and that is a decision rather than
+// an oversight. Reaching past $CFDA extends the image over $D000-$DFFF, so
+// loading it writes 4 KB of filler across the I/O space -- harmless under
+// VICE's RAM injection, but it depends on how the loader banks memory, and
+// the U64 path is a DMA whose behaviour there nobody has tested.
+//
+// M2's music interrupt claims the block anyway, without the image reaching
+// it: music.asm assembles the handler with `.pseudopc MUSCODE` inside the
+// boot segment, and musInit copies it up before the first frame. The PRG
+// still ends at $CFDA. See src/music.asm.
+.const MUSCODE     = $ff40          // the IRQ handler's run address
+.const MUSCODE_END = $fff9          // $fffa-$ffff are the vectors themselves
+
+// The music player's RAM, in what was sphereVisible's block. 51 of the 60
+// bytes; nothing else in the engine wants a block this small.
+//
+// musBuf is the DMA window, not a frame: records are variable-length (a count
+// byte then that many register/value pairs), so the handler fetches a fixed
+// MUSWINDOW bytes, reads the count out of byte 0, and only then knows how far
+// to advance. The window has to cover the longest record in the stream, which
+// musInit checks against the stream header rather than assuming.
+.const MUSDATA   = $0fc4
+.const MUSWINDOW = 40               // >= the header's window byte, checked at boot
+.const musBuf    = MUSDATA          // MUSWINDOW B: one tick's delta record
+.const musPtr    = MUSDATA + 40     // 3 B: 24-bit REU offset of the next record
+.const musLoop   = MUSDATA + 43     // 3 B: where the tune repeats from
+.const musEnd    = MUSDATA + 46     // 3 B: one past the last record
+.const musBank   = MUSDATA + 49     // 1 B: $01 as the interrupt found it
+.const musOK     = MUSDATA + 50     // 1 B: 1 = a stream was found and started
+.errorif MUSDATA + 51 > $1000, "music data overruns MATRIX"
+
+// The nine REU registers the handler has to put back. It DMAs its own record
+// while the renderer is mid-transfer-setup: the renderer fills $DF02-$DF08 and
+// then writes the command, and an interrupt landing between those two writes
+// would otherwise return to a command that transfers the music's parameters.
+// $DF00 and $DF01 are excluded deliberately -- reading the status register
+// clears it.
+.const MUSREU    = $0d33            // 9 B, in UDIV8's tail
+
+// Boot-only: reads the stream header out of the REU, copies the handler to
+// MUSCODE and starts the timer. Runs once, from main, so it lives in MATRIX
+// like mapLoad does -- see BOOTCODE. mapLoad ends at $52a0.
+.const MUSBOOT   = MATRIX + $4300   // $5300
+
+// CIA1 Timer A is the music tick. The KERNAL leaves it free-running as its own
+// 60 Hz interrupt source and nothing in the engine reads it -- readInput uses
+// $DC00/$DC01, the data ports, and clock.asm deliberately took CIA2 instead.
+// The latch comes from the stream header, because the tune sets its own rate:
+// DooM_Medley wants 100.2 Hz ($2663), not the 50 Hz a vertical-blank player
+// would use.
+.const CIA1_TALO   = $dc04
+.const CIA1_TAHI   = $dc05
+.const CIA1_ICR    = $dc0d
+.const CIA1_CRA    = $dc0e
+
+.const SID        = $d400
+.const SID_VOLUME = $d418
+
+// The IRQ vector, read from RAM in both banking states (HIRAM = 0 in $34 and
+// $35 alike), which is the property that makes MUSCODE reachable at all.
+.const IRQVEC     = $fffe
 
 // bsp.asm lands in two pieces. The traversal proper follows doWall in the walls segment; the node test
 // and the standalone descent go in the tail of TABLES_FREE. Two pieces
@@ -244,13 +297,19 @@
 .const miNumSegs    = MAPINFO + 19
 .const miMapId      = MAPINFO + 21
 .const miSphBase    = MAPINFO + 22  // 24-bit REU offset of block 4, NODESPH
+// The music stream, block 5. Zero means the image carries no music, which is
+// not an error: `make assets` without a tune produces one, and the engine then
+// renders in silence rather than refusing to boot (src/music.asm).
+.const miMusBase    = MAPINFO + 25  // 24-bit REU offset of block 5, MUSIC
 
 // image header field offsets — docs/reu-format.md §2
 // 2 added the bounding spheres: the eight-byte subsector slot header and
 // block 4. A version-1 image loads none of it, so mapload.asm rejects it
 // rather than reading zeroes as spheres of radius nothing and culling the
-// entire map.
-.const MAPFMT_VERSION = 2
+// entire map. 3 added the music stream (block 5) and miMusBase above; it
+// must move in lockstep with wad2reu.py's VERSION, because mapload.asm
+// halts the machine on any other number.
+.const MAPFMT_VERSION = 3
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5

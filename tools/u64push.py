@@ -8,14 +8,29 @@
 The PRG goes over the REST API, which resets the machine, DMAs the image
 into RAM and starts it -- no disk image, no drive emulation.
 
-REU images take the other route. The REST API has no "attach REU"
-command, so the image is uploaded over the Ultimate's FTP service and
-the machine's *REU Preload* setting is pointed at it; the Ultimate then
-loads it into REU RAM on the next reset, which run_prg performs anyway.
-That is the answer to the open question in IMPLEMENTATION_PLAN.md
-Phase 1.2.
+REU images take one of two other routes, selected by --reu-mode:
+
+  stash (default)  DMA the image into C64 RAM in 16 KB chunks and have
+                   src/reuload.asm stash each one into the REU, reading
+                   every chunk back with a matching fetch.
+  preload          upload the image over FTP to the path the machine's
+                   *REU Preload Image* setting names. The Ultimate loads
+                   it into REU RAM on a reset -- but **not** on any reset
+                   this tool can ask for: neither machine:reset nor the
+                   reset inside run_prg triggers it (measured, by
+                   poisoning REU RAM and reading it back). Only a reset
+                   from the machine's own menu or a power cycle does. So
+                   this mode uploads the file and tells you to do that;
+                   it cannot finish the job on its own.
+
+--verify-reu reads the whole used region of REU RAM back through the
+same stub and diffs it against the local image. That is the check that
+covers the *streamed* blocks; --verify-map only covers the three
+resident ones, and an image whose first 16 KB arrived and whose tail did
+not passes --verify-map while rendering garbage.
 
 --fps reads the engine's frame counter (frameCnt, see src/defs.asm) twice
+
 over a wall-clock interval and reports the real frame rate. It is a DMA
 read over the network, so it does not perturb the running engine beyond
 the few stolen cycles of the DMA itself.
@@ -72,13 +87,72 @@ RELOAD_PRG = "build/reuload.prg"
 MBOX = 0x0340                    # must match src/reuload.asm
 RLREADY = 0x0348
 RELOAD_BUF = 0x1000              # C64 staging buffer; free while the stub runs
+# Tried doubling this to 32768 to cut the intro's ~470-chunk upload in half;
+# on real hardware the *second* chunk then came back with all 32768 bytes
+# wrong, reproducibly, while 16384 has never done that across thousands of
+# chunks. Something in the Ultimate's own path -- HTTP body handling, the
+# REU DMA, or the fetch-back read -- has a boundary here that is not
+# documented anywhere this project has found it, so this stays at the size
+# that is known to work rather than the size that would be faster.
 RELOAD_CHUNK = 16384
 
 GO_STASH, GO_FETCH, GO_DONE = 1, 2, 0xFF
 
+# NOTE (2026-08-11): most of what the machinery below was built for was one
+# bug, not the machine -- _stash_chunk sent GO_DONE after *every* chunk, and
+# GO_DONE terminates the stub (see finish_stub). Every upload past one chunk
+# therefore failed at chunk 2, in-place retries could not help, and a stub
+# restart "recovered" exactly one more chunk, which is what made a
+# deterministic failure look intermittent. What remains below is the residue:
+# the HTTP-level 404s are real and were seen independently, so the retry path
+# stays, but its failure rate should now be nothing like what these comments
+# describe.
+#
+# The intro's music REU (build/intro.reu, ~7.6 MB used) pushes several
+# hundred chunks through this loop, each several HTTP round trips, and two
+# distinct failures have been seen: an occasional "HTTP 404 Could not read
+# data from attachment" from the Ultimate's own web server on a writemem or
+# a mailbox poll, and -- confirmed by hand, more than once, with identical
+# code and identical data on both sides of it -- a chunk whose fetch-and-
+# verify comes back completely wrong (every byte) for no HTTP-visible
+# reason. Both are genuinely intermittent, not triggered by anything about
+# the chunk itself: the same stash+fetch of the same bytes at the same REU
+# offset, run again from a fresh reset, has been clean every time it was
+# retried that way.
+#
+# What does NOT clear it is retrying the identical mbox command against
+# the *same* running stub -- 8 in-place retries, 3 s apart, recovered a
+# stuck chunk zero times across several attempts. Only a fresh run_prg
+# did, reliably. So a chunk gets a short in-place retry first (cheap, and
+# occasionally enough for the HTTP-level failure), and only escalates to
+# restarting the stub if that is exhausted.
+#
+# Restarting is not free, though: run_prg does real work on the Ultimate
+# per call, and ~10 of them inside a minute (no restraint, tried once)
+# left it answering every run_prg with "Cannot open file" -- some internal
+# resource it opens per call, exhausted -- which a plain machine:reset did
+# not clear either; recovering needed a power cycle. RESTART_COOLDOWN and
+# STUB_RESTARTS both exist to keep this from happening again: restarts are
+# spaced out and capped well under where that was seen.
+CHUNK_RETRIES = 3
+CHUNK_RETRY_DELAY = 2.0
+STUB_RESTARTS = 6
+RESTART_COOLDOWN = 8.0
+
 
 def image_used_bytes(img: bytes) -> int:
-    """How much of a padded .reu image actually carries data."""
+    """How much of a padded .reu image actually carries data.
+
+    Two image shapes reach here: the engine's own D64U block format
+    (wad2reu.py), whose header says exactly how much is used, and a plain
+    padded blob (tools/mp3topcm.py's PCM for the intro), which carries no
+    header at all. The second is told apart by the missing magic and
+    measured by trimming its trailing zero padding instead -- silence in
+    8-bit *unsigned* PCM sits at $80, not $00, so trailing zero bytes can
+    only be the pad mp3topcm.py itself appended, never audio content.
+    """
+    if img[:4] != b"D64U":
+        return len(img.rstrip(b"\x00")) or 1
     end = 64
     for i in range(img[5]):
         _bid, _flags, o0, o1, o2, length, _hi = struct.unpack_from(
@@ -102,11 +176,11 @@ def _mbox(u: Ultimate, c64: int, reu: int, length: int, go: int) -> None:
     raise U64Error("REU loader did not acknowledge a transfer")
 
 
-def upload_reu(u: Ultimate, image: str) -> None:
-    with open(image, "rb") as fh:
-        img = fh.read()
-    used = image_used_bytes(img)
+RELOAD_SETTLE = 3.0               # see start_stub
 
+
+def start_stub(u: Ultimate) -> None:
+    """(Re)start src/reuload.asm and wait until it is ready for commands."""
     if not os.path.isfile(RELOAD_PRG):
         raise U64Error(f"{RELOAD_PRG} is missing -- run `make {RELOAD_PRG}`")
     with open(RELOAD_PRG, "rb") as fh:
@@ -119,41 +193,202 @@ def upload_reu(u: Ultimate, image: str) -> None:
     else:
         raise U64Error("REU loader did not start")
 
+    # RLREADY going to 1 says the stub is polling its mailbox; it does not
+    # say the Ultimate is done with its own post-reset housekeeping. That
+    # housekeeping is exactly what WARMUP_SECONDS in measure_fps sits out
+    # before trusting the frame counter -- and the same thing this waits
+    # out here, for the same reason: it narrows how often the first couple
+    # of chunks after a reset misbehave, it does not eliminate it.
+    time.sleep(RELOAD_SETTLE)
+
+
+def upload_reu(u: Ultimate, image: str) -> None:
+    with open(image, "rb") as fh:
+        img = fh.read()
+    used = image_used_bytes(img)
+    total_chunks = (used + RELOAD_CHUNK - 1) // RELOAD_CHUNK
     print(f"uploading {used} of {len(img)} bytes into REU RAM "
-          f"({(used + RELOAD_CHUNK - 1) // RELOAD_CHUNK} chunks)")
-    for ofs in range(0, used, RELOAD_CHUNK):
+          f"({total_chunks} chunks)")
+
+    start_stub(u)
+    restarts = 0
+    ofs = 0
+    while ofs < used:
         chunk = img[ofs:ofs + RELOAD_CHUNK]
-        u.writemem(RELOAD_BUF, chunk)
-        _mbox(u, RELOAD_BUF, ofs, len(chunk), GO_STASH)
-
-        # read it straight back out of the REU, through the same DMA engine
-        u.writemem(RELOAD_BUF, b"\0" * len(chunk))
-        _mbox(u, RELOAD_BUF, ofs, len(chunk), GO_FETCH)
-        back = u.readmem(RELOAD_BUF, len(chunk))
-        if back != chunk:
-            n = sum(1 for a, b in zip(back, chunk) if a != b)
-            raise U64Error(f"REU verify failed at offset {ofs}: "
-                           f"{n} of {len(chunk)} bytes differ")
+        try:
+            _stash_with_retries(u, ofs, chunk)
+        except U64Error as exc:
+            restarts += 1
+            if restarts > STUB_RESTARTS:
+                raise U64Error(f"${ofs:06X}: still failing after "
+                               f"{STUB_RESTARTS} stub restarts: {exc}")
+            print(f"  ${ofs:06X} +{len(chunk):<6} failed ({exc}) -- "
+                  f"restarting the loader stub "
+                  f"({restarts}/{STUB_RESTARTS}) and pausing "
+                  f"{RESTART_COOLDOWN:.0f}s first")
+            time.sleep(RESTART_COOLDOWN)
+            start_stub(u)
+            continue                # retry this same chunk on the fresh stub
         print(f"  ${ofs:06X} +{len(chunk):<6} stashed and verified")
+        ofs += RELOAD_CHUNK
+    finish_stub(u)
 
+
+def _stash_with_retries(u: Ultimate, ofs: int, chunk: bytes) -> None:
+    for attempt in range(1, CHUNK_RETRIES + 1):
+        try:
+            _stash_chunk(u, ofs, chunk)
+            return
+        except U64Error as exc:
+            if attempt == CHUNK_RETRIES:
+                raise
+            print(f"  ${ofs:06X} +{len(chunk):<6} attempt {attempt} "
+                  f"failed ({exc}) -- retrying")
+            time.sleep(CHUNK_RETRY_DELAY)
+
+
+def _stash_chunk(u: Ultimate, ofs: int, chunk: bytes) -> None:
+    """One chunk's worth of the loop body in upload_reu -- factored out so
+    a transient failure partway through can retry the whole thing instead
+    of leaving REU RAM at that offset in a state nothing checks again."""
+    u.writemem(RELOAD_BUF, chunk)
+    _mbox(u, RELOAD_BUF, ofs, len(chunk), GO_STASH)
+
+    # read it straight back out of the REU, through the same DMA engine
+    u.writemem(RELOAD_BUF, b"\0" * len(chunk))
+    _mbox(u, RELOAD_BUF, ofs, len(chunk), GO_FETCH)
+    back = u.readmem(RELOAD_BUF, len(chunk))
+    if back != chunk:
+        n = sum(1 for a, b in zip(back, chunk) if a != b)
+        raise U64Error(f"REU verify failed at offset {ofs}: "
+                       f"{n} of {len(chunk)} bytes differ")
+
+
+def finish_stub(u: Ultimate) -> None:
+    """Tell the stub to stop polling. Once, after the last chunk.
+
+    GO_DONE is not "chunk complete" -- it is *terminate*: rlDone in
+    src/reuload.asm is an infinite loop that performs no more transfers.
+    It does keep clearing the trigger byte, so every later command is
+    acknowledged instantly and silently ignored, and the host sees not a
+    hang but a verify failure -- the fetch never ran, so the readback is
+    the zeros the host itself staged.
+
+    This lived inside _stash_chunk from the retry refactor until
+    2026-08-11, which made every upload past one chunk fail at chunk 2,
+    always, with a byte count equal to the non-zero bytes of that chunk.
+    It is also the whole of the "intermittent" corruption the retry and
+    stub-restart machinery above was built for: retrying in place could
+    not work (the stub was dead), and restarting it "recovered" exactly
+    one further chunk, which is what made it look transient.
+    """
     u.writemem(MBOX, struct.pack("<HHBHB", 0, 0, 0, 0, GO_DONE))
 
 
+def verify_reu(u: Ultimate, image: str) -> int:
+    """Diff the whole used region of REU RAM against the local image.
+
+    verify_map covers the three resident blocks, which all live in the
+    first 4 KB of the image; the streamed blocks -- SSECDATA and NODESPH,
+    which is most of it and all of the per-frame geometry -- were covered
+    by nothing until this existed. An image whose head arrived and whose
+    tail did not therefore passed every check the tool had while
+    rendering visibly wrong walls, which is exactly what happened on
+    2026-08-11.
+
+    Uses the same stub as the uploader, so it resets the machine: call it
+    before run_prg, not after.
+    """
+    with open(image, "rb") as fh:
+        img = fh.read()
+    used = image_used_bytes(img)
+    print(f"reu: reading back {used} bytes and diffing against {image}")
+
+    start_stub(u)
+    rc = 0
+    for ofs in range(0, used, RELOAD_CHUNK):
+        n = min(RELOAD_CHUNK, used - ofs)
+        u.writemem(RELOAD_BUF, b"\0" * n)
+        _mbox(u, RELOAD_BUF, ofs, n, GO_FETCH)
+        got = u.readmem(RELOAD_BUF, n)
+        want = img[ofs:ofs + n]
+        if got == want:
+            print(f"reu:   ${ofs:06X} +{n:<6} matches")
+            continue
+        bad = [i for i in range(n) if got[i] != want[i]]
+        print(f"reu:   *** ${ofs:06X} +{n}: {len(bad)} bytes differ, first at "
+              f"${ofs + bad[0]:06X} (want {want[bad[0]]:02X}, "
+              f"got {got[bad[0]]:02X}) ***")
+        rc = 1
+    finish_stub(u)
+    if rc == 0:
+        print("reu: image delivered intact, streamed blocks included")
+    return rc
+
+
+def _reu_size_bytes(setting: str) -> int | None:
+    """'512 KB' / '16 MB' -> bytes. None if the string is not one of those."""
+    parts = str(setting).split()
+    if len(parts) != 2 or not parts[0].isdigit():
+        return None
+    unit = {"KB": 1024, "MB": 1024 * 1024}.get(parts[1].upper())
+    return int(parts[0]) * unit if unit else None
+
+
+MENU_HINT = ("arm it once from the Ultimate's own menu -- C64 and Cartridge "
+             "Settings -> REU Preload Image / REU Preload Offset (0 KB) / "
+             "REU Preload (Enabled). Setting these over the REST API is "
+             "accepted and does nothing (docs/reu-format.md §9.2). Or run "
+             "with --reu-mode stash.")
+
+
 def push_reu(u: Ultimate, image: str, remote: str) -> None:
+    """Deliver the image the way the Ultimate's own preload does it.
+
+    The file is replaced over FTP; the machine loads it into REU RAM at
+    the next reset, and run_prg resets. Nothing is *set* here -- see
+    MENU_HINT for why -- only read back and checked, because a preload
+    that is not armed fails exactly like a preload that is: the REU
+    answers every transfer with whatever its RAM already held.
+    """
     size = os.path.getsize(image)
+    cfg = u.get_category(REU_CATEGORY)
+
+    enabled = str(cfg.get("REU Preload", "")).strip()
+    armed = str(cfg.get("REU Preload Image", "")).strip()
+    offset = str(cfg.get("REU Preload Offset", "")).strip()
+    if enabled != "Enabled":
+        raise U64Error(f"REU Preload is '{enabled or 'unset'}' on the "
+                       f"machine, not 'Enabled' -- {MENU_HINT}")
+    if armed.lower().lstrip("/") != remote.lower().lstrip("/"):
+        raise U64Error(f"REU Preload Image is '{armed}', not '{remote}' -- "
+                       f"point it at {remote} or pass --reu-remote {armed}. "
+                       f"{MENU_HINT}")
+    if offset not in ("0 KB", "0"):
+        raise U64Error(f"REU Preload Offset is '{offset}', not '0 KB' -- the "
+                       f"image would land at the wrong REU address. "
+                       f"{MENU_HINT}")
+
+    # The image is padded to REU_IMAGE_SIZE; a machine whose REU is smaller
+    # than that cannot hold it, and the tail is exactly where the music
+    # stream lives. Compare rather than assume -- this is the setting that
+    # will bite when the tune lands.
+    reu_size = _reu_size_bytes(cfg.get("REU Size", ""))
+    if reu_size is not None and reu_size < size:
+        raise U64Error(f"the machine's REU Size is {cfg.get('REU Size')} but "
+                       f"the image is {size} bytes -- raise REU Size in the "
+                       f"same menu")
+
     print(f"uploading {image} ({size} bytes) -> {remote}")
     sent = u.ftp_put(image, remote)
     if sent != size:
         raise U64Error(f"short upload: sent {sent} of {size} bytes")
-    for item, value in (("REU Preload Image", remote),
-                        ("REU Preload Offset", "0 KB"),
-                        ("REU Preload", "Enabled")):
-        u.set_item(REU_CATEGORY, item, value)
-    after = u.get_category(REU_CATEGORY)
-    if str(after.get("REU Preload", "")).strip() != "Enabled":
-        raise U64Error("REU Preload did not enable")
-    print(f"REU preload armed: {after.get('REU Preload Image')} "
-          f"(REU {after.get('REU Size')}, {after.get('RAM Expansion Unit')})")
+    print(f"REU preload armed: {armed} at {offset} "
+          f"(REU {cfg.get('REU Size')}, {cfg.get('RAM Expansion Unit')})")
+    print("*** now reset the machine from its own menu, or power-cycle it: "
+          "neither machine:reset nor run_prg's reset triggers preload, so "
+          "REU RAM still holds whatever was in it. Nothing here can tell "
+          "the difference -- run with --verify-reu afterwards. ***")
 
 
 # Must match src/defs.asm. mapErr values come from src/mapload.asm.
@@ -435,15 +670,26 @@ def main(argv=None) -> int:
     add_host_args(ap)
     ap.add_argument("prg", help="the .prg to run")
     ap.add_argument("--reu", metavar="IMG",
-                    help="REU image to upload and arm as the preload image; "
-                         "ignored if the file does not exist")
+                    help="REU image to deliver before running; ignored if "
+                         "the file does not exist")
+    ap.add_argument("--reu-mode", choices=("preload", "stash"),
+                    default="stash",
+                    help="how to deliver it: DMA it in chunk by chunk through "
+                         "src/reuload.asm, or FTP it to the machine's preload "
+                         "image -- which then needs a menu reset or a power "
+                         "cycle by hand (default: %(default)s)")
     ap.add_argument("--reu-remote", default="/Usb0/doom.reu",
-                    help="path on the Ultimate to upload the REU image to "
+                    help="path on the Ultimate to upload the REU image to; "
+                         "must be what REU Preload Image already names "
                          "(default: %(default)s)")
     ap.add_argument("--fps", type=float, metavar="SECONDS", nargs="?",
                     const=10.0,
                     help="after starting, measure the frame rate over this "
                          "many seconds (default 10)")
+    ap.add_argument("--verify-reu", action="store_true",
+                    help="before running, read the whole used region of REU "
+                         "RAM back and diff it against the image (covers the "
+                         "streamed blocks, which --verify-map does not)")
     ap.add_argument("--verify-map", action="store_true",
                     help="after starting, read back the resident map blocks "
                          "and compare them against the local REU image")
@@ -465,20 +711,29 @@ def main(argv=None) -> int:
 
         if args.reu:
             if os.path.isfile(args.reu):
-                upload_reu(u, args.reu)
+                if args.reu_mode == "preload":
+                    push_reu(u, args.reu, args.reu_remote)
+                else:
+                    upload_reu(u, args.reu)
             else:
                 print(f"note: {args.reu} does not exist yet -- "
                       f"running without an REU image")
 
+        rc = 0
+        if args.verify_reu:
+            if not args.reu or not os.path.isfile(args.reu):
+                print("--verify-reu needs --reu <image>", file=sys.stderr)
+                return 2
+            rc = verify_reu(u, args.reu)
+
         if args.no_run:
-            return 0
+            return rc
 
         with open(args.prg, "rb") as fh:
             data = fh.read()
         print(f"running {args.prg} ({len(data)} bytes)")
         u.run_prg(data)
 
-        rc = 0
         if args.verify_map:
             if not args.reu or not os.path.isfile(args.reu):
                 print("--verify-map needs --reu <image>", file=sys.stderr)

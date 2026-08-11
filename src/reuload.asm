@@ -47,6 +47,12 @@
 //    $0347  go: 1 = stash, 2 = fetch, $ff = finish; cleared
 //           back to 0 when the transfer is done
 //
+//  $ff is FINISH, not "chunk done": rlDone below never performs
+//  another transfer. It does keep clearing the trigger byte, so a
+//  host that sends it too early is answered normally and its later
+//  commands vanish -- which is not a hang but a wrong readback, and
+//  cost a day on 2026-08-11 (docs/reu-format.md §9.3).
+//
 //  The host polls the trigger byte back to 0 to know the transfer
 //  completed. `fetch` exists so an upload can be read back and
 //  compared without trusting the writing path to verify itself.

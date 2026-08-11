@@ -15,6 +15,11 @@
 #   make u64-map    run on the Ultimate and verify the REU map image landed
 #   make reubench   measure REU DMA throughput on the Ultimate
 #   make audiotest  the two audio-feasibility probes (sidtest + irqtest)
+#   make intro      build/intro.prg + build/intro.reu -- the title screen
+#   make run-intro  run the title screen in VICE (picture only -- see
+#                   src/intro/ultaudio.asm for why VICE has no sound here)
+#   make run-intro-u64  push the title screen to the Ultimate and run it,
+#                   with sound
 #   make clean
 
 # KickAssembler is only distributed from theweb.dk; keep the location
@@ -58,7 +63,11 @@ WAD       := assets/DOOM1.WAD
 # refuses an image that is not exactly the emulated REU size, and boots with a
 # zeroed REU when it does. +reuimagerw keeps VICE from writing the image back
 # on exit, which would otherwise stamp reuProbe's signature into a build artifact.
-REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
+# -reusize must be >= the image wad2reu.py writes (REU_IMAGE_SIZE, now 512 KB
+# to hold the music stream): VICE refuses an image larger than the emulated
+# REU -- "Reading REU image ... failed" -- and then fails open into a BASIC
+# READY screen, which looks like a hung engine and is not one.
+REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 # +confirmexit is not a VICE option (VICE bails out); it is +confirmonexit.
 # -autostartprgmode 1 injects the PRG directly, so no 1541 drive ROMs are
 # needed. +sound keeps a missing audio device from killing a headless run.
@@ -70,7 +79,8 @@ REUOPTS    = -reu -reusize 128 +reuimagerw -reuimage $(REUIMG)
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
 .PHONY: all run shot check debug stats profile framehash assets reubench run-u64 u64-config \
-        u64-fps u64-map sidtest irqtest audiotest setup clean
+        u64-fps u64-map sidtest irqtest audiotest setup clean \
+        intro run-intro shot-intro run-intro-u64 intro-config
 
 # `setup` is defined first for readability but must not be the default goal:
 # a bare `make` has to build, as the README says it does.
@@ -167,6 +177,74 @@ irqtest: $(IRQTEST) u64-config
 
 audiotest: sidtest irqtest
 
+# The title screen. Its own source directory (src/intro/), its own PRG and
+# its own REU image -- it shares no memory map and no build artifact with
+# doom.prg, and is pushed to hardware separately (see run-intro-u64). See
+# the header of src/intro/intro.asm.
+#
+# build/intro-audio.asm and build/intro.reu come out of the same tool run
+# (the .asm records how many bytes of PCM the .reu actually holds), so one
+# recipe with two targets, the same shape as $(TESTREU) below.
+INTROSRC   := $(wildcard src/intro/*.asm)
+INTROPRG   := build/intro.prg
+INTROREU   := build/intro.reu
+INTROASM   := build/intro-audio.asm
+KLA        := assets/doom-title.kla
+INTROMP3   := assets/04 - Intermission From Doom.mp3
+# The asset ships with spaces in its name, which Make's prerequisite lists
+# cannot carry unescaped (quoting a prerequisite does nothing -- Make splits
+# on whitespace regardless). $(space) is the standard GNU Make workaround:
+# a variable whose value *is* one space, substituted for a backslash-space
+# only in the one context (the prerequisite list) that needs it escaped.
+empty      :=
+space      := $(empty) $(empty)
+INTROMP3_ESC := $(subst $(space),\ ,$(INTROMP3))
+
+$(INTROPRG): $(INTROSRC) $(KLA) $(INTROASM)
+	$(KICKASS) src/intro/intro.asm -odir build -o $(INTROPRG) -libdir build \
+	    -showmem -symbolfile -vicesymbols
+
+$(INTROREU) $(INTROASM) &: tools/mp3topcm.py $(INTROMP3_ESC)
+	$(PYTHON) tools/mp3topcm.py "$(INTROMP3)" -o $(INTROREU) --asm $(INTROASM)
+
+intro: $(INTROPRG) $(INTROREU)
+
+# 4096 = 4 MB, and it must equal REU_SIZE in tools/mp3topcm.py: VICE refuses
+# an -reuimage whose size is not exactly -reusize (docs/reu-format.md §9.1).
+# The Ultimate's own REU Size is a separate setting and stays at 16 MB.
+INTROREUOPTS = -reu -reusize 4096 +reuimagerw -reuimage $(INTROREU)
+
+run-intro: $(INTROPRG) $(INTROREU)
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(INTROREUOPTS) -autostart $(INTROPRG)
+
+SHOT_INTRO := build/shot-intro.png
+shot-intro: $(INTROPRG) $(INTROREU)
+	rm -f $(SHOT_INTRO)
+	-$(VICEWRAP) $(VICE) $(VICEOPTS) $(INTROREUOPTS) -warp \
+	    -limitcycles $(SHOT_CYCLES) -exitscreenshot $(SHOT_INTRO) \
+	    -autostart $(INTROPRG)
+	@test -s $(SHOT_INTRO) || { echo "shot-intro: VICE wrote no $(SHOT_INTRO)"; exit 1; }
+	@echo "shot-intro: wrote $(SHOT_INTRO)"
+
+# Two settings this needs that u64-config does not touch (that one is the
+# engine's turbo profile) -- see tools/introconfig.py.
+intro-config:
+	$(PYTHON) tools/introconfig.py $(U64_HOST)
+
+# No --reu here, unlike run-u64: the music image is loaded once from the
+# Ultimate's own menu and stays in REU RAM across resets, so pushing 3.6 MB
+# over the network on every run buys nothing. Load it by hand when it changes:
+#
+#     put build/intro.reu on the machine (FTP, or the SD/USB card), then
+#     Ultimate menu -> C64 and Cartridge Settings -> REU Preload Image
+#     -> /Usb0/intro.reu, and reset.
+#
+# The menu path works where the REST API's identical config write does not --
+# see docs/reu-format.md §9.2. $(INTROREU) stays a prerequisite so a changed
+# mp3 still rebuilds the image and reminds you to reload it.
+run-intro-u64: $(INTROPRG) $(INTROREU) u64-config intro-config
+	$(PYTHON) tools/u64push.py $(U64_HOST) $(INTROPRG)
+
 # The map images. Both go through the same packers in wad2reu.py; the format
 # they share is frozen in docs/reu-format.md.
 #
@@ -190,22 +268,34 @@ $(TESTREU): tools/wad2reu.py
 u64-config:
 	$(PYTHON) tools/u64config.py $(U64_HOST)
 
+# The REU image is DMA'd in chunk by chunk through $(RELPRG) -- u64push.py's
+# default --reu-mode, hence the prerequisite. The Ultimate's own REU Preload
+# is the other route and cannot be driven from here: it fires on a reset from
+# the machine's own menu or a power cycle, and on neither machine:reset nor
+# the reset inside run_prg (docs/reu-format.md §9.2). `--reu-mode preload`
+# uploads the file for that workflow but cannot complete it.
 run-u64: $(PRG) $(REUIMG) $(RELPRG) u64-config
 	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG)
 
-# Verify on real hardware that the REU image reached the machine: run, then
-# read the resident map blocks back out of C64 RAM and compare them against
-# build/assets.reu. This is what Phase 1.2 could not check -- that the bytes
-# FTP+REU-Preload delivers actually land in REU RAM.
+# Verify on real hardware that the REU image reached the machine, at both ends
+# of the path: --verify-reu diffs the whole used region of REU RAM against the
+# image (the streamed blocks included -- they are most of it), and --verify-map
+# then checks what the running engine made of the three resident blocks.
+#
+# Both are needed. --verify-map alone passes on an image whose first 16 KB
+# arrived and whose tail did not, because all three resident blocks live in
+# that first 16 KB -- which is precisely the state that rendered garbage on
+# 2026-08-11 while every check the tool had reported green.
 u64-map: $(PRG) $(REUIMG) $(RELPRG) u64-config
-	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG) --verify-map
+	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG) \
+	    --verify-reu --verify-map
 
 # Measure the real frame rate: run, then read the engine's frame counter
 # twice over U64_FPS_SECONDS of wall clock.
 U64_FPS_SECONDS ?= 10
 u64-fps: $(PRG) $(REUIMG) $(RELPRG) u64-config
-	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --reu $(REUIMG) \
-	    --fps $(U64_FPS_SECONDS)
+	$(PYTHON) tools/u64push.py $(U64_HOST) $(PRG) --fps $(U64_FPS_SECONDS) 
+	# --reu $(REUIMG)
 
 # Run under the binary monitor and diff live RAM against the PRG image; a clean
 # run reports no writes outside the engine's own buffers. See tools/vicedbg.
@@ -305,4 +395,4 @@ profile: $(PRG) $(REUIMG)
 	exit $$rc
 
 clean:
-	rm -f build/*.prg build/*.sym build/*.vs build/*.reu build/*.png build/debug.log
+	rm -f build/*.prg build/*.sym build/*.vs build/*.reu build/*.png build/debug.log build/intro-audio.asm

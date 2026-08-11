@@ -16,5 +16,8 @@ __pycache__/
 *.pyc
 src/.source.txt
 src/render/.source.txt
+src/intro/.source.txt
 src/build/
+src/intro/build/
 build/main.vs
+build/intro-audio.asm

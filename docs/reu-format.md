@@ -449,19 +449,28 @@ inside the C64 — the REU answers every transfer and returns whatever is in its
 RAM. So both are checked rather than assumed: `mapload.asm` verifies the header
 and sums each block, and `make check` / `make u64-map` assert the results.
 
-### 9.1 The image is padded to 128 KB, and that is not cosmetic
+### 9.1 The image is padded to the REU size, and that is not cosmetic
 
 VICE's `-reuimage` loads the file with `util_file_load()`, which fails unless the
 file is **exactly** the emulated REU size. On a mismatch it prints
 `Reading REU image ... failed` to stderr, boots anyway with a zeroed REU, and the
 engine reads a header full of nothing.
 
-So `wad2reu.py` pads every image to `REU_IMAGE_SIZE` = 128 KB — VICE's smallest
-REU and the smallest real 1750 — and the Makefile runs `-reusize 128`. Raise the
-two together or neither. `+reuimagerw` is also passed, so VICE does not write the
+So `wad2reu.py` pads every image to `REU_IMAGE_SIZE` and the Makefile runs a
+matching `-reusize`. **Raise the two together or neither** — that pair went out
+of step once, on 2026-08-10, when `REU_IMAGE_SIZE` went to 512 KB for the music
+stream and `-reusize 128` did not follow: VICE refused the image and fell back
+to a BASIC `READY` screen, which is indistinguishable from a hung engine until
+you read its stderr. `+reuimagerw` is also passed, so VICE does not write the
 image back on exit and stamp runtime state into a build artifact.
 
-### 9.2 The Ultimate's REU Preload does not deliver the image
+The size is currently **512 KB**: 128 KB was VICE's smallest REU and the
+smallest real 1750, and it stopped being enough when the music stream (block 5,
+~400 KB at offset `$010000`) was added. On real hardware the machine's own
+**REU Size** setting has to cover it too; `u64push.py` checks that and refuses
+rather than uploading an image the machine cannot hold.
+
+### 9.2 REU Preload delivers the image — but only when armed from the menu
 
 `IMPLEMENTATION_PLAN.md` Phase 1.2 established that the `.reu` file reaches the
 Ultimate over FTP and that `REU Preload Image` / `Offset` / `Preload` all arm and
@@ -483,7 +492,75 @@ correct, none of which helped:
 The REU itself is fine — writes from the C64 persist across resets, which is how
 the stale bytes were identified in the first place.
 
-### 9.3 What is used instead
+**Retested with an image exactly the size of the REU, and it still does not
+deliver.** Everything above used a 128 KB `doom.reu` against a 16 MB REU, and
+the one variation never tried was the other direction: an image that is exactly
+`REU Size`, which is what VICE demands of `-reuimage` (§9.1). `build/intro.reu`
+is padded to exactly 16 MB, so that configuration is now testable. Uploaded over
+FTP, `REU Preload Image` / `Offset` / `Preload` armed and read back correct, a
+reset performed, and REU RAM read back through `src/reuload.asm`'s fetch:
+
+| REU offset | result |
+|---|---|
+| `$000000` | matches the image |
+| `$004000` | matches the image |
+| `$400000` | 1 of 256 bytes match |
+| `$700000` | 0 of 256 bytes match |
+
+The two low offsets are not evidence of anything — a previous `reuload.asm`
+upload wrote them, and REU contents survive a reset. The 4 MB and 7 MB probes
+are the discriminator, because no upload in this project has ever written past
+about 1.3 MB, and they come back as uninitialised SDRAM.
+
+**But that is a statement about the REST API, not about preload.** Setting the
+same three items from the Ultimate's *own menu* and resetting **does** deliver
+the image — confirmed on the same machine and firmware, with `intro.prg`
+playing 3.6 MB of music that nothing ever pushed. So the feature works; what
+does not work is arming it through `PUT /v1/configs/...`. The write is
+accepted, `GET` reads it back correct, and the load step still never happens —
+the config item and the action behind it are evidently not wired together on
+this path.
+
+That split the two images, for a while:
+
+- **`intro.reu` (3.6 MB, changes only when the mp3 does)** is loaded by hand
+  from the menu, once, and survives resets. `run-intro-u64` therefore pushes
+  only the PRG.
+- **`assets.reu`**, rebuilt on every map or packer change, stayed on the
+  `reuload.asm` path in §9.3, because a manual menu step per build seemed worse
+  than a three-chunk upload.
+
+**The split stands, and preload cannot be driven from the host at all**
+(2026-08-11). `assets.reu` was moved to preload for a day, after the chunked
+uploader appeared to fail on a 512 KB image, and moved straight back when both
+halves of that turned out to be wrong:
+
+- The uploader was not failing on size. `_stash_chunk` was sending `GO_DONE`
+  after every chunk, and `GO_DONE` *terminates* the stub — see §9.3. Fixed;
+  the same 3-chunk upload now verifies clean.
+- Preload does not fire on any reset the host can ask for. Measured directly,
+  by poisoning REU RAM at five offsets with a pattern that is not in the image
+  and reading it back: after `machine:reset` — still poisoned; after the reset
+  inside `run_prg` — still poisoned. Only a reset from the machine's own menu
+  or a power cycle delivers, which is how `intro.reu` was loaded by hand and
+  why that looked like it worked.
+
+That leaves `assets.reu` on the `reuload.asm` path in §9.3 (automatic,
+verified per chunk) and `intro.reu` on the menu (loaded by hand, once, and it
+survives resets). `--reu-mode preload` uploads the file over FTP for that
+workflow, checks the three settings read back armed — an unarmed preload fails
+exactly like an armed one, because the REU answers every transfer with
+whatever its RAM already held — and then says plainly that a hand reset is
+still required, because nothing it can do will complete the job.
+
+**The failure this hid is worth naming.** The engine ran, mapOK=1, all three
+resident blocks checksummed correct, and the walls were still garbage: the
+resident blocks all live in the first 4 KB of the image, so an image whose
+first 16 KB arrived and whose tail did not passes `--verify-map` exactly like
+a whole one. `--verify-reu` closes that — it diffs the entire used region,
+streamed blocks included — and `make u64-map` now runs both.
+
+### 9.3 The chunked uploader (`--reu-mode stash`)
 
 `src/reuload.asm` is a small standalone PRG with an 8-byte mailbox at `$0340`.
 The host DMAs a chunk into C64 RAM with `machine:writemem`, writes the mailbox
@@ -493,8 +570,27 @@ it before the parameters it describes — and the stub issues the REU stash.
 matching REU **fetch** before moving on, because this is exactly the leg of the
 path that turned out not to be trustworthy.
 
-E1M1's image is 34688 used bytes of the padded 128 KB, so three chunks. The
-whole upload plus verification takes a few seconds and runs before `doom.prg`.
+E1M1's image is ~36 KB of used bytes, so three chunks; the whole upload plus
+verification takes a few seconds and runs before `doom.prg`.
+
+**`go` = `$ff` means terminate, not "chunk done".** `rlDone` in `reuload.asm`
+is an infinite loop that performs no further transfers — and it keeps clearing
+the trigger byte, so the host's poll is answered instantly and every later
+command is silently ignored. The host does not see a hang; it sees a verify
+failure, because the fetch never ran and the readback is the zeros the host
+itself staged in the buffer. From the retry refactor until 2026-08-11
+`_stash_chunk` sent it after *every* chunk, so:
+
+- every upload past one chunk failed at chunk 2, always;
+- the byte count differing was exactly the non-zero bytes of that chunk
+  (4489 of 16384 for `assets.reu`, all 32768 in the one 32 KB-chunk
+  experiment) — the tell, in hindsight, that the readback was pure zeros
+  rather than corrupt;
+- retrying in place could never help, and restarting the stub "recovered"
+  precisely one further chunk, which is what made a deterministic bug look
+  intermittent and drove the whole retry/restart apparatus in `u64push.py`.
+
+It is now sent once, by `finish_stub`, after the last chunk.
 
 ### 9.4 REU scratch outside the image
 
