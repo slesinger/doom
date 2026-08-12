@@ -110,6 +110,8 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 5 | `MUSIC` | no — streamed | — | 405136 B |
 | 6 | `WALLTEX` | no — streamed | — | 512 B |
 | 7 | `LINEDEFS` | no — streamed, read once at boot | `$DB40` | 80 B |
+| 8 | `HUDBG` | no — streamed, read once at boot | — | 3840 B |
+| 9 | `HUDFONT` | no — streamed, read once at boot | — | 1280 B |
 
 Resident total: **3488 B**, of which 3456 sit under the I/O space (§6).
 
@@ -468,6 +470,78 @@ one (`IMPLEMENTATION_PLAN.md` §11.2a): a walkover line emits **one record per
 side**, so it fires from either direction, and a use-activated line sets
 `ldTrig` to the sector that moves — the player is holding the key while
 standing in a subsector with that sector behind one of its segs.
+
+### 4.9 `HUDBG` and `HUDFONT` — the status bar
+
+Blocks 8 and 9, `IMPLEMENTATION_PLAN.md` §13. Both streamed and read exactly
+once, at boot, like `LINEDEFS` — and for the same underlying reason `LINEDEFS`
+gives (§4.8): nothing reads either block again after the bar is painted, so
+there is nothing for a resident descriptor to be resident *of*. Neither block
+has a `MAPINFO` field either; the engine's boot-time loader finds them by
+block id while it walks the descriptor table, the exact mechanism `lineLoad`
+already uses for block 7.
+
+**The engine paints the status bar once, at boot, with fixed placeholder
+values.** There is no runtime patching: M2 has no code RAM left for a
+dirty-flag mechanism (`IMPLEMENTATION_PLAN.md` §13's landing note has the
+numbers), so health/armour/ammo are wired to three bytes the boot code reads
+once rather than baked in as immediates, and M3 — which gives them a real
+source — is what makes them live.
+
+**Both blocks use MATRIX's own chunky format, one byte per pixel
+(`ramp << 4 | intensity`), not `WALLTEX`'s nibble-packed one.** That is
+deliberate: the boot blit runs each cell through the *same*
+`ditherTabs`/`scrTab`/`colTab` tables `chunky2mc.asm`'s per-frame converter
+already has resident, so a ramp+intensity byte means the same thing on
+screen whether the renderer or the boot-time HUD blit wrote it. A cell is one
+multicolor cell — 4 px wide, 8 tall, 32 bytes, `chunky2mc.asm`'s own "cell n
+at `MATRIX+n*32`, offset = `row*4+px`" — and both blocks are simply strips of
+these cells, row-major (cell index = `row*width + col`).
+
+`HUDBG`, 3840 B: `40 x 3` cells, downsampled from the WAD's `STBAR` lump —
+the three rows `main.asm`'s `clearHudRows` has always reserved below the
+22-row viewport. `HUDFONT`, 1280 B: ten glyphs (`STTNUM0`..`STTNUM9`), each
+**2×2 cells** (8×16 logical pixels), from the WAD's own big HUD digit font.
+
+One cell (4×8) per glyph was tried first and measured, not estimated (§4's
+rule): every digit rendered as a near-solid blob, checked by eye against
+`STTNUM0`'s own pixels, which really are that dense — Doom's HUD font reads
+by outer silhouette rather than an internal hole, and 4 px wide loses the
+silhouette along with everything else. 2×2 cells, against `STTNUM`'s native
+~14×16, keeps enough of the outline that 0/1/4/7 are clearly distinct.
+
+`wad2reu.py`'s `_picture_intensity_grid` is `texture_luma_tile`'s downsample
+technique (nearest-neighbour bucket-and-average, §4.7) generalised from a
+`TEXTURE1` composite to a single WAD picture lump and an arbitrary
+destination grid — `STBAR` and `STTNUM` are plain patch-format pictures, so
+`decode_picture` is all the WAD reading either needs.
+
+Two things the world's own pipeline does not do, both forced by measurement
+rather than taste:
+
+- **Every byte carries ramp 8 in its high nibble, including the intensity-0
+  background pixels.** `chunky2mc.asm` samples *one* pixel per cell (row 3,
+  px 1) to pick that cell's screen/colour-RAM pair, on the assumption a cell
+  is one surface with one ramp. A wall is; a digit glyph is not — most of its
+  cells are part ink, part background — and a bare `0` in the sampled
+  position dropped the *whole* cell, ink included, to ramp 0's greys.
+- **Intensities are snapped to `{0, 5, 10, 15}` (`HUD_LEVELS`), and the font
+  to `{0, 15}` only.** Those four are the fixed points of
+  `chunky2mc.asm`'s `dcode()`: they map to codes 0/1/2/3 for *every* Bayer
+  threshold, so nothing dithers. The first build let the full 0-15 range
+  through and the bar came out a uniform speckle with the digits barely a
+  shade different from it — read off a live bitmap dump, not judged from a
+  screenshot. Ordered dither is right for a shaded wall and wrong for a
+  status bar.
+
+Both blocks share **ramp 8**, one of `chunky2mc.asm`'s eight spare ramp slots
+(8-15 are reserved, unused duplicates of ramp 0, kept for exactly this kind
+of future use) redefined with the WAD's own status-bar palette. No table
+growth, no RAM impact — the slot was already resident.
+
+`--validate` checks both blocks are present, exactly the expected length, and
+— echoing the `WALLTEX` uniform-tile check — that no digit glyph quantises to
+a single byte value, which would render as a blank digit.
 
 ---
 

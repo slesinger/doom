@@ -288,6 +288,66 @@
 .const JUMPTAB_END = $0e70          // COLLCODE
 .const JUMPBOOT  = MATRIX + $4c00   // $5c00, after BOOTCODE5's $5900-$5b12
 
+// The HUD (IMPLEMENTATION_PLAN.md §13, docs/reu-format.md §4.9). Boot-only,
+// like everything above: hudBoot paints the status bar exactly once and is
+// never called again. Plenty of MATRIX is still unclaimed above JUMPBOOT's
+// slack ($5c40) and below where boot code stops ($7dff) -- this phase spends
+// none of the scarce low-RAM code holes every other M2 phase fought over.
+.const BOOTCODE6 = MATRIX + $4c40   // $5c40
+
+// The two REU blocks (8, 9), staged into plain MATRIX the same way every
+// other loader does -- lineLoad included -- and consumed immediately by
+// hudBoot, which runs once mapLoad (and its descriptor-walk callouts to
+// hudBgLoad/hudFontLoad) has returned. Must match wad2reu.py's HUD_* exactly.
+.const HUD_CELL_BYTES = 32          // one MATRIX-format cell: 4x8, 1 B/pixel
+.const HUD_BG_CELLS_W = 40
+.const HUD_BG_CELLS_H = 3
+.const HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES  // 3840
+.const HUD_FONT_GLYPHS = 10
+.const HUD_FONT_CELLS_W = 2
+.const HUD_FONT_CELLS_H = 2
+.const HUD_FONT_GLYPH_BYTES = HUD_FONT_CELLS_W*HUD_FONT_CELLS_H*HUD_CELL_BYTES // 128
+.const HUD_FONT_BYTES = HUD_FONT_GLYPHS * HUD_FONT_GLYPH_BYTES          // 1280
+
+// Not at MATRIX+0, where every other staged block goes, and that is the whole
+// point: mapLoad walks the descriptors in image order, LINEDEFS (block 7) is
+// emitted *after* the two HUD blocks (8, 9), and lineLoad stages through
+// MATRIX+0 -- so the bar's first cells came out as raw linedef records. The
+// bug was invisible in the screenshot and obvious the moment the staged bytes
+// were diffed against wad2reu.py's own build_hudbg() output at a hudBoot
+// checkpoint. Staging above the boot code instead ($6100-$74ff, inside the
+// $6100-$7dff MATRIX tail nothing else claims) makes the two independent of
+// descriptor order, which is what the ordering assumption should never have
+// been.
+.const HUDBG_STAGE   = MATRIX + $5100            // $6100, 3840 B
+.const HUDFONT_STAGE = HUDBG_STAGE + HUD_BG_BYTES // $7000, 1280 B, ends $74ff
+.errorif HUDFONT_STAGE + HUD_FONT_BYTES > MATRIX + $6e00, "HUD staging runs past MATRIX's boot-time tail"
+
+// The three values the bar reads once at boot. COLBUF's tail past what flip
+// copies back is indeed dead (IMPLEMENTATION_PLAN.md §8.3) -- but it is not
+// unclaimed: $0770-$07ff is TX_SEED, and tex.asm's 137 bytes of relocated
+// vSeed/texSetup/wallSpan reach $07f8. The first version of this put the
+// three bytes at $07e8 and texBoot, which runs *after* bootMain writes them,
+// copied wallSpan straight over the top -- the bar then drew AMMO 180 from
+// two opcodes. These are the genuine tail, and TX_SEED_END below is pulled
+// down to $07fd so tex.asm's own .errorif fails the build by name if that
+// block ever grows into them.
+.const hudHealth = $07fd
+.const hudArmor  = $07fe
+.const hudAmmo   = $07ff
+// Field layout. A glyph is HUD_FONT_CELLS_W x _H = 2x2 cells, so it spans two
+// of the bar's three cell-rows -- rows 1-2, leaving row 0 as a plain band
+// above the numbers, the way Doom's own STBAR has undecorated space above its
+// digits. Three digits per field, most significant first, each digit two
+// cells wide; column below is the field's leftmost cell (0-39). AMMO left,
+// HEALTH centre, ARMOR right -- Doom's own left-to-right order, minus the
+// face/keys this 3-row bar has no room for.
+.const HUD_GLYPH_ROW  = 1            // top cell-row a glyph is blitted at
+.const HUD_DIGITS     = 3            // digits per field, zero-padded
+.const HUD_AMMO_COL   = 2
+.const HUD_HEALTH_COL = 17
+.const HUD_ARMOR_COL  = 32
+
 // segFacing, the world-space backface test, in the free RAM between the BSP
 // stack and MATRIX. $0f51-$0fc3.
 .const BFACECODE = $0f51
@@ -952,6 +1012,23 @@
 .const zMLSum  = $72        // 16-bit sum of the block being copied
 .const zMLId   = $74        // block id x 2, i.e. its offset into mapSum
 
+// boot-time HUD blit scratch (IMPLEMENTATION_PLAN.md §13). Same reuse
+// argument again, one step later than mapLoad's own: hudBoot runs after
+// mapLoad and lineInit have both finished and before cli, so their scratch
+// is dead too.
+.const zHudSrc   = $68      // source cell pointer (HUDBG_STAGE/HUDFONT_STAGE)
+.const zHudN     = $6a      // destination cell index, 0-999
+.const zHudPtr   = $6c      // scratch dest pointer, recomputed per store
+.const zHudOff8  = $6e      // scratch: zHudN * 8, the bitmap byte offset
+.const zHudVal   = $70      // hudDrawField's remaining value
+.const zHudCol   = $71      // hudDrawDigit's leftmost cell column
+.const zHudDigit = $72      // the digit (0-9) hudDrawDigit is blitting
+.const zHudGlyphBase = $73  // stable per-digit source base, 2 B ($73-$74)
+.const zHudCnt   = $75      // hudBoot's background-cell counter -- NOT X:
+                            // hudBlitCell clobbers X for its scrTab/colTab
+                            // sample lookup, so a caller's loop counter may
+                            // not live there across a jsr to it
+
 // The player spawn is no longer a constant: it comes from MAPINFO, which
 // wad2reu.py fills from the map's THINGS type 1 (docs/reu-format.md §4.1, §7).
 
@@ -971,7 +1048,8 @@
 // handler is copied up to MUSCODE. They are marked (boot) below.
 //
 //   TX_UENDS  $bf40-$bfff  192  182  texUEnds, texMulT, spanTex
-//   TX_SEED   $0770-$07ff  144  137  vSeed, texSetup, wallSpan  (boot)
+//   TX_SEED   $0770-$07fc  141  137  vSeed, texSetup, wallSpan  (boot)
+//             ($07fd-$07ff is hudHealth/hudArmor/hudAmmo -- see §13 above)
 //   TX_FETCH  $03a0-$03ff   96   81  texFetch                   (boot)
 //   TX_VSET   $02b0-$02ff   80   69  texVSet                    (boot)
 //   TX_SHADE  $0cb3-$0cf2   64   64  wallShade
@@ -1029,7 +1107,7 @@
 .const TX_CLIP   = $0cf3
 
 .const TX_UENDS_END = $c000
-.const TX_SEED_END  = $0800
+.const TX_SEED_END  = $07fd         // not $0800: hudHealth/Armor/Ammo (§13)
 .const TX_FETCH_END = $0400
 .const TX_VSET_END  = $0300
 .const TX_SHADE_END = TX_CLIP       // the clip parameter has the slack now

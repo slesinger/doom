@@ -267,7 +267,7 @@ Named here so nothing has to be rediscovered:
 | Floor/ceiling textures | **Out.** Flats stay flat — perspective-correct span texturing is a different renderer |
 | Doors and moving sectors | **In.** Doors, platforms, switches, walkover triggers (§11) |
 | Sprites | **In, rendering only.** Things are drawn, sorted and clipped. **No AI, no combat** (§12) |
-| HUD | **In.** Status bar with live health/ammo/armour (§13) |
+| HUD | **In**, and landed — status bar with health/ammo/armour. **Fixed values, not live**: no code RAM for a runtime patch path, see §13.1 |
 | Enemy behaviour, weapons, damage, pickups | **Out.** M3 |
 | PVS/REJECT, quality scaling, visplanes | **Out** |
 
@@ -353,7 +353,7 @@ that was uncomfortably tight.
 | Wall textures | ~~6-9 ms~~ **8.7 ms spent** | §10.4; measured on hardware 2026-08-12, §10's landing note |
 | Doors and moving sectors | < 0.5 ms | §11; the renderer needs no change |
 | Sprites | 6-8 ms | §12.4, dominated by REU streaming |
-| HUD | < 0.5 ms | §13; redrawn only when a value changes |
+| HUD | **0 ms spent** | §13.1; painted once at boot, nothing runs per frame |
 | Margin | 2 ms | |
 | **Total** | **15-20 ms** | against 22 |
 
@@ -972,6 +972,41 @@ reads the byte back while the engine is running can tell you who else has it.
 rather than against the machine: it must trace the triangle unbroken while W
 is down, and be perfectly still while standing or only turning.
 
+## 11c. A 1351 mouse alongside WASD/joystick 2 *(option, not built)*
+
+Proposed 2026-08-12, evaluated for feasibility, not scheduled. Recorded here so
+it isn't re-derived if it's picked up later.
+
+**No port conflict.** Only joystick port 2 is read (`readInput`, `$dc00`);
+port 1 is untouched, so a 1351 in proportional mode there costs nothing in
+contention. It reads via SID `POTX`/`POTY` (`$d419`/`$d41a`), muxed by the same
+`$dc00` bits 6/7 the row strobes already write every frame — sequencable, but
+the pot-select write has to be added to that existing sequence deliberately,
+not bolted on beside it.
+
+**It doesn't fit `zInput`'s model.** `movePlayer` turns by adding/subtracting a
+fixed `TURN_SPEED` gated on a bit in `zInput`; a mouse delta is a variable
+signed value, not a flag, so it needs its own path — `camA += scaledDelta`
+run alongside the keyboard/joystick turn, not through it. The delta itself is
+an 8-bit wraparound subtract against the previous frame's `POTX`, which is
+exact as long as per-frame motion stays under ~128 units.
+
+**Cost, if built:**
+- Cycles: negligible — one `$dc00` write, two pot reads, one subtract, once a
+  frame, against a 59.85 ms deadline that currently has ~13 ms of margin.
+- RAM: a couple of zero-page bytes plus an estimated 20-40 bytes of code, the
+  same class as §11a's jump (43 B) and §11b's bob (23 B) — except those two
+  spent the last free holes below `$d000` that size. This would likely need
+  its own `.pseudopc` block relocated at boot, same as `LINECODE*`/`MUSCODE`,
+  rather than a hole to drop into.
+- A sensitivity constant, tuned by feel — same deferred-judgment shape as
+  `TURN_SPEED` in §8.1.
+
+**Not scheduled**: it competes for code RAM that is now more fragmented than
+when jump and bob were built, and it changes player feel in a way that wants a
+tuning pass, not a one-shot implementation. Pick up if a future session wants
+mouselook specifically; nothing here blocks it.
+
 ## 12. Phase 10 — Sprites
 
 The hardest phase, and the one whose scope must stay narrow: **things are drawn,
@@ -1055,7 +1090,7 @@ REU cache keyed on the fact that consecutive frames draw the same things — but
 §4's revert says model it with a hit count first, because "trade CPU for REU
 bytes" has been close to exhausted in this engine at this frame size.
 
-## 13. Phase 11 — The HUD
+## 13. Phase 11 — The HUD *(landed 2026-08-12 — see §13.1)*
 
 Cheap, independent of everything else, and the thing that most makes the game
 look finished. **It can jump the queue** — it shares no code with textures,
@@ -1079,6 +1114,71 @@ from an earlier phase is waiting on the machine.
 *Done when:* the bar renders on hardware, `ftComp` is unchanged from before it,
 and changing a health variable over the monitor updates the display.
 
+### 13.1 How it landed *(2026-08-12)*
+
+Green on `make check`, and **confirmed on hardware by the user** — the bar
+renders, three plausible numbers in roughly Doom's layout. `make framehash`
+is **unchanged at `27f1774c…`**, and
+that is a real result rather than a coincidence: the digest covers MATRIX, the
+renderer's own chunky buffer, and the bar is blitted straight into
+`BITMAP0`/`BITMAP1` below the 22-row viewport. The renderer has no idea the
+HUD exists, which is the whole point of doing it at boot.
+
+Where it differs from §13's four bullets:
+
+| §13 said | What is there |
+|---|---|
+| draw once, **patch digits on change**, a dirty flag per field | **not built.** Code RAM is at or near zero in every hole that matters (main segment, `JUMPCODE`, `LINECODE3`, zero page — the `.errorif` guards say so), so a runtime patch path would have needed its own byte-hunt first. The bar is painted **once**, from fixed values. §13's "changing a health variable over the monitor updates the display" is **not met**, deliberately |
+| values wired to variables | **done, and it is the part that survives.** `hudHealth`/`hudArmor`/`hudAmmo` are real bytes, read once by `hudBoot`; M3 makes them live and calls the redraw again, rather than redesigning a pipeline |
+| a digit font of 12 glyphs | 10 (`STTNUM0`..`9`). No face frames — §13 calls them optional |
+| — | the entire feature is **boot-only code in MATRIX** (`BOOTCODE6`, `$5c40-$6008`) plus two streamed REU blocks. It costs the resident build **3 bytes** of RAM, the three values |
+
+Four traps, in the order they cost a pass, and all four were found by diffing
+live memory rather than by looking at the screen:
+
+1. **`convert()`'s dither chain cannot be transliterated to indirect
+   addressing.** It accumulates four pixels into A across three `ora`s, and
+   gets each pixel into Y with `ldy MATRIX+s*4+j,x` — absolute, so A survives.
+   Writing that as `ldy #s*4+j / lda (zHudSrc),y / tay` quietly destroys the
+   accumulator between the `ora`s; every packed byte came out as the last
+   pixel's *source value* ORed with its own dither code. `hudBlitCell` copies
+   the cell into a fixed 32-byte buffer first and keeps the absolute
+   addressing.
+2. **A block's staging address must not assume descriptor order.** The HUD
+   blocks are 8 and 9 but `LINEDEFS` (7) is emitted after them, and `lineLoad`
+   stages through `MATRIX+0` — so the bar's first cells were raw linedef
+   records. HUD staging moved to `$6100`, in the MATRIX tail nothing else
+   claims.
+3. **`$07e8` was not dead RAM.** §8.3 is right that COLBUF's tail past what
+   `flip` copies back is never read, but `$0770-$07ff` is `TX_SEED`, and
+   tex.asm's 137 relocated bytes reach `$07f8`. `texBoot` runs *after*
+   `bootMain` writes the placeholders and copied `wallSpan` over the top; the
+   bar drew AMMO **180** from two opcodes. The three values are at
+   `$07fd-$07ff` now and `TX_SEED_END` is pulled down to `$07fd` so the
+   collision is a build error by name.
+4. **`hudBlitCell` clobbers X** (its `scrTab`/`colTab` sample lookup), and
+   `hudBoot`'s background loop was counting in it. The count now lives in
+   `zHudCnt`. This is the same class as §11.4's `lnHPtr`/`segFacing` traps.
+
+Two asset findings, both measured off a live bitmap dump rather than judged
+from a screenshot (`docs/reu-format.md` §4.9 has the detail): a 1-cell digit
+is an illegible blob and 2×2 cells are the minimum that reads, and the HUD
+must **not** be ordered-dithered — intensities are snapped to the four values
+that are fixed points of `chunky2mc.asm`'s `dcode()`, or the bar comes out a
+speckle with the digits a shade lost in it.
+
+**Frame cost: not credibly measured, and not measurable this way.** Three
+`make u64-fps` runs on hardware gave 90%, 92% and (below) on-deadline rates
+against §11.4's 100%, with `compute` climbing run to run and the tool's own
+post-reset-housekeeping warning firing every time — the same degrading shape
+§11.4 already recorded for repeated `run_prg` calls in one session, and it did
+not clear with `WARMUP_SECONDS` raised to 60. Nothing here *can* cost
+per-frame time: `hudBoot` is called once from `bootMain`, the per-frame path
+is untouched, and the framehash is bit-identical. Re-measure on a genuinely
+idle machine, well spaced, before reading anything into these numbers.
+(`WARMUP_SECONDS` is now an environment override in `u64push.py`, because the
+tool's own warning tells you to raise it and there was no way to.)
+
 ## 14. M2 risk register
 
 | # | Risk | Early warning | Response if it arrives |
@@ -1089,6 +1189,147 @@ and changing a health variable over the monitor updates the display.
 | 4 | **Sprite clipping mis-draws through openings** (§12.1's known simplification) | A sprite visible through a window in E1M1 | Accept for M2. It is a per-seg opening list in M3, which needs RAM M2 does not have |
 | 5 | **Three raster frames still is not enough.** Everything lands and compute exceeds 59.85 ms | `ftHist`'s `4+` bucket leaving zero | Four frames is 12.5 fps and that is below playable. Cut sprites to a near-distance cap first, then Stage A textures on fewer surfaces |
 | 6 | **The Ultimate's `404 Cannot open file` recurs** after §9.1's fix | Any `make run-u64` in a long session. Deliberately re-run 2026-08-11 — 12 `run_prg` calls in 40 s, clean — but 40 s is not a session | Then it is not upload volume, and the milestone needs a reliable reset procedure before it needs features |
+
+## 14a. Budget relief — the options, priced *(analysed 2026-08-12, mostly not decided)*
+
+Both budgets are tight at the same time, and it is worth being precise about
+where they stand before spending either.
+
+**Time.** 46.7 ms compute against 59.85 ms (§10's landing note) = **13.1 ms
+free**. Doors measured at effectively nothing (§11.4) and the HUD has landed,
+so the whole remainder is §12's sprites, estimated at 6-8 ms. That closes M2
+with ~5 ms of margin *if the estimate holds*, and §4 is unambiguous that this
+class of estimate has been wrong by 3-7× in this engine, in both directions.
+
+**RAM.** `defs.asm` now reads *"below MATRIX the largest unclaimed run left is
+five bytes"*. ~90 B of code RAM in ten fragments, ~200 B of data RAM, and the
+640 B under I/O is spent on doors. There is nothing left.
+
+**Both budgets are consumed by the same object.** `MATRIX` is `$1000-$7dff` —
+28160 B, 160×176 chunky, **45% of usable RAM** — and the per-pixel work over it
+(`spanFill`, the texture sampler, `chunky2mc`'s conversion) is the bulk of the
+frame. That is why the options below are largely one compromise wearing
+different hats, and why the first is the only one that pays into both budgets
+at once.
+
+### 14a.1 Viewport height *(decided: 176 → 160, pending a look)*
+
+> **Agreed 2026-08-12: 176 → 160 rows, and no further for now.** The taller
+> cuts are listed because they are the same edit with a different constant, not
+> because they are scheduled. **160 is to be built and looked at first**; 144
+> is reconsidered only if the letterbox turns out to read as deliberate rather
+> than as a smaller game. Not yet implemented — this is a decision, not a
+> landing note.
+
+`176` is 22 cell-rows and appears in **four places**: `math.asm`'s `rowCell`
+bound, `bsp.asm`, `walls.asm`'s column close, and `chunky2mc.asm`'s header. A
+contained edit, not a rewrite.
+
+| Height | MATRIX | RAM freed | Pixel work |
+|---|---:|---:|---:|
+| 176 (22 rows, now) | 28160 | — | — |
+| **160 (20 rows)** | **25600** | **2560 B** | **−9%** |
+| 144 (18 rows) | 23040 | 5120 B | −18% |
+| 128 (16 rows) | 20480 | 7680 B | −27% |
+
+The RAM freed is **contiguous, above `$0801`, and can hold code** — a
+categorically better resource than the ten fragments every phase since §10 has
+fought over. The boot-staging blocks at `MATRIX+$4000…+$6e00` (BOOTCODE*,
+`HUDBG_STAGE`, `HUDFONT_STAGE`) still work at boot either way; everything past
+the new MATRIX end becomes permanent free RAM once the first frame has run.
+
+**The measurement this needs first**, and it is the cheapest one in this
+section: **`chunky2mc`'s share of the frame is not recorded anywhere.**
+`spanFill` is ~27% and textures are 8.7 ms measured, but the conversion pass is
+unpriced, and it decides whether a height cut returns roughly its pixel
+percentage or rather less. A `profile.py` checkpoint, per §4 — every session in
+§6 that skipped this step had sound reasoning and the wrong conclusion.
+
+**What it costs:** a letterboxed view. Doom's own 320×200 view is 168 rows under
+the status bar, so 176 was already generous. This is a look judgement and it is
+deliberately being made by eye, on hardware, rather than by this table.
+
+### 14a.2 Resident downsampled sprites, instead of streamed *(open, recommended)*
+
+§12.4 says sprite cost is **dominated by REU streaming** — 5-8 sprites × 512 B
+= 2.5-4 ms of the 6-8 ms estimate. But M2's sprites are static props and there
+are few *distinct* ones. At **16×16 4-bit = 128 B**, eight props is **1 KB
+fully resident** and the streaming cost goes to zero, taking the phase to
+plausibly 2-3 ms.
+
+This is precisely §10.2's Stage A argument applied to §12, and Stage A shipped.
+It converts the phase's largest and least controllable cost into a fixed RAM
+charge, payable out of what §14a.1 frees.
+
+**What it costs:** blockier sprites than the walls behind them — at 160 columns
+with 2:1 pixels, a 16×16 sprite scaled up close is visibly coarse. Mitigated by
+§12.3's near-distance cap, which is wanted regardless.
+
+### 14a.3 Drop double buffering *(open, held in reserve)*
+
+`BITMAP1` (`$e000-$ff3f`, 8000 B) + `SCREEN1` (`$c000`, 1000 B) = **9 KB**, the
+largest single block available, freed at **zero cost in frame time**.
+
+**What it costs:** tearing. `chunky2mc` writes the bitmap across the frame and
+`flip` syncs to raster 251; single-buffered, the conversion is visible as it
+happens, and at 16.7 fps on a three-raster-frame period that is not subtle.
+Ranked **below** §14a.1 and §14a.2 despite the larger number: it is the option
+most likely to look *broken* rather than to look *reduced*. The card to play if
+Stage B textures become the thing worth having most.
+
+### 14a.4 Halve horizontal resolution to 80 columns *(rejected)*
+
+MATRIX → 80×176 = 14080 B (**14 KB**), the column loop halves, the divide count
+halves, texture sampling halves. Probably 15+ ms and 14 KB in one change, and
+it dominates every other option numerically.
+
+**Rejected on look.** Multicolor is already 2:1; this is 4:1, which changes what
+the game is rather than how much of it there is. Recorded so it does not have to
+be re-derived.
+
+### 14a.5 Cold-code REU overlay *(open, modest)*
+
+The general question was: can RAM be found by DMAing code blobs from REU,
+executing them, and overwriting them with the next blob?
+
+**Not for the hot path.** The ~90 B shortage is tight because `bspLoop`,
+`doWall`, `spanFill`, the texture sampler and `checkMove` must be
+*simultaneously* resident — they call each other within one pass and none of
+them idles long enough to be safely overwritten. Reloading a 1-2 KB overlay
+every frame also costs 1-2 ms/frame *permanently* at the REU's flat 1 byte/µs,
+which spends the scarce frame budget to relieve the RAM budget — the inverse of
+§3's one trade that works. And it does not produce what Stage B actually needs,
+which is *data* scratch concurrent with rendering: MATRIX is the framebuffer
+during play, not idle memory.
+
+**Yes for cold code.** The door thinker, the use-key/walkover handler and the
+HUD blit run rarely, not every frame. Making them on-demand overlays reclaims a
+few hundred bytes of *resident* code RAM with no recurring per-frame cost,
+because the reload only happens when the feature fires. `lineBoot`/BOOTCODE5
+already does exactly this at boot, and `probe.py`'s relocated-block check
+already guards the pattern (§11a) — so this is extending a mechanism the
+codebase trusts, not inventing one.
+
+### 14a.6 A fourth raster frame *(separate question, not a RAM lever)*
+
+12.5 fps buys ~20 ms outright through machinery that already exists
+(`FPS_CAP_TICKS`, `TARGET_FRAMES`, §8.1's phase-drift fix), and is far more
+frame budget than any option above.
+
+**But it frees no RAM at all**, and §14's risk #5 already called 12.5 fps below
+playable. The two are independent: dropping to four frames does not require
+overlays, and overlays do not require four frames. Worth keeping them separate
+so that the cheap lever is not credited to the complicated mechanism.
+
+### 14a.7 The combination worth revisiting
+
+**§14a.1 at 144 rows + §14a.2** would together give ~5 KB of contiguous
+code-capable RAM and land sprites at 2-3 ms instead of 6-8 — leaving roughly
+15 ms free rather than 5, which is enough to make **Stage B textures a live
+question again** after §10 closed them on budget grounds.
+
+That is recorded as the shape of the argument, not as a plan. The agreed step
+is 160 rows, looked at on hardware first.
 
 ## 15. Sequencing
 

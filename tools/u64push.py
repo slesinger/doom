@@ -699,7 +699,11 @@ def read_ms(u: Ultimate) -> int:
 # that is running at 25.0, which is exactly what happened once. 3 s of warmup
 # cleared it about as often as not, because the wait is for frameCnt to move
 # and frameCnt does not move until the first of those two frames has finished.
-WARMUP_SECONDS = 20.0
+#
+# Overridable from the environment because measure_fps's own outlier warning
+# tells you to raise it, and until now there was no way to take that advice
+# short of editing this line: `WARMUP_SECONDS=60 make u64-fps`.
+WARMUP_SECONDS = float(os.environ.get("WARMUP_SECONDS", 20.0))
 
 
 def wait_for_engine(u: Ultimate, deadline: float = 20.0) -> None:

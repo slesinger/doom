@@ -28,7 +28,12 @@
 .eval ramps.add(List().add($6,$4,$a))   //  5 violet  blue purple lred
 .eval ramps.add(List().add($b,$c,$1))   //  6 metal   dgrey grey white
 .eval ramps.add(List().add($2,$8,$7))   //  7 fire    red orange yellow
-.for (var r=8; r<16; r++) .eval ramps.add(List().add($b,$c,$f)) // spare
+.eval ramps.add(List().add($9,$8,$7))   //  8 hud     brown orange yellow --
+                                        // IMPLEMENTATION_PLAN.md §13; one of
+                                        // the spare slots below, claimed by
+                                        // wad2reu.py's HUD_RAMP for STBAR and
+                                        // STTNUM's own warm palette
+.for (var r=9; r<16; r++) .eval ramps.add(List().add($b,$c,$f)) // spare
 
 // intensity(0-15) + Bayer threshold -> 2-bit code 0..3
 .function dcode(v, px, row) {

@@ -40,8 +40,11 @@
 // indexed by id, so this and docs/reu-format.md §3 must stay in step.
 .const MAPNBLK = 4
 
-// The one streamed block this file reads at boot -- see lineLoad.
+// The streamed blocks this file reads at boot itself -- see lineLoad and
+// hudBgLoad/hudFontLoad.
 .const BLK_LINEDEFS = 7
+.const BLK_HUDBG    = 8
+.const BLK_HUDFONT  = 9
 
 .const MAPINFOSZ = 32
 .const NODETABSZ = NODETAB_END - NODETAB
@@ -125,8 +128,18 @@ mapBlockLoop:
         ldy #bdId
         lda (zMLDesc),y
         cmp #BLK_LINEDEFS
-        bne mapNextBlock
+        bne !notLines+
         jsr lineLoad
+        jmp mapNextBlock
+!notLines:
+        cmp #BLK_HUDBG
+        bne !notHudBg+
+        jsr hudBgLoad
+        jmp mapNextBlock
+!notHudBg:
+        cmp #BLK_HUDFONT
+        bne mapNextBlock
+        jsr hudFontLoad
         jmp mapNextBlock
 !resident:
 
@@ -293,6 +306,357 @@ lineLoad:
         rts
 !bad:   lda #MERR_SIZE
         jmp mapFail
+
+//------------------------------------------------------------
+// hudBgLoad / hudFontLoad — IMPLEMENTATION_PLAN.md §13, docs/reu-format.md
+// §4.9. Streamed for the same reason LINEDEFS is (above): read exactly once,
+// by their own loader, because nothing reads either block again after
+// hudBoot (src/main.asm) has painted the bar. Unlike LINEDEFS there is no
+// second copy into a final home -- the fetch lands straight in a fixed
+// MATRIX offset (HUDBG_STAGE/HUDFONT_STAGE, ordinary RAM, no banking
+// concern) and hudBoot reads it from there directly.
+//
+// Assembled into BOOTCODE6, not BOOTCODE: mapLoad's own block (above) had
+// only ~96 B free before this and both routines together need more than
+// that. There is no requirement that a block id's loader live in the same
+// MATRIX region as the descriptor walk that calls it -- only that the
+// address is known at assembly time, which .const already gives it -- and
+// BOOTCODE6 is unclaimed (see defs.asm). hudBoot, which consumes what these
+// two stage, follows directly below.
+//------------------------------------------------------------
+.pc = BOOTCODE6 "boot: hud load + blit"
+
+hudBgLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #<HUD_BG_BYTES
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        cmp #>HUD_BG_BYTES
+        bne !bad+
+        lda #<HUDBG_STAGE
+        sta REU_C64ADDR
+        lda #>HUDBG_STAGE
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #<HUD_BG_BYTES
+        sta REU_LENGTH
+        lda #>HUD_BG_BYTES
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+
+hudFontLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #<HUD_FONT_BYTES
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        cmp #>HUD_FONT_BYTES
+        bne !bad+
+        lda #<HUDFONT_STAGE
+        sta REU_C64ADDR
+        lda #>HUDFONT_STAGE
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #<HUD_FONT_BYTES
+        sta REU_LENGTH
+        lda #>HUD_FONT_BYTES
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+
+//------------------------------------------------------------
+// hudBlitCell -- one MATRIX-format cell (zHudSrc, 32 bytes, offset =
+// row*4+px, chunky2mc.asm's own layout) -> the bitmap, screen and colour RAM
+// at cell index zHudN (n*8 is the bitmap byte offset, n is the screen/colour
+// byte offset -- "cell n -> BITMAP + n*8", chunky2mc.asm's convert). Drives
+// the SAME ditherTabs/scrTab/colTab tables the per-frame converter has
+// resident, so a ramp+intensity byte means the same thing here as there.
+//
+// A real subroutine, not the per-frame unrolled hot path: BOOTCODE6 has no
+// cycle budget to defend, called ~130 times total and never again.
+//------------------------------------------------------------
+hudBlitCell:
+        // ---- copy the cell to a fixed buffer, so the dither chain below can
+        // index it absolutely. convert() writes `ldy MATRIX+s*4+j,x`, and it
+        // is load-bearing that the fetch lands in Y without going through A:
+        // the four pixels of a row accumulate into A across three `ora`s. The
+        // first version of this routine fetched indirectly instead --
+        // `ldy #s*4+j / lda (zHudSrc),y / tay` -- which quietly overwrites
+        // that accumulator between the ora's, so every packed byte came out
+        // as the last pixel's source value ORed with its own dither code.
+        // 32 bytes of buffer and 32 boot-time copies buy the same addressing
+        // mode convert() has.
+        ldy #HUD_CELL_BYTES-1
+!:      lda (zHudSrc),y
+        sta hudCell,y
+        dey
+        bpl !-
+
+        // ---- pack 8 bitmap bytes: dither, one source row at a time ----
+        .for (var s=0; s<8; s++) {
+            .for (var j=0; j<4; j++) {
+                ldy hudCell + s*4 + j
+                .if (j==0) lda ditherTabs + [j*4 + mod(s,4)]*256,y
+                .if (j!=0) ora ditherTabs + [j*4 + mod(s,4)]*256,y
+            }
+            sta zTmp+s
+        }
+
+        // ---- zHudOff8 = zHudN * 8 ----
+        lda zHudN
+        sta zHudOff8
+        lda zHudN+1
+        sta zHudOff8+1
+        .for (var k=0; k<3; k++) {
+            asl zHudOff8
+            rol zHudOff8+1
+        }
+
+        // ---- BITMAP0 + off8, 8 bytes ----
+        lda zHudOff8
+        clc
+        adc #<BITMAP0
+        sta zHudPtr
+        lda zHudOff8+1
+        adc #>BITMAP0
+        sta zHudPtr+1
+        ldy #0
+        .for (var s=0; s<8; s++) {
+            lda zTmp+s
+            sta (zHudPtr),y
+            iny
+        }
+
+        // ---- BITMAP1 + off8, 8 bytes ----
+        lda zHudOff8
+        clc
+        adc #<BITMAP1
+        sta zHudPtr
+        lda zHudOff8+1
+        adc #>BITMAP1
+        sta zHudPtr+1
+        ldy #0
+        .for (var s=0; s<8; s++) {
+            lda zTmp+s
+            sta (zHudPtr),y
+            iny
+        }
+
+        // ---- attributes: sample pixel (row 3, px 1) picks the ramp ----
+        ldx hudCell + 13
+        ldy #0
+
+        lda zHudN
+        clc
+        adc #<SCREEN0
+        sta zHudPtr
+        lda zHudN+1
+        adc #>SCREEN0
+        sta zHudPtr+1
+        lda scrTab,x
+        sta (zHudPtr),y
+
+        lda zHudN
+        clc
+        adc #<SCREEN1
+        sta zHudPtr
+        lda zHudN+1
+        adc #>SCREEN1
+        sta zHudPtr+1
+        lda scrTab,x
+        sta (zHudPtr),y
+
+        // $D800 directly, not COLBUF -- flip only ever copies COLBUF's first
+        // 880 bytes (main.asm's clearHudRows makes the same choice).
+        lda zHudN
+        clc
+        adc #<$d800
+        sta zHudPtr
+        lda zHudN+1
+        adc #>$d800
+        sta zHudPtr+1
+        lda colTab,x
+        sta (zHudPtr),y
+        rts
+
+//------------------------------------------------------------
+// hudDrawDigit -- zHudDigit (0-9), zHudCol (leftmost cell column, 0-39) ->
+// blits STTNUM's HUD_FONT_CELLS_W x _H (2x2) cells for that digit, row-major
+// within the glyph (matching wad2reu.py's build_hudfont), at absolute cell
+// rows 22+HUD_GLYPH_ROW .. +HUD_GLYPH_ROW+1.
+//------------------------------------------------------------
+hudDrawDigit:
+        // zHudGlyphBase = HUDFONT_STAGE + digit * HUD_FONT_GLYPH_BYTES (128)
+        lda zHudDigit
+        lsr
+        clc
+        adc #>HUDFONT_STAGE
+        sta zHudGlyphBase+1
+        lda zHudDigit
+        and #1
+        beq !even+
+        lda #$80
+        jmp !setlo+
+!even:  lda #$00
+!setlo: clc
+        adc #<HUDFONT_STAGE
+        sta zHudGlyphBase
+        bcc !+
+        inc zHudGlyphBase+1
+!:
+        // Both addresses below are computed fresh from a stable base each
+        // time, never incremented across unrolled iterations, on purpose:
+        // a data-dependent branch (bcc/bne) inside a compile-time .for
+        // unroll needs a uniquely-named target every time it appears, since
+        // an anonymous !+/!- binds to the *textually nearest* anonymous
+        // label and two branches a few bytes apart from separate unrolled
+        // iterations is exactly the shape that resolves to the wrong one.
+        // cellOffset and the row's cell-index base are compile-time
+        // constants (cy, cx are .for variables), so adc #<const> / adc #0
+        // carries the one possible overflow with no branch at all.
+        .for (var cy=0; cy<HUD_FONT_CELLS_H; cy++) {
+            .for (var cx=0; cx<HUD_FONT_CELLS_W; cx++) {
+                .var cellOfs = [cy*HUD_FONT_CELLS_W + cx] * 32
+                lda #<[[22+HUD_GLYPH_ROW+cy]*40]
+                clc
+                adc zHudCol
+                adc #cx
+                sta zHudN
+                lda #>[[22+HUD_GLYPH_ROW+cy]*40]
+                adc #0
+                sta zHudN+1
+                lda zHudGlyphBase
+                clc
+                adc #<cellOfs
+                sta zHudSrc
+                lda zHudGlyphBase+1
+                adc #>cellOfs
+                sta zHudSrc+1
+                jsr hudBlitCell
+            }
+        }
+        rts
+
+//------------------------------------------------------------
+// hudDrawField -- A = value (0-255), X = field's leftmost cell column
+// (0-39). Draws HUD_DIGITS glyphs, most significant first, each
+// HUD_FONT_CELLS_W cells wide.
+//------------------------------------------------------------
+hudDrawField:
+        sta zHudVal
+        stx zHudCol
+
+        ldx #0
+!:      lda zHudVal
+        cmp #100
+        bcc !d100+
+        sbc #100
+        sta zHudVal
+        inx
+        jmp !-
+!d100:  stx zHudDigit
+        jsr hudDrawDigit
+        lda zHudCol
+        clc
+        adc #HUD_FONT_CELLS_W
+        sta zHudCol
+
+        ldx #0
+!:      lda zHudVal
+        cmp #10
+        bcc !d10+
+        sbc #10
+        sta zHudVal
+        inx
+        jmp !-
+!d10:   stx zHudDigit
+        jsr hudDrawDigit
+        lda zHudCol
+        clc
+        adc #HUD_FONT_CELLS_W
+        sta zHudCol
+
+        lda zHudVal
+        sta zHudDigit
+        jsr hudDrawDigit
+        rts
+
+//------------------------------------------------------------
+// hudBoot -- IMPLEMENTATION_PLAN.md §13. Paints the status bar exactly once:
+// the HUD_BG_CELLS_W x _H background, then three fixed-value digit fields.
+// Called once from bootMain, after clearHudRows. There is no runtime update
+// path -- M2 has no code RAM left for a dirty-flag mechanism -- so
+// hudHealth/hudArmor/hudAmmo are read once, here, rather than every frame;
+// M3 is what makes them live.
+//------------------------------------------------------------
+hudBoot:
+        lda #<HUDBG_STAGE
+        sta zHudSrc
+        lda #>HUDBG_STAGE
+        sta zHudSrc+1
+        lda #<[22*40]                // cell 880, the bar's top-left cell
+        sta zHudN
+        lda #>[22*40]
+        sta zHudN+1
+        lda #0
+        sta zHudCnt                  // NOT X -- hudBlitCell clobbers it
+hudBgLoop:
+        jsr hudBlitCell
+        lda zHudSrc
+        clc
+        adc #32
+        sta zHudSrc
+        bcc !+
+        inc zHudSrc+1
+!:      inc zHudN
+        bne !+
+        inc zHudN+1
+!:      inc zHudCnt
+        lda zHudCnt
+        cmp #HUD_BG_CELLS_W*HUD_BG_CELLS_H
+        bne hudBgLoop
+
+        lda hudAmmo
+        ldx #HUD_AMMO_COL
+        jsr hudDrawField
+        lda hudHealth
+        ldx #HUD_HEALTH_COL
+        jsr hudDrawField
+        lda hudArmor
+        ldx #HUD_ARMOR_COL
+        jsr hudDrawField
+        rts
+
+// hudBlitCell's working copy of the cell it is packing. Lives here, in
+// boot-only MATRIX, for the same reason everything else in BOOTCODE6 does.
+hudCell:
+        .fill HUD_CELL_BYTES, 0
 
 //------------------------------------------------------------
 // mapCopyStaged — MATRIX -> (zMLDst), zMLLen bytes, with RAM

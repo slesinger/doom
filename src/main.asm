@@ -108,6 +108,15 @@ bootMain:
         sta $d021
         sta backBuf
         jsr clearHudRows
+        // Placeholder values -- IMPLEMENTATION_PLAN.md §13. There is no
+        // combat yet to set these from; hudBoot reads them once so M3 only
+        // has to make them live, not touch the pipeline.
+        lda #100
+        sta hudHealth
+        lda #0
+        sta hudArmor
+        lda #50
+        sta hudAmmo
         // Three of the wall texturing blocks run below $0801, where a PRG image
         // cannot load them. They are assembled into MATRIX with .pseudopc and
         // copied down here, before anything calls them -- see BOOTCODE4 in
@@ -128,6 +137,11 @@ bootMain:
         // tools/vicedbg/probe.py, and mapHalt makes it visible on a machine.
         jsr mapLoad
         bcc mapHalt
+        // The status bar. HUDBG_STAGE/HUDFONT_STAGE were just staged by
+        // mapLoad's own descriptor walk (hudBgLoad/hudFontLoad in
+        // mapload.asm), so this must run after mapLoad and only on success --
+        // IMPLEMENTATION_PLAN.md §13, docs/reu-format.md §4.9.
+        jsr hudBoot
         lda miSpawnX                // spawn from the map's own THINGS entry
         sta camX
         lda miSpawnX+1

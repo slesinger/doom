@@ -176,6 +176,177 @@ LINEDEF_BYTES = MAXLINES * LINE_ARRAYS          # 80
 
 LK_NONE, LK_DOOR, LK_LIFT, LK_FLOOR, LK_EXIT = 0, 1, 2, 3, 4
 
+# ----------------------------------------------------------------------------
+# The HUD -- IMPLEMENTATION_PLAN.md §13.
+#
+# Boot-only: the engine paints the status bar exactly once, from these two
+# blocks, using MATRIX's own byte-per-pixel chunky format (%rrrriiii, the same
+# one the per-frame renderer writes) rather than WALLTEX's nibble-packed
+# format. That is deliberate -- it means the boot blit can drive the SAME
+# ditherTabs/scrTab/colTab tables chunky2mc.asm already has resident for the
+# renderer, so "what does this ramp+intensity look like on screen" has one
+# answer, in the world and in the HUD alike. There is no runtime patching:
+# code RAM has nothing left to spend on a dirty-flag mechanism (see the M2
+# state notes), so the bar is fixed at boot with plausible placeholder values
+# and wired to variables only so M3 does not have to touch the pipeline.
+#
+# A cell is one multicolor cell -- 4 px wide, 8 tall, 32 bytes, MATRIX's own
+# "cell n at MATRIX+n*32, offset = row*4+px" -- so a HUD block is simply a
+# strip of MATRIX-format cells, row-major (cell index = row*width+col).
+#
+# Neither block gets a MAPINFO field. Like LINEDEFS (block 7), they are
+# streamed and read exactly once, by their own loader triggered off the block
+# id during mapLoad's descriptor walk -- there is nothing to be resident
+# *of*, since nothing reads this data again after boot.
+BLK_HUDBG, BLK_HUDFONT = 8, 9
+
+HUD_RAMP = 8                        # a spare ramp slot in chunky2mc.asm's
+                                     # ramps table (8-15 are reserved, unused
+                                     # duplicates of ramp 0, for exactly this)
+HUD_CELL_BYTES = 32                 # one MATRIX-format cell: 4x8, 1 B/pixel
+
+# The status bar is the three rows M1 always reserved below the 22-row
+# viewport (main.asm's clearHudRows) -- 40 cells wide, 3 tall.
+HUD_BG_CELLS_W = 40
+HUD_BG_CELLS_H = 3
+HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES   # 3840
+
+# STTNUM0..9, the big HUD digit font. Measured, not estimated (§4's rule):
+# one cell (4x8) renders every digit as a near-solid blob -- checked by eye
+# against the WAD's own STTNUM0 pixels, which really are that dense; Doom's
+# HUD font reads by outer silhouette, not an internal hole, and 4 px wide
+# loses the silhouette along with everything else. 2x2 cells (8x16 logical
+# px, against STTNUM's native ~14x16) keeps enough of the outline that 0/1/4/7
+# are clearly distinct by eye. Still four cells, still boot-only, still
+# trivial against REU's abundant space.
+HUD_FONT_GLYPHS = 10
+HUD_FONT_CELLS_W = 2
+HUD_FONT_CELLS_H = 2
+HUD_FONT_GLYPH_BYTES = HUD_FONT_CELLS_W * HUD_FONT_CELLS_H * HUD_CELL_BYTES  # 128
+HUD_FONT_BYTES = HUD_FONT_GLYPHS * HUD_FONT_GLYPH_BYTES            # 1280
+
+
+def _picture_intensity_grid(wad: Wad, lumpname: str, dst_w: int,
+                            dst_h: int) -> list:
+    """A WAD picture lump -> dst_w*dst_h intensity nibbles, u-major
+    (index = x*dst_h + y), 0 meaning "transparent, paint background".
+
+    Same nearest-neighbour bucket-and-average technique as
+    texture_luma_tile, generalised from a TEXTURE1 composite to a single
+    picture lump and an arbitrary destination grid -- STBAR and STTNUM are
+    plain patch-format pictures, not composites, so decode_picture is all
+    the WAD reading this needs.
+    """
+    luma = palette_luma(wad)
+    w, h, px = decode_picture(wad.lump(lumpname))
+    acc = [0.0] * (dst_w * dst_h)
+    cnt = [0] * (dst_w * dst_h)
+    for (x, y), c in px.items():
+        dx = x * dst_w // w
+        dy = y * dst_h // h
+        if 0 <= dx < dst_w and 0 <= dy < dst_h:
+            k = dx * dst_h + dy
+            acc[k] += luma[c]
+            cnt[k] += 1
+    return [light_to_intensity(acc[k] / cnt[k]) if cnt[k] else 0
+            for k in range(dst_w * dst_h)]
+
+
+#: The only four intensities that survive chunky2mc.asm's dither untouched.
+#: dcode() is min(floor(v/5 + (t+0.5)/16), 3) with t the 0-15 Bayer threshold,
+#: so v in {0,5,10,15} lands on code 0/1/2/3 for *every* t -- no ordered-dither
+#: noise at all. Anything between them alternates between two codes across the
+#: 4x4 Bayer cell, which is right for a shaded wall and wrong for the HUD: the
+#: first build let the full 0-15 range through and the bar came out a uniform
+#: speckle with the digits barely a shade different from it (measured off a
+#: live VICE bitmap dump, not judged by eye). Snapping to these four makes the
+#: bar flat and the glyphs crisp.
+HUD_LEVELS = (0, 5, 10, 15)
+
+
+def _hud_snap(v: int) -> int:
+    """An intensity nibble -> the nearest dither-free HUD_LEVELS value."""
+    return min(HUD_LEVELS, key=lambda L: abs(L - v))
+
+
+def _pack_hud_cell(intensities_row_major: list) -> bytes:
+    """32 intensities, index = row*4+px (MATRIX's own cell layout) -> 32
+    MATRIX-format bytes, every one carrying HUD_RAMP in its high nibble --
+    including intensity-0 (background) pixels.
+
+    That looks wasteful -- ramp is meaningless at intensity 0 -- but it is
+    load-bearing: chunky2mc.asm's convert() samples *one* pixel per cell
+    (row 3, px 1) to pick the whole cell's screen/colour-RAM colours, on the
+    assumption a cell is one surface and shares one ramp. A wall does; a
+    digit glyph does not -- most of its cells are part background, part ink
+    -- and if the sampled pixel happens to be a background one, a bare 0
+    there would fall back to ramp 0 (grey) for the *entire* cell, ink
+    included. Carrying HUD_RAMP on the 0s costs nothing else: ditherTabs
+    keys only on the low nibble, so an intensity-0 pixel still dithers to
+    %00/black regardless of what its ramp nibble says.
+    """
+    return bytes((HUD_RAMP << 4) | v for v in intensities_row_major)
+
+
+def _hud_fallback_cell(pattern: int) -> bytes:
+    """A cell for the TEST map, which has no WAD to downsample from. Not
+    trying to look like anything -- just a fixed, checkable pattern, the same
+    role _pattern_tile plays for WALLTEX's test-map path."""
+    cell = [(pattern >> (v % 4)) & 1 for v in range(32)]
+    return _pack_hud_cell([_hud_snap(TEX_MID) if b else 0 for b in cell])
+
+
+def build_hudbg(wad: Wad = None) -> bytes:
+    """Block 8: HUD_BG_CELLS_W x HUD_BG_CELLS_H cells, row-major, from STBAR.
+
+    Without a WAD (the test map) this is a fixed placeholder pattern instead,
+    at full size either way -- build_walltex's own reasoning applies here
+    too: the two images should differ only in content, not in code path.
+    """
+    if wad is None:
+        return b"".join(
+            _hud_fallback_cell((cx + cy) & 1)
+            for cy in range(HUD_BG_CELLS_H) for cx in range(HUD_BG_CELLS_W))
+    w = HUD_BG_CELLS_W * 4
+    h = HUD_BG_CELLS_H * 8
+    grid = _picture_intensity_grid(wad, "STBAR", w, h)
+    out = bytearray()
+    for cy in range(HUD_BG_CELLS_H):
+        for cx in range(HUD_BG_CELLS_W):
+            cell = [_hud_snap(grid[(cx * 4 + px) * h + (cy * 8 + row)])
+                   for row in range(8) for px in range(4)]
+            out += _pack_hud_cell(cell)
+    return bytes(out)
+
+
+def build_hudfont(wad: Wad = None) -> bytes:
+    """Block 9: HUD_FONT_GLYPHS glyphs, each HUD_FONT_CELLS_W x _H cells,
+    row-major within the glyph, from STTNUM0..9.
+
+    Two levels only, not the four HUD_LEVELS the background gets: ink is
+    forced to 15 (ramp 8's brightest, yellow) and STTNUM's transparent
+    surround to 0 (black). A digit is 8 screen pixels wide here -- the
+    shading of the real font's bevel does not survive that, and trying to
+    keep it just costs contrast against the bar behind it.
+    """
+    if wad is None:
+        return b"".join(
+            _hud_fallback_cell(d + i)
+            for d in range(HUD_FONT_GLYPHS)
+            for i in range(HUD_FONT_CELLS_W * HUD_FONT_CELLS_H))
+    w_px = HUD_FONT_CELLS_W * 4
+    h_px = HUD_FONT_CELLS_H * 8
+    out = bytearray()
+    for d in range(HUD_FONT_GLYPHS):
+        grid = _picture_intensity_grid(wad, f"STTNUM{d}", w_px, h_px)
+        for cy in range(HUD_FONT_CELLS_H):
+            for cx in range(HUD_FONT_CELLS_W):
+                cell = [15 if grid[(cx * 4 + px) * h_px + (cy * 8 + row)]
+                        else 0
+                       for row in range(8) for px in range(4)]
+                out += _pack_hud_cell(cell)
+    return bytes(out)
+
 LF_WALKOVER = 0x10              # crossing the line fires it; else the use key
 LF_REPEAT = 0x20                # fires again after it has run; else once only
 
@@ -1343,7 +1514,8 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
     return bytes(b)
 
 
-def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
+def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
+                hudbg: bytes = b"", hudfont: bytes = b"") -> bytes:
     """Assemble the whole .reu image. Blocks follow the header in id order,
     each padded up to a 256-byte boundary (docs/reu-format.md §3).
 
@@ -1371,7 +1543,9 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     ofs_ssecdata = ofs_sectors + align(len(sectors))
     ofs_nodesph = ofs_ssecdata + align(len(ssecdata))
     ofs_walltex = ofs_nodesph + align(len(nodesph))
-    ofs_lines = ofs_walltex + align(len(walltex))
+    ofs_hudbg = ofs_walltex + align(len(walltex))
+    ofs_hudfont = ofs_hudbg + align(len(hudbg))
+    ofs_lines = ofs_hudfont + align(len(hudfont))
 
     ofs_music = MUSIC_OFFSET if music else 0
 
@@ -1389,6 +1563,14 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     ]
     if walltex:
         blocks.append((BLK_WALLTEX, 0, ofs_walltex, walltex, 0))
+    # Streamed, and read exactly once, like LINEDEFS below: hudLoad in
+    # mapload.asm finds them by block id during the descriptor walk and
+    # blits them straight into the bitmap at boot. Neither is resident --
+    # nothing reads either block again after that.
+    if hudbg:
+        blocks.append((BLK_HUDBG, 0, ofs_hudbg, hudbg, 0))
+    if hudfont:
+        blocks.append((BLK_HUDFONT, 0, ofs_hudfont, hudfont, 0))
     # Streamed, and read exactly once: mapLoad stages it into MATRIX at boot
     # and lineLoad splits it into the two holes under I/O. It is not resident
     # because a resident block's home is a *page* in the descriptor and neither
@@ -1713,6 +1895,29 @@ def validate(m: MapData, img: bytes) -> list[str]:
         check(info["tex_base"] == 0,
               "MAPINFO points at a texture block the image does not contain")
 
+    # 12. the HUD blocks (IMPLEMENTATION_PLAN.md §13). No MAPINFO pointer to
+    # check -- hudLoad finds them by block id, like LINEDEFS -- so this is
+    # presence, size, and the one silent failure worth catching: a glyph or
+    # background cell that quantises to uniform intensity, i.e. a blank digit
+    # or a blank patch of bar (echoing the WALLTEX check just above).
+    hb = p["blocks"].get(BLK_HUDBG)
+    check(hb is not None, "image has no HUDBG block")
+    if hb is not None:
+        check(hb["flags"] & BF_RESIDENT == 0, "HUDBG must not be resident")
+        check(hb["length"] == HUD_BG_BYTES,
+              f"HUDBG is {hb['length']} B, expected {HUD_BG_BYTES}")
+    hf = p["blocks"].get(BLK_HUDFONT)
+    check(hf is not None, "image has no HUDFONT block")
+    if hf is not None:
+        check(hf["flags"] & BF_RESIDENT == 0, "HUDFONT must not be resident")
+        check(hf["length"] == HUD_FONT_BYTES,
+              f"HUDFONT is {hf['length']} B, expected {HUD_FONT_BYTES}")
+        for d in range(HUD_FONT_GLYPHS):
+            glyph = hf["data"][d * HUD_FONT_GLYPH_BYTES:
+                               (d + 1) * HUD_FONT_GLYPH_BYTES]
+            check(len(set(glyph)) > 1,
+                  f"digit glyph {d} is uniform -- it will render blank")
+
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
         for name, child in (("right", nd.right), ("left", nd.left)):
@@ -1913,6 +2118,7 @@ def report(m: MapData, img: bytes) -> None:
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
                       (BLK_NODESPH, "NODESPH"), (BLK_WALLTEX, "WALLTEX"),
+                      (BLK_HUDBG, "HUDBG"), (BLK_HUDFONT, "HUDFONT"),
                       (BLK_LINEDEFS, "LINEDEFS"), (BLK_MUSIC, "MUSIC")):
         if bid not in p["blocks"]:
             continue
@@ -1971,14 +2177,16 @@ def main(argv=None) -> int:
         if a.map.upper() == "TEST":
             m = build_test_map()
             walltex = build_walltex(None)
+            hudbg, hudfont = build_hudbg(None), build_hudfont(None)
         else:
             if not a.wad:
                 ap.error("a WAD path is required unless --map TEST")
             wad = Wad(a.wad)
             m = load_wad_map(wad, a.map.upper())
             walltex = build_walltex(wad)
+            hudbg, hudfont = build_hudbg(wad), build_hudfont(wad)
         music = load_music(a.music) if a.music else b""
-        img = build_image(m, music, walltex)
+        img = build_image(m, music, walltex, hudbg, hudfont)
     except (ValueError, OSError) as e:
         print(f"wad2reu: {e}", file=sys.stderr)
         return 2
