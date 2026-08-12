@@ -1226,14 +1226,42 @@ frame. That is why the options below are largely one compromise wearing
 different hats, and why the first is the only one that pays into both budgets
 at once.
 
-### 14a.1 Viewport height *(decided: 176 → 160, pending a look)*
+### 14a.1 Viewport height *(landed 2026-08-12: 176 → 160)*
 
 > **Agreed 2026-08-12: 176 → 160 rows, and no further for now.** The taller
 > cuts are listed because they are the same edit with a different constant, not
 > because they are scheduled. **160 is to be built and looked at first**; 144
 > is reconsidered only if the letterbox turns out to read as deliberate rather
-> than as a smaller game. Not yet implemented — this is a decision, not a
-> landing note.
+> than as a smaller game.
+>
+> **Built.** The four constants: `math.asm`'s `rowCellLo/Hi` table (22 → 20
+> entries) and `spanPrep`'s row clamp/bound (177/176/22 → 161/160/20);
+> `bsp.asm`'s `colBot` init (176 → 160); `walls.asm`'s column-close value
+> (176 → 160); `chunky2mc.asm`'s `pageCnt` (110 → 100 pages, i.e. 880 → 800
+> cells) and `flip`'s color-RAM burst copy (880 → 800 bytes). `clearHudRows`
+> grew to blank rows 20-24 in one pass instead of 22-24 — rows 20-21 are the
+> letterbox the shorter viewport opens up, and without a boot-time clear they
+> would show whatever the boot-staging blocks left in that part of MATRIX's
+> chunky buffer rather than a clean black bar (the bitmap-only clear is exact
+> to `BITMAP0`'s 8000-byte end, so it can't spill into `TX_UENDS` just past
+> it). `checkshot.py`, `u64shot.py` and `framehash.py` all updated to the new
+> 160-row/25600-byte buffer.
+>
+> `make check`, `make walktest` and `make doortest` are all green, unchanged
+> in substance. `make framehash` is a **new** digest, expectedly — the frame
+> genuinely differs — at `398eb98fea794c1b97486a292c943f4e222e9b2d8d2f71a37d0385d04059879e`
+> over 25600 bytes, 100% non-zero (the old hash's buffer included 2560 bytes
+> the renderer never wrote, past `MATRIX_LEN`, that never asserted anything).
+> `make shot` shows a visible but thin black bar between the 3D view and the
+> HUD — the look judgement this section deferred to hardware. **Not yet
+> measured on real hardware**: no network path to the Ultimate from this
+> session. §10.2's called-for `profile.py` checkpoint on `chunky2mc`'s own
+> share of the frame — the number this section says is needed before judging
+> whether the pixel-work saving tracks the row percentage — is still open,
+> and so is the RAM side: the freed 2560 B tail of MATRIX (past the new
+> 25600-byte live buffer, inside the old boot-staging region up to
+> `MATRIX+$6e00`) is free for code once the first frame has run, but nothing
+> has claimed it yet.
 
 `176` is 22 cell-rows and appears in **four places**: `math.asm`'s `rowCell`
 bound, `bsp.asm`, `walls.asm`'s column close, and `chunky2mc.asm`'s header. A

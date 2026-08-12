@@ -7,7 +7,8 @@
 screenshot lands wherever -limitcycles stops, which is mid-flip often enough
 that two runs of the *same* build differ by a few dozen pixels. What is exact
 is the renderer's own output buffer, read at a frame boundary: the camera does
-not move without input, so every frame writes the identical 28160 bytes.
+not move without input, so every frame writes the identical 25600 bytes
+(176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1).
 
 Waits for the engine's frame counter to pass a few frames, reads MATRIX, and
 prints its sha256 plus the coverage the shot check would see. Two builds that
@@ -23,7 +24,7 @@ from vicemon import Mon
 from probe import connect
 
 MATRIX = 0x1000
-MATRIX_LEN = 160 * 176          # what the renderer actually writes
+MATRIX_LEN = 160 * 160          # what the renderer actually writes
 FRAMECNT = 0x0F40               # `.const frameCnt` in src/defs.asm
 MAPOK = 0x0F47
 

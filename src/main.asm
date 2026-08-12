@@ -16,7 +16,10 @@
 //    $0E70-$0EEE  collision helpers
 //    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
 //    $0F51-$0FC3  seg backface test  $0FC4-$0FF7  music player state
-//    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000,
+//    $1000-$7DFF  MATRIX (28160 B total; renderer/converter use 25600 B, 100
+//                 pages -- 176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1; the
+//                 2560 B tail is free RAM once the first frame has run)
+//                 -- also stages MAPHDR at $5000,
 //                 the boot-only map loader at $5100 (BOOTCODE), the music
 //                 boot code at $5300 (MUSBOOT) and the rest of the boot-only
 //                 code -- the boot sequence itself, reuProbe, clearHudRows --
@@ -243,32 +246,40 @@ turboOn:
 
 
 //------------------------------------------------------------
-// The converter only writes cells 0-879 (rows 0-21); rows 22-24
-// are the HUD area. Blank them once in both buffers.
+// The converter only writes cells 0-799 (rows 0-19, IMPLEMENTATION_PLAN.md
+// §14a.1: 176 -> 160 rows); rows 20-24 are now blank once in both buffers --
+// rows 20-21 are the letterbox the shorter viewport opened up, rows 22-24
+// are still the HUD area, and both are cleared the same way in one pass.
 //
-// COLBUF's own rows 22-24 ($0770-$07e7) are deliberately *not* cleared: flip
-// copies only the first 880 bytes of it to $d800, so nothing ever reads them
+// COLBUF's own rows 20-24 ($0700-$07e7) are deliberately *not* cleared: flip
+// copies only the first 800 bytes of it to $d800, so nothing ever reads them
 // back (IMPLEMENTATION_PLAN.md §8.3's table says so, and this is the code that
 // made the claim true).
 //------------------------------------------------------------
 clearHudRows:
         lda #0
         tax
-!:      sta BITMAP0+[22*320],x      // 960 bytes as 4 overlapping 256B strides
-        sta BITMAP0+[22*320]+256,x
-        sta BITMAP0+[22*320]+512,x
-        sta BITMAP0+[22*320]+704,x
-        sta BITMAP1+[22*320],x
-        sta BITMAP1+[22*320]+256,x
-        sta BITMAP1+[22*320]+512,x
-        sta BITMAP1+[22*320]+704,x
+!:      sta BITMAP0+[20*320],x      // 1600 bytes as 7 overlapping 256B
+        sta BITMAP0+[20*320]+256,x  // strides, exact to BITMAP's 8000-byte
+        sta BITMAP0+[20*320]+512,x  // end (20*320+1600 = 8000) so this can't
+        sta BITMAP0+[20*320]+768,x  // spill into TX_UENDS just past it
+        sta BITMAP0+[20*320]+1024,x
+        sta BITMAP0+[20*320]+1280,x
+        sta BITMAP0+[20*320]+1344,x
+        sta BITMAP1+[20*320],x
+        sta BITMAP1+[20*320]+256,x
+        sta BITMAP1+[20*320]+512,x
+        sta BITMAP1+[20*320]+768,x
+        sta BITMAP1+[20*320]+1024,x
+        sta BITMAP1+[20*320]+1280,x
+        sta BITMAP1+[20*320]+1344,x
         inx
         bne !-
-!:      sta SCREEN0+880,x           // screen/color rows 22-24: 120 bytes
-        sta SCREEN1+880,x
-        sta $d800+880,x
+!:      sta SCREEN0+800,x           // screen/color rows 20-24: 200 bytes
+        sta SCREEN1+800,x
+        sta $d800+800,x
         inx
-        cpx #120
+        cpx #200
         bcc !-
         rts
 

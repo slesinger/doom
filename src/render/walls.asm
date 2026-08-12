@@ -442,7 +442,7 @@ colLoopHead:
         sta zSCol
         jsr wallSpan
         ldx zSX
-        lda #176                    // close the column for good
+        lda #160                    // close the column for good (176 -> 160 rows)
         sta colTop,x
         lda #0
         sta colBot,x

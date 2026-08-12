@@ -8,8 +8,9 @@ assembles, runs, `make debug` stays clean, and the display shows nothing.
 `make debug` cannot see that — it only proves nobody wrote outside their
 buffers — so the screenshot needs an assertion of its own.
 
-Two cheap properties separate "a frame" from "not a frame", inside the 320x176
-3D viewport (the top 22 of the 25 text rows; rows 22-24 are the blanked HUD):
+Two cheap properties separate "a frame" from "not a frame", inside the 320x160
+3D viewport (the top 20 of the 25 text rows; rows 20-24 are letterbox + HUD,
+both blanked -- IMPLEMENTATION_PLAN.md §14a.1, 176 -> 160 rows):
 
   coverage  fraction of pixels that are not the black background. A wall/floor/
             ceiling view fills most of the viewport; the known-good E1M1-less
@@ -36,7 +37,7 @@ except ImportError:
 # area is centred in it. Derive the offset rather than hardcoding 32/36, so a
 # different -exitscreenshot geometry still lines up.
 DISPLAY_W, DISPLAY_H = 320, 200
-VIEWPORT_H = 176                 # rows 0-175: the 3D view. Below is HUD.
+VIEWPORT_H = 160                 # rows 0-159: the 3D view. Below is letterbox+HUD.
 
 
 def measure(path):

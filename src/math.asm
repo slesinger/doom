@@ -23,8 +23,10 @@ sqrHi: .fill 512, >floor(i*i/4)
 sinLo: .fill 256, <round(16383*sin(i*2*PI/256))
 sinHi: .fill 256, >round(16383*sin(i*2*PI/256))
 // matrix row-of-cells base addresses: MATRIX + cellrow*1280
-rowCellLo: .fill 22, <[MATRIX + i*1280]
-rowCellHi: .fill 22, >[MATRIX + i*1280]
+// 20 entries (176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1): the freed
+// tail of MATRIX past row 160 is permanent RAM once the first frame has run.
+rowCellLo: .fill 20, <[MATRIX + i*1280]
+rowCellHi: .fill 20, >[MATRIX + i*1280]
 
 .pc = MATHCODE "math+span code"
 
@@ -367,9 +369,9 @@ spanDone:
 //------------------------------------------------------------
 spanPrep:
         lda zSY1                    // clamp the run's far end to the last
-        cmp #177                    // valid row (176 = 22 cell-rows * 8):
+        cmp #161                    // valid row (160 = 20 cell-rows * 8):
         bcc !+                      // otherwise the cell loop steps the
-        lda #176                    // pointer past rowCell's 22 entries, one
+        lda #160                    // pointer past rowCell's 20 entries, one
         sta zSY1                    // full cell at a time, unbounded
 !:      sec
         sbc zSY0
@@ -386,7 +388,7 @@ spanPrep:
         lsr
         lsr
         lsr
-        cmp #22
+        cmp #20
         bcs !nul-
         tay                         // Y = cell row of first pixel
         lda xOfsLo,x

@@ -57,7 +57,7 @@ renderFrame:
         cpx #0
         bne !-
         ldx #160
-        lda #176
+        lda #160                    // 176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1
 !:      dex
         sta colBot,x
         cpx #0

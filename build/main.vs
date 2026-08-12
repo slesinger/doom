@@ -27,7 +27,7 @@ al C:ff40 .musIrq
 al C:de8 .texUpd
 al C:5586 .bootMain
 al C:9fe1 .texPix
-al C:ca16 .rowCellHi
+al C:ca14 .rowCellHi
 al C:5f39 .hudBoot
 al C:5c12 .jmpStepEnd
 al C:9b85 .umul16

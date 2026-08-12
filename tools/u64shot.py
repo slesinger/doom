@@ -3,8 +3,10 @@
 
     python3 tools/u64shot.py 192.168.1.65 build/hwshot.png
 
-This is the hardware counterpart of `make shot`. It DMA-reads the 28160
-byte MATRIX buffer over the REST API and renders it the way the C64
+This is the hardware counterpart of `make shot`. It DMA-reads the live
+25600 bytes of the MATRIX buffer over the REST API (176 -> 160 rows,
+IMPLEMENTATION_PLAN.md §14a.1 -- the rest of MATRIX's 28160 bytes is
+unused past the first frame) and renders it the way the C64
 would, so a hardware frame can be looked at -- and diffed against the
 emulator's -- without a capture card or the U64 video stream.
 
@@ -28,8 +30,8 @@ import zlib
 from u64 import Ultimate, U64Error, add_host_args
 
 MATRIX = 0x1000
-WIDTH, HEIGHT = 160, 176
-CELL_ROWS = HEIGHT // 8          # 22
+WIDTH, HEIGHT = 160, 160          # 176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1
+CELL_ROWS = HEIGHT // 8          # 20
 CAMX = 0x50                      # camX, camY, camZ, camA, camSec -- see defs.asm
 
 CHUNK = 0x1000                   # bytes per readmem request

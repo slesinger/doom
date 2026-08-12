@@ -1,5 +1,7 @@
 //============================================================
-//  chunky2mc.asm — 160x176 chunky buffer -> VIC-II multicolor
+//  chunky2mc.asm — 160x160 chunky buffer -> VIC-II multicolor
+//  (176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1: a 320x200 frame with
+//  rows 160-175 letterboxed black and the HUD unchanged at rows 176-199)
 //  C64 Ultimate @ turbo, 25 fps double-buffered
 //
 //  Matrix byte format: %rrrriiii  (ramp 0-15, intensity 0-15)
@@ -72,8 +74,8 @@ convert:
         jsr initFrame
         lda #>MATRIX
         sta matPage
-        lda #110
-        sta pageCnt
+        lda #100                    // 100 pages * 8 cells = 800 cells = 20
+        sta pageCnt                 // cell-rows = 160 px (176 -> 160, was 110/880/22)
 pageLoop:
         jsr patchMatrixPage         // 32+1 fetch hi-bytes := matPage
         ldx #0                      // X = (cell & 7) * 32
@@ -172,8 +174,8 @@ flip:
 !:      sta $dd00
         lda #$08                    // both buffers: screen +$0000, bitmap +$2000
         sta $d018
-        ldx #0                      // COLBUF -> $d800 (880 bytes)
-!:      lda COLBUF,x
+        ldx #0                      // COLBUF -> $d800 (800 bytes, 176 -> 160
+!:      lda COLBUF,x                // rows: 20 cell-rows * 40 cols)
         sta $d800,x
         lda COLBUF+$100,x
         sta $d900,x
@@ -184,7 +186,7 @@ flip:
 !:      lda COLBUF+$300,x
         sta $db00,x
         inx
-        cpx #112
+        cpx #32
         bne !-
         lda backBuf                 // swap
         eor #1
