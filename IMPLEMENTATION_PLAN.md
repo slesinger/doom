@@ -816,13 +816,18 @@ wrong and are written into `src/lines.asm`'s header:
    — fetching the player's subsector for the use scan — happens in the
    trampoline, before the bank switch.
 
-### 11.3 The one thing to watch
+### 11.3 The one thing to watch *(closed 2026-08-12 — not an issue)*
 
 **A door that closes on the player.** Doom's answer is to reverse the door;
 without it, `checkMove`'s headroom test starts failing every move and the player
 is stuck inside geometry with no way out. Handle it in the thinker — if the
 player's subsector is the moving sector and the headroom would drop below 56,
 reverse — not in the collision code.
+
+> **Not built, and the user has decided that's fine.** E1M1's DR doors reopen
+> on use, which is the escape in practice, and play-testing on hardware found
+> no case where it mattered. Not scheduled for M3 either unless it actually
+> bites.
 
 *Done when:* the E1M1 start-room door opens on use, closes behind you, and the
 first lift runs; `make framehash` differs between open and closed and is stable
@@ -840,7 +845,7 @@ Where it differs from §11.2, beyond §11.2a's sector-based activation:
 
 | §11.2 said | What is there |
 |---|---|
-| the thinker reverses a door closing on the player | **not built.** §11.3's case is still open — E1M1's DR doors reopen on use, which is the escape |
+| the thinker reverses a door closing on the player | **not built, and closed as a non-issue (§11.3)** — E1M1's DR doors reopen on use, which is the escape, and play-testing found nothing to fix |
 | — | the whole feature is in the **640 bytes under I/O**, code included, so its three blocks are `.pseudopc` images copied by `lineBoot` (BOOTCODE5). A block at `$dbd0` would extend the PRG over `$d000-$dfff` and make *loading* it a 4 KB write across the I/O space |
 | — | the image header grew **64 → 128 bytes**; block 7 was the eighth descriptor and seven is all the old header held (`mapErr=4`) |
 | — | `IN_USE` is bit 4 because that is both joystick fire's bit in `$dc00` and SPACE's in keyboard row 7, and `IN_SLEFT` is bit 6 because that is Q's — row 7 became a mask with no branches, and the use key cost **−2 bytes** |
@@ -855,9 +860,23 @@ looking**, so a door sharing their subsector opens whichever way they face.
 That is the visible price of §11.2a; M3's geometric line test is what removes
 it.
 
-Frame cost is **not yet measured** — the one `make u64-fps` reading taken
-(`compute 53.8 ms` against §10's 46.7) was collected while the machine was in
-use, so it says nothing. Re-run it idle.
+**Frame cost, measured idle 2026-08-12.** `make u64-fps` (20 s window):
+`fps: 334 frames in 20.04 s = 16.67 fps (60.0 ms/frame)`,
+`compute 34.5 ms last, 15.2 min, 70.0 max (deadline 59.85 ms)`,
+`raster frames 3x334 4+x1 -- 100%` on deadline, one frame flagged by the
+tool's own diagnostic as the residual one-time post-reset housekeeping cost
+rather than the engine. **Doors cost effectively nothing measurable** —
+compute is at or below §10's 46.7 ms baseline, consistent with §11.1's claim
+that the renderer never learned what a door is. ~13 ms of budget remains
+for §12 sprites and §13 HUD, unchanged from §10's estimate.
+
+Three back-to-back readings taken in the same session ranged from 100% down
+to 88% on deadline, with the 4+-raster-frame outlier count climbing each time
+rather than settling — likely repeated `run_prg` calls in quick succession
+degrading the connection, the same shape as the §9.1 upload-load risk, not a
+property of the engine. The first, cleanest reading is the one recorded
+above; treat repeated measurements taken close together as suspect until
+spaced out.
 
 ## 11a. Jumping *(added 2026-08-12, out of sequence)*
 
