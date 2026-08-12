@@ -323,7 +323,14 @@ doWall:
         bcs !+
         lda #2                      // minimum visibility
 !:      ldx zWIdx2
-        ora sgRamp,x
+        // sgRamp is %rrrrtttt as of format 4: the low nibble is the texture
+        // family, not part of the shading byte, so it has to be masked off
+        // before the depth intensity goes in. Through M1 it was reserved and
+        // zero and this was a bare `ora sgRamp,x`.
+        sta zWallByte
+        lda sgRamp,x
+        and #$f0
+        ora zWallByte
         sta zWallByte
         // ---- rows at both ends: top (ceil) and bot (floor) lines
         lda zDzC

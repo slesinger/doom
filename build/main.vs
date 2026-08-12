@@ -29,7 +29,7 @@ al C:c30 .sphereVisible
 al C:9d30 .spanCells
 al C:97fe .sideBack
 al C:5262 .mapCopyTail
-al C:cd7c .colAdvance
+al C:cd82 .colAdvance
 al C:ff40 .musIrq
 al C:5586 .bootMain
 al C:acb .moveOK
@@ -84,10 +84,10 @@ al C:810 .main
 al C:9d7c .mathCodeEnd
 al C:e70 .segNear
 al C:51f4 .mapNextBlock
-al C:cd94 .neg__0
-al C:cdb0 .neg__1
-al C:cdd2 .neg__2
-al C:cdee .neg__3
+al C:cd9a .neg__0
+al C:cdb6 .neg__1
+al C:cdd8 .neg__2
+al C:cdf4 .neg__3
 al C:54c6 .musSrcEnd
 al C:ce75 .bspLeaf
 al C:ce96 .renderSsec
@@ -99,10 +99,10 @@ al C:9f8e .msInit
 al C:cf69 .secFront
 al C:ffb4 .miCmpDone
 al C:9dab .lineSetup
-al C:cd96 .done__0
-al C:cdb2 .done__1
-al C:cdd4 .done__2
-al C:cdf0 .done__3
+al C:cd9c .done__0
+al C:cdb8 .done__1
+al C:cdda .done__2
+al C:cdf6 .done__3
 al C:9f41 .projRow
 al C:ffa7 .miAdvDone
 al C:9740 .tablesEnd
@@ -123,7 +123,7 @@ al C:9500 .colTab
 al C:ce95 .bspDone
 al C:5292 .mapMaxLenLo
 al C:53a2 .miBadWindow
-al C:ccc2 .colLoopHead
+al C:ccc8 .colLoopHead
 al C:5388 .miBadMagic
 al C:9a4b .patchMatrixPage
 al C:5279 .mapCopyDone

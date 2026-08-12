@@ -46,7 +46,7 @@ At REU offset `$000000`, 64 bytes:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, ASCII `D64U` |
-| 4 | 1 | format version — **3** |
+| 4 | 1 | format version — **4** |
 | 5 | 1 | block count `N` |
 | 6 | 2 | reserved, zero |
 | 8 | 8×`N` | block descriptors |
@@ -101,10 +101,15 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 3 | `SSECDATA` | no — streamed | — | 30336 B |
 | 4 | `NODESPH` | no — streamed | — | 1920 B |
 | 5 | `MUSIC` | no — streamed | — | 405136 B |
+| 6 | `WALLTEX` | no — streamed | — | 512 B |
 
 Resident total: **3488 B**, of which 3456 sit under the I/O space (§6).
 
-Blocks are stored in the image in id order, each padded to a 256-byte boundary.
+Blocks are stored in the image in id order, each padded to a 256-byte boundary —
+with one exception, `MUSIC`, which sits at a fixed offset above everything else
+(see below), so `WALLTEX` at id 6 is physically *below* it. The descriptors say
+where each block is and nothing reads them in order, so the exception costs
+nothing; it is called out here because a hex dump does not read as id order.
 Padding costs REU space, which is free, and makes every block's offset
 inspectable in a hex dump, which is not.
 
@@ -138,7 +143,8 @@ in silence" rather than as an error. `build/testmap.reu` is built that way.
 | 21 | 1 | `mapId` — 0 = test map, 1 = E1M1 |
 | 22 | 3 | `sphReuBase`, 24-bit REU offset of `NODESPH` |
 | 25 | 3 | `musReuBase`, 24-bit REU offset of `MUSIC` — **0 means no music** |
-| 28 | 4 | reserved, zero |
+| 28 | 3 | `texReuBase`, 24-bit REU offset of `WALLTEX` — **0 means no textures** |
+| 31 | 1 | reserved, zero |
 
 `spawnSsector` is redundant — the engine's own BSP descent will find it — and
 that is the point. `main.asm` compares the two at boot and halts with
@@ -361,6 +367,63 @@ stream bytes in 0.5 s, which at the medley's mean record length of 9.1 B is
 ~107 ticks/s against the tune's 100.25 Hz — the tick rate is right, and it is
 right because the CIA runs at 1 MHz whatever the CPU's turbo setting is.
 
+### 4.7 `WALLTEX` — the wall texture tiles
+
+Block 6, never resident, at `texReuBase` (MAPINFO +28). Sixteen families of 32
+bytes; family `f` is at `texReuBase + (f << 5)`. Zero in `texReuBase` means the
+image carries none, which is not an error — the engine then draws walls flat,
+exactly as M1 did.
+
+A family is one **8×8 grid of intensity nibbles**, nibble-packed **column-major**:
+four bytes per `u` column, `v = 0` in the first byte's high nibble, `v = 1` in
+its low one, and so on down the column.
+
+| Byte in family | Holds |
+|---|---|
+| `u*4 + 0` | `v0 << 4 \| v1` |
+| `u*4 + 1` | `v2 << 4 \| v3` |
+| `u*4 + 2` | `v4 << 4 \| v5` |
+| `u*4 + 3` | `v6 << 4 \| v7` |
+
+Column-major because the engine unpacks **one `u` column at a time** into an
+eight-byte strip and then walks `v` down the screen inside it: `u` is constant
+for a screen column, so the strip is selected once and indexed per pixel.
+
+**The tile modulates intensity and never touches the ramp.** The chunky byte is
+`ramp << 4 | intensity` and a 4×8 multicolor cell holds three colours plus
+background, so a surface's cell stays legal only while the whole surface shares
+one ramp (`IMPLEMENTATION_PLAN.md` §10.1). The engine's combination is
+
+```
+final = clamp(depthIntensity + texel - 8, 2, 15)
+```
+
+so a texel of 8 leaves M1's shading byte exactly as it was. Keeping the depth
+term as the base rather than the texture's own brightness is what stops a dark
+texture from going black at distance.
+
+Tiles are the 8×8 box downsample of a real WAD texture's luminance, quantised to
+±4 around 8 with a gain that saturates at ±25 luma units — so a flat texture
+modulates less than a high-contrast one instead of every tile being normalised
+to full swing. `wad2reu.py`'s `FAMILY_TEXTURE` names the texture each family is
+built from, and `WALL_TEX_FAMILY` maps E1M1's 30 wall texture names onto the
+fifteen non-plain families by longest prefix, the same way `WALL_RAMPS` does.
+
+**Family 0 is `plain` and is uniform**: 177 of E1M1's 732 segs are two-sided
+lines the WAD itself leaves untextured. `--validate` exempts family 0 from the
+"no uniform tile" check and applies it to every other family, because a uniform
+tile anywhere else is a wall that is textured with nothing and looks exactly
+like a wall that is not textured yet.
+
+**`u` and `v` come from world coordinates, not from a texture offset.** `u` is
+the seg's dominant world axis and `v` is `z`, both `>> 4`, so 16 world units is
+a texel and the mapping is *continuous across a BSP seg split*. That is what
+lets the 10-byte seg record stay 10 bytes: Doom carries a per-seg offset along
+the linedef precisely because its `u` is per-linedef, and a world-space `u`
+needs no such thing. The cost is that a diagonal wall's texture is stretched by
+up to √2 and that `u` does not honour the sidedef's own x offset — neither is
+visible at 8×8 and 160 columns.
+
 ---
 
 ## 5. `SSECDATA` — the streamed subsector slots
@@ -419,7 +482,19 @@ the renderer must skip a zero-seg subsector rather than assume it cannot happen.
 | 4 | 2 | `x1` |
 | 6 | 2 | `y1` |
 | 8 | 1 | `backSector` — sector id, or `$FF` for a one-sided (solid) seg |
-| 9 | 1 | `rampByte` — `ramp << 4`; the intensity nibble is filled per-wall from depth |
+| 9 | 1 | `rampByte` — `ramp << 4 \| texFamily` (§4.7) |
+
+**The low nibble was reserved and zero through format 3**, because the byte's
+low nibble is the *intensity*, and the intensity is not a property of the seg —
+`doWall` computes it per wall from depth and ors it in. Format 4 spends that
+nibble on the texture family, which is why Stage A texturing is a version bump
+and not a wider seg record. `doWall` masks with `and #$f0` before the or; an
+engine that forgets to would shade every textured wall 0–15 steps too bright.
+
+Widening the record to carry a texture id was the alternative and was rejected
+on M1's evidence: the 6-byte seg record experiment (`IMPLEMENTATION_PLAN.md` §4)
+was complete, correct and reverted, and per-frame DMA bytes out of `SSECDATA` are
+the scarce thing an 11th byte would spend.
 
 **Winding**: `(x0,y0) → (x1,y1)` with the seg's *front* sector on the **right**.
 This is both Doom's linedef convention and `testmap.asm`'s ("interior is on the

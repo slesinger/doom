@@ -302,6 +302,11 @@
 .const sgX1     = SEGBUF + 4
 .const sgY1     = SEGBUF + 6
 .const sgBack   = SEGBUF + 8
+// %rrrrtttt: the surface's ramp in the high nibble, its texture family in the
+// low one. The low nibble was reserved and zero through M1, which is why
+// Stage A texturing is a format version bump and not a wider seg record -- see
+// docs/reu-format.md §5.1 and IMPLEMENTATION_PLAN.md §10.2. doWall must mask
+// it off before it ors the depth intensity in.
 .const sgRamp   = SEGBUF + 9
 
 // MAPINFO field offsets — docs/reu-format.md §4.1
@@ -323,6 +328,10 @@
 // not an error: `make assets` without a tune produces one, and the engine then
 // renders in silence rather than refusing to boot (src/music.asm).
 .const miMusBase    = MAPINFO + 25  // 24-bit REU offset of block 5, MUSIC
+// The wall texture tiles, block 6 (docs/reu-format.md §4.7). Zero means the
+// image carries none, which is not an error either: the engine then draws
+// walls flat, exactly as M1 did.
+.const miTexBase    = MAPINFO + 28  // 24-bit REU offset of block 6, WALLTEX
 
 // image header field offsets — docs/reu-format.md §2
 // 2 added the bounding spheres: the eight-byte subsector slot header and
@@ -330,8 +339,9 @@
 // rather than reading zeroes as spheres of radius nothing and culling the
 // entire map. 3 added the music stream (block 5) and miMusBase above; it
 // must move in lockstep with wad2reu.py's VERSION, because mapload.asm
-// halts the machine on any other number.
-.const MAPFMT_VERSION = 3
+// halts the machine on any other number. 4 added the wall texture tiles
+// (block 6, miTexBase) and the texture family in sgRamp's low nibble.
+.const MAPFMT_VERSION = 4
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5

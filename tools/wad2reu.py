@@ -44,9 +44,11 @@ from collections import Counter
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 3                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+VERSION = 4                     # 2 added the bounding spheres (SSEC_HDR, block 4)
                                 # 3 added the music stream (block 5) and the
                                 #   page-unit length flag it needs
+                                # 4 added the wall texture tiles (block 6) and
+                                #   the texture family id in the seg's low nibble
 
 HEADER_SIZE = 64
 BLOCK_ALIGN = 256
@@ -73,6 +75,52 @@ NODESPH_SHIFT = 3
 
 BLK_MAPINFO, BLK_NODES, BLK_SECTORS, BLK_SSECDATA, BLK_NODESPH = 0, 1, 2, 3, 4
 BLK_MUSIC = 5
+BLK_WALLTEX = 6
+
+# Wall texture tiles -- IMPLEMENTATION_PLAN.md §10.2 Stage A.
+#
+# Sixteen families, one 8x8 intensity tile each, nibble-packed column-major:
+# 4 bytes per u column (v = 0,1 in byte 0, v = 2,3 in byte 1, ...), 32 bytes per
+# family, 512 bytes for the block. Family i is at texReuBase + (i << 5).
+#
+# Sixteen and not more because the family id rides in the low nibble of the seg
+# record's rampByte, which was reserved and zero (docs/reu-format.md §5.1). That
+# is what makes this a format version bump and not a seg-record widening -- the
+# 6-byte seg experiment in IMPLEMENTATION_PLAN.md §4 is the standing warning
+# against growing the hottest record in the engine for a feature this size.
+TEX_FAMILIES = 16
+TEX_TILE_W = 8
+TEX_TILE_H = 8
+TEX_TILE_BYTES = TEX_TILE_W * TEX_TILE_H // 2    # 32, nibble-packed
+TEX_BLOCK_BYTES = TEX_FAMILIES * TEX_TILE_BYTES  # 512
+
+# The intensity a texel of mean brightness gets. The engine adds the tile's
+# texel to the wall's depth-shaded intensity and subtracts this, so a mean texel
+# leaves the M1 shading exactly as it was and the tile is a pure modulation:
+#
+#     final = clamp(depthIntensity + texel - TEX_MID, 2, 15)
+#
+# Keeping the depth term as the base rather than the texture's own brightness is
+# what stops a dark texture from going black at distance, which is the failure
+# mode M1 risk #5 already found once with two flats on one ramp.
+TEX_MID = 8
+
+# How far a texel may swing either side of TEX_MID, and how much luma buys a
+# step. TEX_SWING = 4 of 14 usable intensity steps is clearly visible without
+# swamping the depth cue; TEX_GAIN saturates that swing at +-25 luma units,
+# which is about the contrast of a Doom panel texture. Textures flatter than
+# that (BROWNGRN's range is 22 luma) modulate less, which is the honest
+# result -- normalising every tile to full swing makes a flat wall look noisy.
+TEX_SWING = 4
+TEX_GAIN = TEX_SWING / 25.0
+
+# World units per texel, both axes. The engine maps u and v from *world*
+# coordinates rather than from a per-seg texture offset -- u = axisCoord >> 4,
+# v = z >> 4 -- so the mapping is continuous across a BSP seg split and no
+# offset has to ride in the seg record. 16 units is a 128-unit repeat, which is
+# what a 128x128 Doom texture spans at 1 pixel per unit; it is the size most of
+# E1M1's wall textures actually are.
+TEX_UNITS_SHIFT = 4
 
 # Block descriptor flags (docs/reu-format.md §2).
 #
@@ -191,8 +239,73 @@ FLAT_RAMPS = {
 }
 
 
-def pick_ramp(name: str, table: dict, misses: Counter) -> int:
-    """Longest-prefix match of a Doom texture/flat name onto a ramp id."""
+# ----------------------------------------------------------------------------
+# Texture families — the Stage A texturing knob, and the sibling of the ramp
+# table above. A family is a group of E1M1 wall textures that share one 8x8
+# intensity tile, and the tile is the downsample of the family's *representative*
+# texture, named here rather than derived, so that the art decision is visible.
+#
+# Sixteen families is the hard cap (the id is a nibble), and E1M1's 30 distinct
+# wall texture names fit in fifteen of them with family 0 left for "this surface
+# has no texture in the WAD either" — the 177 segs whose front sidedef carries
+# none. Family 0's tile is deliberately uniform and the validator exempts it;
+# every other tile must have structure or it is a silently untextured wall.
+#
+# Matching is by longest prefix, exactly like pick_ramp, so STARTAN3 and
+# STARTAN1 land together without either being spelled out twice.
+# ----------------------------------------------------------------------------
+
+TEX_PLAIN = 0                   # no texture on the sidedef; uniform tile
+
+# family id -> the WAD texture whose 8x8 downsample becomes the tile.
+# None means "synthesise a uniform tile" and is only legal for TEX_PLAIN.
+FAMILY_TEXTURE = [
+    None,                       # 0  plain
+    "BROWNGRN",                 # 1  the brown-green that lines E1M1's corridors
+    "STARTAN3",                 # 2
+    "BROWN1",                   # 3
+    "SUPPORT2",                 # 4  metal banding; STEP1 rides along
+    "STARG3",                   # 5
+    "PLANET1",                  # 6
+    "LITE3",                    # 7  the light strips
+    "COMPTILE",                 # 8
+    "NUKE24",                   # 9  slime surrounds
+    "DOORSTOP",                 # 10 door jambs and tracks
+    "COMPTALL",                 # 11 the big computer banks
+    "TEKWALL4",                 # 12
+    "EXITSIGN",                 # 13
+    "EXITDOOR",                 # 14 doors proper
+    "BRNBIGC",                  # 15
+]
+assert len(FAMILY_TEXTURE) == TEX_FAMILIES
+
+# Every distinct wall texture name in E1M1, by prefix, onto a family.
+WALL_TEX_FAMILY = {
+    "BROWNGRN": 1,
+    "STARTAN": 2,                                   # STARTAN1, STARTAN3
+    "BROWN1": 3, "BROWN144": 3, "BROWN96": 3,
+    "SUPPORT2": 4, "STEP1": 4, "STEP6": 4,
+    "STARG": 5, "STARGR": 5,
+    "PLANET1": 6,
+    "LITE3": 7,
+    "COMPTILE": 8,
+    "NUKE24": 9, "SLADWALL": 9,
+    "DOORSTOP": 10, "DOORTRAK": 10,
+    "COMPTALL": 11, "COMPUTE2": 11, "COMPSPAN": 11,
+    "TEKWALL": 12,
+    "EXITSIGN": 13,
+    "EXITDOOR": 14, "BIGDOOR": 14, "DOOR3": 14, "SW1STRTN": 14,
+    "BRNBIG": 15,                                   # BRNBIGL/C/R
+}
+
+
+def pick_ramp(name: str, table: dict, misses: Counter,
+              default: int = DEFAULT_RAMP) -> int:
+    """Longest-prefix match of a Doom texture/flat name onto a ramp or family id.
+
+    Both lookups have the same shape -- a prefix table, a fallback, and a counter
+    so that --report can name what fell through -- so both use this.
+    """
     name = name.upper()
     best = None
     for key in table:
@@ -200,7 +313,7 @@ def pick_ramp(name: str, table: dict, misses: Counter) -> int:
             best = key
     if best is None:
         misses[name] += 1
-        return DEFAULT_RAMP
+        return default
     return table[best]
 
 
@@ -252,6 +365,14 @@ class Wad:
                 break
         return out
 
+    def lump(self, name: str) -> bytes:
+        """A whole lump by name, first match. Textures are global, not per-map,
+        so they come through here rather than through map_lumps."""
+        for n, ofs, size in self.dir:
+            if n == name:
+                return self.data[ofs:ofs + size]
+        raise ValueError(f"no lump {name!r} in WAD")
+
     def records(self, lumps: dict, name: str, fmt: str) -> list:
         ofs, size = lumps[name]
         step = struct.calcsize(fmt)
@@ -262,22 +383,203 @@ class Wad:
 
 
 # ----------------------------------------------------------------------------
+# Wall textures out of the WAD, down to 8x8 intensity tiles.
+#
+# A Doom wall texture is a composite: TEXTURE1 gives its size and a list of
+# patches with origins, and each patch is a lump in the column-post "picture"
+# format. None of that survives into the image — what ships is an 8x8 grid of
+# intensity nibbles per family — but the downsample has to be done on the real
+# pixels or the tile is a guess. Two sessions of M1 went to things that were
+# estimated rather than measured (IMPLEMENTATION_PLAN.md §4); a texture that
+# reads as the wrong material is the same mistake in the art direction.
+# ----------------------------------------------------------------------------
+
+def palette_luma(wad: Wad) -> list:
+    """PLAYPAL entry -> perceptual luminance, 0-255."""
+    pal = wad.lump("PLAYPAL")[:768]
+    return [0.299 * pal[i * 3] + 0.587 * pal[i * 3 + 1] + 0.114 * pal[i * 3 + 2]
+            for i in range(256)]
+
+
+def read_pnames(wad: Wad) -> list:
+    d = wad.lump("PNAMES")
+    n = struct.unpack_from("<i", d, 0)[0]
+    return [d[4 + i * 8:12 + i * 8].rstrip(b"\0").decode("ascii", "replace").upper()
+            for i in range(n)]
+
+
+def read_texture1(wad: Wad) -> dict:
+    """TEXTURE1 -> {name: (width, height, [(originx, originy, patchid), ...])}"""
+    d = wad.lump("TEXTURE1")
+    n = struct.unpack_from("<i", d, 0)[0]
+    out = {}
+    for o in struct.unpack_from("<%di" % n, d, 4):
+        name = d[o:o + 8].rstrip(b"\0").decode("ascii", "replace").upper()
+        _masked, w, h, _cdir, npatch = struct.unpack_from("<ihhih", d, o + 8)
+        patches = [struct.unpack_from("<hhhhh", d, o + 22 + i * 10)[0:3]
+                   for i in range(npatch)]
+        out[name] = (w, h, patches)
+    return out
+
+
+def decode_picture(data: bytes) -> tuple:
+    """Doom picture format -> (w, h, {(x, y): palette index}).
+
+    Columns are lists of posts, each `topdelta, length, pad, pixels..., pad`,
+    terminated by a topdelta of $FF. Gaps between posts are transparent and are
+    simply absent from the dict, which is what makes the downsample below
+    average over the covered texels only.
+    """
+    w, h = struct.unpack_from("<hh", data, 0)
+    colofs = struct.unpack_from("<%dI" % w, data, 8)
+    px = {}
+    for x in range(w):
+        p = colofs[x]
+        while data[p] != 0xFF:
+            top, ln = data[p], data[p + 1]
+            p += 3
+            for i in range(ln):
+                y = top + i
+                if 0 <= y < h:
+                    px[(x, y)] = data[p + i]
+            p += ln + 1
+    return w, h, px
+
+
+def texture_luma_tile(wad: Wad, name: str, tex1: dict, pnames: list,
+                      luma: list) -> list:
+    """A wall texture -> 64 mean luminances, column-major (u major, v minor)."""
+    if name not in tex1:
+        raise ValueError(f"texture {name!r} is not in TEXTURE1")
+    w, h, patches = tex1[name]
+    acc = [0.0] * 64
+    cnt = [0] * 64
+    for ox, oy, pid in patches:
+        _pw, _ph, px = decode_picture(wad.lump(pnames[pid]))
+        for (x, y), c in px.items():
+            tx, ty = x + ox, y + oy
+            if 0 <= tx < w and 0 <= ty < h:
+                k = (tx * TEX_TILE_W // w) * TEX_TILE_H + (ty * TEX_TILE_H // h)
+                acc[k] += luma[c]
+                cnt[k] += 1
+    if not any(cnt):
+        raise ValueError(f"texture {name!r} has no opaque pixels")
+    mean = sum(acc) / sum(cnt)
+    return [acc[k] / cnt[k] if cnt[k] else mean for k in range(64)]
+
+
+def quantise_tile(lum: list) -> list:
+    """64 luminances -> 64 intensity nibbles centred on TEX_MID.
+
+    The centre is the tile's own mid-range rather than its mean: a texture that
+    is mostly one shade with a bright stripe (LITE3) should have the stripe read
+    as bright and the field as neutral, not the field read as dark because the
+    stripe pulled the mean up.
+    """
+    lo, hi = min(lum), max(lum)
+    mid = (lo + hi) / 2.0
+    out = []
+    for v in lum:
+        d = int(round((v - mid) * TEX_GAIN))
+        out.append(max(TEX_MID - TEX_SWING, min(TEX_MID + TEX_SWING, TEX_MID + d)))
+    return out
+
+
+def pack_tile(nibbles: list) -> bytes:
+    """64 nibbles, column-major, -> 32 bytes: v even in the high nibble.
+
+    Column-major because the engine unpacks one *u column* at a time into an
+    8-byte strip and then walks v down the screen inside it — see
+    IMPLEMENTATION_PLAN.md §10.3. Even v in the high nibble so that a hex dump
+    of the block reads top-to-bottom in the order the wall is drawn.
+    """
+    out = bytearray(TEX_TILE_BYTES)
+    for u in range(TEX_TILE_W):
+        for v in range(0, TEX_TILE_H, 2):
+            hi = nibbles[u * TEX_TILE_H + v] & 0x0F
+            lo = nibbles[u * TEX_TILE_H + v + 1] & 0x0F
+            out[u * (TEX_TILE_H // 2) + v // 2] = (hi << 4) | lo
+    return bytes(out)
+
+
+# The test map's tiles, as patterns rather than as textures.
+#
+# The test map is what a renderer change is brought up on before E1M1's 732 segs
+# are involved, and a uniform tile would make it useless for exactly the change
+# it now has to serve. Each pattern is chosen so that a specific mapping bug is
+# obvious by eye and cannot be confused with another one:
+#
+#   "vbars"  varies in u only -- any wobble is the perspective u interpolation
+#   "hbars"  varies in v only -- any wobble is the v step, i.e. the wall scale
+#   "check"  varies in both  -- catches u and v swapped, which the two above
+#                              cannot: each looks correct through the other's eye
+#   "frame"  a border        -- shows where one tile ends and the next begins,
+#                              which is what a seg-to-seg seam looks like
+#
+# Amplitude is TEX_SWING so the patterns exercise the same clamp the real tiles
+# are checked against.
+def _pattern_tile(kind: str) -> list:
+    lo, hi = TEX_MID - TEX_SWING, TEX_MID + TEX_SWING
+    out = []
+    for u in range(TEX_TILE_W):
+        for v in range(TEX_TILE_H):
+            if kind == "vbars":
+                out.append(hi if (u & 2) else lo)
+            elif kind == "hbars":
+                out.append(hi if (v & 2) else lo)
+            elif kind == "check":
+                out.append(hi if ((u ^ v) & 1) else lo)
+            else:                                       # frame
+                edge = u in (0, TEX_TILE_W - 1) or v in (0, TEX_TILE_H - 1)
+                out.append(hi if edge else lo)
+    return out
+
+
+TEST_PATTERNS = ["vbars", "hbars", "check", "frame"]
+
+
+def build_walltex(wad: Wad = None) -> bytes:
+    """Block 6: TEX_FAMILIES tiles of TEX_TILE_BYTES, in family order.
+
+    Without a WAD (the test map) the families get the patterns above instead of
+    downsampled textures. The block is emitted at full size either way, so the
+    two images differ only in their contents and the engine has one code path.
+    """
+    tiles = []
+    if wad is not None:
+        luma = palette_luma(wad)
+        pnames = read_pnames(wad)
+        tex1 = read_texture1(wad)
+    for fam, name in enumerate(FAMILY_TEXTURE):
+        if fam == TEX_PLAIN:
+            tiles.append(pack_tile([TEX_MID] * 64))
+        elif wad is None:
+            tiles.append(pack_tile(
+                _pattern_tile(TEST_PATTERNS[(fam - 1) % len(TEST_PATTERNS)])))
+        else:
+            tiles.append(pack_tile(quantise_tile(
+                texture_luma_tile(wad, name, tex1, pnames, luma))))
+    return b"".join(tiles)
+
+
+# ----------------------------------------------------------------------------
 # The in-memory map, in the form the packers want. Both the WAD path and the
 # test-map path produce one of these, and nothing downstream can tell which.
 # ----------------------------------------------------------------------------
 
 class Seg:
-    __slots__ = ("x0", "y0", "x1", "y1", "front", "back", "ramp")
+    __slots__ = ("x0", "y0", "x1", "y1", "front", "back", "ramp", "tex")
 
-    def __init__(self, x0, y0, x1, y1, front, back, ramp):
+    def __init__(self, x0, y0, x1, y1, front, back, ramp, tex=TEX_PLAIN):
         self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
         self.front = front              # sector id
         self.back = back                # sector id, or None if one-sided
         self.ramp = ramp
+        self.tex = tex                  # texture family, 0-15 (block 6)
 
     def __repr__(self):
         return (f"Seg(({self.x0},{self.y0})->({self.x1},{self.y1}) "
-                f"f={self.front} b={self.back} r={self.ramp})")
+                f"f={self.front} b={self.back} r={self.ramp} t={self.tex})")
 
 
 class Node:
@@ -307,6 +609,8 @@ class MapData:
         self.root = 0
         self.spawn = (0, 0, 0)          # x, y, camA
         self.ramp_misses = Counter()
+        self.tex_misses = Counter()     # wall textures with no family (Stage A)
+        self.tex_used = Counter()       # segs per family, for --report
 
     @property
     def numsegs(self):
@@ -395,15 +699,33 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
                 return pick_ramp(name, WALL_RAMPS, m.ramp_misses)
         return DEFAULT_RAMP
 
+    def side_family(idx):
+        """Texture family from a sidedef, by the same precedence as side_ramp.
+
+        A sidedef with no texture at all is TEX_PLAIN, not a miss: 177 of E1M1's
+        732 segs are two-sided lines the WAD itself leaves untextured, and
+        counting those as unmatched would bury a genuine miss in the noise.
+        """
+        if idx == 0xFFFF:
+            return TEX_PLAIN
+        _xo, _yo, upper, lower, middle, _sec = sides[idx]
+        for tex in (middle, upper, lower):
+            name = txt(tex)
+            if name and name != "-":
+                return pick_ramp(name, WALL_TEX_FAMILY, m.tex_misses, TEX_PLAIN)
+        return TEX_PLAIN
+
     segs = []
     for v1, v2, _angle, linedef, side, _offset in wsegs:
         right, left = lines[linedef][5], lines[linedef][6]
         front_sd, back_sd = (right, left) if side == 0 else (left, right)
         x0, y0 = verts[v1]
         x1, y1 = verts[v2]
+        fam = side_family(front_sd)
+        m.tex_used[fam] += 1
         segs.append(Seg(x0, y0, x1, y1,
                         side_sector(front_sd), side_sector(back_sd),
-                        side_ramp(front_sd)))
+                        side_ramp(front_sd), fam))
 
     for count, first in wssec:
         group = segs[first:first + count]
@@ -469,12 +791,18 @@ def build_test_map() -> MapData:
         m.sectors.append(Sector(floor, ceil, fb, cb))
 
     segs = []
+    # The test map has no sidedefs to carry a texture name, so a wall's family
+    # is its ramp plus one -- distinct per material, and never TEX_PLAIN, which
+    # would leave the map untextured and useless for the change it exists to
+    # de-risk. The +1 is why the pattern list is indexed from family 1.
     for x0, y0, x1, y1, front, back, framp, bramp in TEST_LINEDEFS:
-        segs.append(Seg(x0, y0, x1, y1, front, back, framp))
+        segs.append(Seg(x0, y0, x1, y1, front, back, framp,
+                        1 + framp % (TEX_FAMILIES - 1)))
         if back is not None:
             # The reverse side of a two-sided line is its own seg, wound the
             # other way so that its front sector is again on the right.
-            segs.append(Seg(x1, y1, x0, y0, back, front, bramp))
+            segs.append(Seg(x1, y1, x0, y0, back, front, bramp,
+                            1 + bramp % (TEX_FAMILIES - 1)))
 
     build_bsp(m, segs)
     m.spawn = TEST_SPAWN
@@ -771,13 +1099,15 @@ def pack_ssecdata(m: MapData) -> bytes:
             if back != NO_BACK_SECTOR and back >= len(m.sectors):
                 raise ValueError(f"seg back sector {back} out of range")
             struct.pack_into("<hhhhBB", out, p,
-                             s.x0, s.y0, s.x1, s.y1, back, (s.ramp & 0x0F) << 4)
+                             s.x0, s.y0, s.x1, s.y1, back,
+                             ((s.ramp & 0x0F) << 4) | (s.tex & 0x0F))
             p += SEG_RECORD
     return bytes(out)
 
 
 def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
-                 sph_reu_base: int, mus_reu_base: int = 0) -> bytes:
+                 sph_reu_base: int, mus_reu_base: int = 0,
+                 tex_reu_base: int = 0) -> bytes:
     b = bytearray(MAPINFO_SIZE)
     struct.pack_into("<HHBB", b, 0,
                      len(m.nodes), len(m.subsectors), len(m.sectors),
@@ -796,10 +1126,13 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
     b[25] = mus_reu_base & 0xFF                 # MUSIC, streamed; 0 = no tune
     b[26] = (mus_reu_base >> 8) & 0xFF
     b[27] = (mus_reu_base >> 16) & 0xFF
+    b[28] = tex_reu_base & 0xFF                 # WALLTEX, streamed 32 B/family
+    b[29] = (tex_reu_base >> 8) & 0xFF
+    b[30] = (tex_reu_base >> 16) & 0xFF
     return bytes(b)
 
 
-def build_image(m: MapData, music: bytes = b"") -> bytes:
+def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     """Assemble the whole .reu image. Blocks follow the header in id order,
     each padded up to a 256-byte boundary (docs/reu-format.md §3).
 
@@ -825,12 +1158,14 @@ def build_image(m: MapData, music: bytes = b"") -> bytes:
     ofs_sectors = ofs_nodes + align(len(nodes))
     ofs_ssecdata = ofs_sectors + align(len(sectors))
     ofs_nodesph = ofs_ssecdata + align(len(ssecdata))
+    ofs_walltex = ofs_nodesph + align(len(nodesph))
 
     ofs_music = MUSIC_OFFSET if music else 0
 
     sx, sy, _ = m.spawn
     spawn_ssec = descend(m, sx, sy)
-    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec, ofs_nodesph, ofs_music)
+    mapinfo = pack_mapinfo(m, ofs_ssecdata, spawn_ssec, ofs_nodesph, ofs_music,
+                           ofs_walltex if walltex else 0)
 
     blocks = [
         (BLK_MAPINFO, BF_RESIDENT, ofs_mapinfo, mapinfo, LOAD_MAPINFO >> 8),
@@ -839,10 +1174,13 @@ def build_image(m: MapData, music: bytes = b"") -> bytes:
         (BLK_SSECDATA, 0, ofs_ssecdata, ssecdata, 0),
         (BLK_NODESPH, 0, ofs_nodesph, nodesph, 0),
     ]
+    if walltex:
+        blocks.append((BLK_WALLTEX, 0, ofs_walltex, walltex, 0))
     if music:
         blocks.append((BLK_MUSIC, BF_PAGES, ofs_music, music, 0))
 
-    used = align(ofs_nodesph + len(nodesph))
+    used = align(ofs_walltex + len(walltex)) if walltex \
+        else align(ofs_nodesph + len(nodesph))
     if used > REU_PROBE_OFFSET:
         raise ValueError(
             f"image is {used} B and would reach REU ${REU_PROBE_OFFSET:06X}, "
@@ -940,12 +1278,13 @@ def parse_image(img: bytes) -> dict:
     ssec_base = mi[6] | (mi[7] << 8) | (mi[8] << 16)
     sph_base = mi[22] | (mi[23] << 8) | (mi[24] << 16)
     mus_base = mi[25] | (mi[26] << 8) | (mi[27] << 16)
+    tex_base = mi[28] | (mi[29] << 8) | (mi[30] << 16)
     root, sx, sy, sa, spawn_ssec, spawn_sec, numsegs, mapid = \
         struct.unpack_from("<HhhBHBHB", mi, 9)
 
     info = dict(numnodes=numnodes, numssec=numssec, numsec=numsec,
                 shift=shift, ssec_base=ssec_base, sph_base=sph_base,
-                mus_base=mus_base, root=root,
+                mus_base=mus_base, tex_base=tex_base, root=root,
                 spawn=(sx, sy, sa), spawn_ssec=spawn_ssec,
                 spawn_sec=spawn_sec, numsegs=numsegs, mapid=mapid)
 
@@ -978,7 +1317,7 @@ def parse_image(img: bytes) -> dict:
                 "<hhhhBB", img, base + SSEC_HDR + k * SEG_RECORD)
             group.append(Seg(x0, y0, x1, y1, secid,
                              None if back == NO_BACK_SECTOR else back,
-                             ramp >> 4))
+                             ramp >> 4, ramp & 0x0F))
         subs.append(group)
         ssec_sector.append(secid)
 
@@ -1052,6 +1391,46 @@ def validate(m: MapData, img: bytes) -> list[str]:
         check(info["mus_base"] == 0,
               "MAPINFO points at a music block the image does not contain")
 
+    # 11. the wall texture tiles (IMPLEMENTATION_PLAN.md §10.5).
+    #
+    # Texturing removes the oracle every M1 optimisation was held to -- "0 of
+    # 104448 pixels differ" cannot survive a change that is meant to change
+    # every wall pixel. These four checks are what replaces it on the build
+    # side: they catch a tile that is missing, a tile that would clip against
+    # the intensity range at either end of the depth ramp, a family that no
+    # tile backs, and the specific silent failure of a wall that is textured
+    # with nothing.
+    if BLK_WALLTEX in p["blocks"]:
+        tex = p["blocks"][BLK_WALLTEX]
+        check(tex["flags"] & BF_RESIDENT == 0, "WALLTEX must not be resident")
+        check(tex["length"] == TEX_BLOCK_BYTES,
+              f"WALLTEX is {tex['length']} B, expected {TEX_BLOCK_BYTES}")
+        check(info["tex_base"] == tex["ofs"],
+              "MAPINFO's texture base does not point at the WALLTEX block")
+        for fam in range(TEX_FAMILIES):
+            tile = tex["data"][fam * TEX_TILE_BYTES:(fam + 1) * TEX_TILE_BYTES]
+            nib = [n for b in tile for n in (b >> 4, b & 0x0F)]
+            lo, hi = min(nib), max(nib)
+            # The engine computes clamp(depth + texel - TEX_MID, 2, 15) with
+            # depth in 2..15. Clipping is not a crash, it is a wall that goes
+            # flat at one end of its depth range, so it is checked at both.
+            check(hi - TEX_MID <= 15 - TEX_MID and TEX_MID - lo <= TEX_MID - 2,
+                  f"texture family {fam} swings {lo}..{hi} around {TEX_MID}, "
+                  "which clips the intensity nibble at one end of the depth ramp")
+            if fam != TEX_PLAIN:
+                check(lo != hi,
+                      f"texture family {fam} ({FAMILY_TEXTURE[fam]}) is a "
+                      "uniform tile -- every seg using it renders untextured")
+        # Every family a seg names must have a tile, and the tile block has
+        # exactly TEX_FAMILIES of them, so this is a range check on the segs.
+        for i, group in enumerate(p["subsectors"]):
+            for k, s in enumerate(group):
+                check(0 <= s.tex < TEX_FAMILIES,
+                      f"subsector {i} seg {k}: texture family {s.tex} has no tile")
+    else:
+        check(info["tex_base"] == 0,
+              "MAPINFO points at a texture block the image does not contain")
+
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
         for name, child in (("right", nd.right), ("left", nd.left)):
@@ -1088,6 +1467,8 @@ def validate(m: MapData, img: bytes) -> list[str]:
                 bad.append(f"subsector {i} seg {k}: back sector changed")
             if a.ramp != b.ramp:
                 bad.append(f"subsector {i} seg {k}: ramp changed")
+            if a.tex != b.tex:
+                bad.append(f"subsector {i} seg {k}: texture family changed")
     for i, (a, b) in enumerate(zip(m.sectors, p["sectors"])):
         if (a.floor, a.ceil, a.fbyte, a.cbyte) != (b.floor, b.ceil, b.fbyte, b.cbyte):
             bad.append(f"sector {i}: round-trip mismatch")
@@ -1239,7 +1620,8 @@ def report(m: MapData, img: bytes) -> None:
           f"  mean {sum(r for _, _, r in sph) / max(1, len(sph)):.0f}")
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
-                      (BLK_NODESPH, "NODESPH"), (BLK_MUSIC, "MUSIC")):
+                      (BLK_NODESPH, "NODESPH"), (BLK_WALLTEX, "WALLTEX"),
+                      (BLK_MUSIC, "MUSIC")):
         if bid not in p["blocks"]:
             continue
         b = p["blocks"][bid]
@@ -1255,10 +1637,26 @@ def report(m: MapData, img: bytes) -> None:
               f"{ticks / rate % 60:04.1f}, {h[3]} B DMA window")
     else:
         print("  music          none -- the engine will render in silence")
+    if BLK_WALLTEX in p["blocks"]:
+        data = p["blocks"][BLK_WALLTEX]["data"]
+        segs_per_fam = Counter(s.tex for g in p["subsectors"] for s in g)
+        print("  wall textures  " + "  ".join(
+            f"{FAMILY_TEXTURE[f] or 'plain'}:{segs_per_fam.get(f, 0)}"
+            for f in range(TEX_FAMILIES) if segs_per_fam.get(f)))
+        swing = []
+        for f in range(TEX_FAMILIES):
+            nib = [n for b in data[f * TEX_TILE_BYTES:(f + 1) * TEX_TILE_BYTES]
+                   for n in (b >> 4, b & 0x0F)]
+            swing.append(max(nib) - min(nib))
+        print(f"  tile contrast  min {min(swing)} max {max(swing)} "
+              f"(swing around {TEX_MID}, cap {2 * TEX_SWING})")
     if m.ramp_misses:
         print("  UNMAPPED textures (fell back to "
               f"{RAMP_NAMES[DEFAULT_RAMP]}): "
               + ", ".join(f"{k}x{v}" for k, v in m.ramp_misses.most_common()))
+    if m.tex_misses:
+        print("  UNMAPPED texture families (fell back to plain): "
+              + ", ".join(f"{k}x{v}" for k, v in m.tex_misses.most_common()))
 
 
 def main(argv=None) -> int:
@@ -1280,12 +1678,15 @@ def main(argv=None) -> int:
     try:
         if a.map.upper() == "TEST":
             m = build_test_map()
+            walltex = build_walltex(None)
         else:
             if not a.wad:
                 ap.error("a WAD path is required unless --map TEST")
-            m = load_wad_map(Wad(a.wad), a.map.upper())
+            wad = Wad(a.wad)
+            m = load_wad_map(wad, a.map.upper())
+            walltex = build_walltex(wad)
         music = load_music(a.music) if a.music else b""
-        img = build_image(m, music)
+        img = build_image(m, music, walltex)
     except (ValueError, OSError) as e:
         print(f"wad2reu: {e}", file=sys.stderr)
         return 2
