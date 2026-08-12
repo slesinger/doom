@@ -293,6 +293,23 @@ texSetup:
         inc zTexOn
 !off:   rts
 
+//------------------------------------------------------------
+// wallSpan — what doWall calls instead of spanFill for the three spans that
+// are wall rather than floor or ceiling.
+//
+// It lived at $83e8, in the gap behind SCREEN0's video matrix, until the walk
+// bob needed a hole twenty-three bytes wide and that gap was the only one left
+// (BOBCODE, defs.asm). Thirteen bytes into COLBUF's tail, next to the vSeed
+// it calls, is a pure address change and costs nothing: every block here is
+// entered by jsr or jmp, and both are absolute wherever the block lands.
+//------------------------------------------------------------
+wallSpan:
+        lda zTexOn
+        beq !flat+
+        jsr vSeed
+        jmp spanTex
+!flat:  jmp spanFill
+
 .errorif * > TX_SEED_END, "tex: v seed block overflows COLBUF's tail"
 }
 txSeedEnd:
@@ -507,21 +524,6 @@ texPix:
         rts
 
 .errorif * > TX_PIX_END, "tex: texel unpack overflows into BITMAP0"
-
-//------------------------------------------------------------
-.pc = TX_WSPAN "tex: wall span"
-//------------------------------------------------------------
-// wallSpan — what doWall calls instead of spanFill for the three spans that
-// are wall rather than floor or ceiling.
-//------------------------------------------------------------
-wallSpan:
-        lda zTexOn
-        beq !flat+
-        jsr vSeed
-        jmp spanTex
-!flat:  jmp spanFill
-
-.errorif * > TX_WSPAN_END, "tex: wall span overflows into the converter tables"
 
 //------------------------------------------------------------
 .pc = TX_COL "tex: strip unpack"

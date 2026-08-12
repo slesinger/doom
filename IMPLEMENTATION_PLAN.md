@@ -909,6 +909,50 @@ caught rather than played around.
 `make jumptest` judges it against the table in the source rather than against
 a picture: the eye must walk the arc, clear the ceiling, and land.
 
+## 11b. The walk bob *(added 2026-08-12, out of sequence)*
+
+Doom's up-and-down while walking, for the same reason the jump was built: it
+moves the world when the player does not turn. **23 bytes, no zero page, no
+table.**
+
+**The wave is computed, not looked up.** `bobStep` takes the low three bits of
+`frameCnt`, reflects them at 4 and doubles: `0 2 4 6 6 4 2 0`, one entry per
+frame — a triangle, which at four samples up and four down is the same picture
+as a sine. Eight table bytes plus the load would have cost 17 against the
+arithmetic's 12, and 23 is exactly what the hole holds. Eight frames is 0.48 s
+against Doom's 20-tic 0.57 s, and `BOBPEAK` is 6 units against Doom's ±8.
+
+**Upward only, because `camJZ` is unsigned**: `setEyeZ`'s first add is what
+carries into the sector floor, and a signed offset would need a sign-extended
+16-bit add in a block that ends against `$d000` with nothing spare.
+
+**The phase is `frameCnt`, not frames-spent-walking**, which would have cost a
+zero-page byte and two instructions there was no room for. The bob therefore
+picks the wave up wherever it is instead of starting from zero — invisible at
+0.48 s. It runs off `IN_MOVE` (the four translation bits), so turning on the
+spot leaves the eye still, and it bobs when walking into a wall, as Doom's
+does, because Doom bobs on the command and not on the displacement.
+
+**Where the 23 bytes came from.** `$83e8`, the 24-byte gap behind SCREEN0's
+video matrix, was the last hole in the machine wide enough — the largest run
+left below `$d000` after it is 20 bytes. `wallSpan` had it (`TX_WSPAN`, 13
+bytes in 24) and moved into `TX_SEED`'s tail in COLBUF, which is a pure
+address change: every texture block is entered by `jsr` or `jmp`.
+
+**It cost one real bug, found by its own test.** The bob test walks and reads
+`zInput` back, and `zInput` was `$8f` — which is also `zNum+1`, and `checkMove`
+writes `zNum` twice per seg per attempt. So walking overwrote the input byte
+with the high byte of a cross product *before* `playerFrame` and `lineFrame`
+read it: `IN_USE` landing in there at random is why walking around fired jumps
+and opened doors nobody had asked for. `zInput` is `$90` now, which `msLast`
+stopped using when the pacing moved to `msFrame`. The lesson is §11a's again in
+another key — a `.const` proves nothing about ownership, and only a test that
+reads the byte back while the engine is running can tell you who else has it.
+
+`make bobtest` judges the eye against the wave from `defs.asm`'s `BOBPEAK`
+rather than against the machine: it must trace the triangle unbroken while W
+is down, and be perfectly still while standing or only turning.
+
 ## 12. Phase 10 — Sprites
 
 The hardest phase, and the one whose scope must stay narrow: **things are drawn,

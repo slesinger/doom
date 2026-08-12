@@ -96,9 +96,9 @@ src/main.asm              VIC setup, spawn, main loop, HUD blanking
 src/defs.asm              memory map + zero-page allocation (all .const live here)
 src/math.asm              mul8 (quarter-square), umul16, smulTrig, ssmul32,
                           udiv, sdiv, spanFill
-src/input.asm             WASD + QE strafe + SPACE jump + joystick 2, subsector
-                          containment and step/headroom collision against the
-                          segs
+src/input.asm             WASD + QE strafe + SPACE jump + walk bob + joystick 2,
+                          subsector containment and step/headroom collision
+                          against the segs
 src/reu.asm               REU DMA primitives + boot-time presence probe
 src/mapload.asm           boot-time load of the resident map blocks from the REU
 src/reuload.asm           standalone PRG: host-driven REU image upload
@@ -125,7 +125,8 @@ tools/setup-dev-env.sh    VICE + C64 ROM setup
 ```
 
 **Controls:** `W`/`S` walk, `A`/`D` turn, `Q`/`E` strafe, `SPACE` jump (and
-open a door); joystick 2 walks and turns, and fire is `SPACE`.
+open a door); joystick 2 walks and turns, and fire is `SPACE`. Walking bobs the
+eye, as Doom's does.
 
 The frame loop is [`main.asm:124`](src/main.asm#L124):
 

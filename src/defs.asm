@@ -572,6 +572,29 @@
 .const JUMPPEAK = 28                // the highest entry below; see the sum above
 .const JUMPFRAMES = 7               // table entries before the $ff
 
+// The walk bob (src/input.asm), Doom's own up-and-down while moving.
+//
+// Doom bobs the eye by +-8 units around the standing height on a 20-tic
+// period; here it is 0..BOBPEAK on an eight-frame one, which is 0.48 s at
+// 16.71 fps against Doom's 0.57 s. Upward only because camJZ is unsigned and
+// setEyeZ's first add is what carries into the floor height -- a negative
+// camJZ would need a sign-extended 16-bit add there, and that block ends
+// against $d000 with nothing to spare.
+//
+// The shape is a triangle computed from frameCnt rather than a table read:
+// eight table bytes plus the load cost 17, the arithmetic costs 12, and 23 is
+// exactly what the hole this went into holds (BOBCODE, below). A triangle and
+// a sine are the same picture at four samples up and four down.
+//
+// The phase is frameCnt, not a counter of frames spent walking, which is a
+// byte of zero page and two instructions this had no room for. What that
+// costs is a bob that does not restart from zero when you start walking: it
+// picks the wave up wherever it is, and at 0.48 s nobody can see the
+// difference.
+.const BOBPEAK  = 6                 // eye units at the top of the wave
+.const BOBCODE  = $83e8             // 24 B, the gap behind SCREEN0's matrix
+.const BOBCODE_END = $8400          // TABLES: the converter's own tables
+
 //------------------------------------------------------------
 // Ultimate 64 / C64 Ultimate turbo control
 //
@@ -716,8 +739,7 @@
 .const zBW     = $8b
 .const zBT     = $8c
 .const zBB     = $8d
-.const zNum    = $8e
-.const zInput  = $8f
+.const zNum    = $8e        // 16 bit: $8e-$8f -- see zInput
 
 //------------------------------------------------------------
 // zero page — frame pacing and the bounding-sphere test ($90-$95)
@@ -725,8 +747,19 @@
 // $90 upwards was untouched: the engine allocated $02-$8f and never calls the
 // KERNAL, so everything above it has been free RAM since boot.
 //------------------------------------------------------------
-.const msLast  = $90        // free: was the pacer's reference until the
-                            // pacing moved to msFrame (see clock.asm)
+// zInput was $8f until the walk bob's test caught what that address really
+// is: the high byte of zNum, which checkMove writes twice per seg per attempt
+// (src/input.asm), and the near-plane clip once per clipped seg. So walking
+// rewrote the input byte with a cross product's high byte, every frame,
+// *before*
+// playerFrame and lineFrame read it -- IN_USE landing in it at random is why
+// walking around fired jumps and opened doors nobody had asked for.
+//
+// $90-$91 was msLast, the pacer's old reference, and nothing has read it
+// since the pacing moved to msFrame (clock.asm). zInput takes the first byte
+// -- it is one byte -- and $91 is free. Anything that reads the input on the
+// host reads this constant (tools/vicedbg), so the move costs nothing there.
+.const zInput  = $90
 .const msNow   = $92        // scratch for a torn-read-safe timer read
 .const msFrame = $96        // ... at the last completed flip (see ftInt below)
 
@@ -938,7 +971,7 @@
 // handler is copied up to MUSCODE. They are marked (boot) below.
 //
 //   TX_UENDS  $bf40-$bfff  192  182  texUEnds, texMulT, spanTex
-//   TX_SEED   $0770-$07ff  144  124  vSeed, texSetup            (boot)
+//   TX_SEED   $0770-$07ff  144  137  vSeed, texSetup, wallSpan  (boot)
 //   TX_FETCH  $03a0-$03ff   96   81  texFetch                   (boot)
 //   TX_VSET   $02b0-$02ff   80   69  texVSet                    (boot)
 //   TX_SHADE  $0cb3-$0cf2   64   64  wallShade
@@ -946,16 +979,20 @@
 //   TX_PIX    $9fe1-$9fff   31   26  texPix
 //   TX_COL    $cdda-$ce07   46   27  texCol
 //   TX_UPD    $0de8-$0dff   24   22  texUpd
-//   TX_WSPAN  $83e8-$83ff   24   13  wallSpan
 //   TX_CLIP   $0cf3-$0cff   13   12  texClip0/texClip1
 //
-// Two of those moved for the jump (JUMPCODE, above), and both moves are
-// pure address changes -- every block here is entered by jsr:
+// Three of those moved, and every move is a pure address change -- each block
+// here is entered by jsr or jmp. Two went for the jump (JUMPCODE, above):
 //
 //   TX_CLIP left $0eef for TX_SHADE's own slack, which handed the tail of the
 //   $0e00 page to playerFrame. It is exact now: 12 bytes in 13.
 //   TX_UADV moved up two bytes into the four it was leaving unused below
 //   $d000, which is what setEyeZ spent on adding camJZ to the eye.
+//
+// and the third went for the walk bob: TX_WSPAN was $83e8-$83ff, 13 bytes of
+// wallSpan in 24, and it is the last hole in the machine wide enough for
+// bobStep. wallSpan moved into TX_SEED's tail -- 137 bytes in 144 now -- and
+// $83e8 is BOBCODE (below).
 //
 // Two more need saying out loud:
 //
@@ -963,11 +1000,12 @@
 // bytes, not 8192) and SCREEN1. It is RAM in both banking states the engine
 // uses and the VIC never fetches it, and it was simply unclaimed.
 //
-// $83e8 is the same gap at SCREEN0: the video matrix is 1000 bytes and ends
-// at $83e7. The VIC does read $83f8-$83ff as sprite pointers even with every
-// sprite disabled -- but it only reads them, and the engine has no sprites, so
-// what those eight bytes contain is nobody's business. The same 24 bytes exist
-// at $c3e8 behind SCREEN1 and are still free.
+// $83e8 is the same gap at SCREEN0 -- the video matrix is 1000 bytes and ends
+// at $83e7 -- and it is BOBCODE now rather than a texture block. The VIC does
+// read $83f8-$83ff as sprite pointers even with every sprite disabled, but it
+// only reads them, and the engine has no sprites, so what those eight bytes
+// contain is nobody's business. The same 24 bytes behind SCREEN1 at $c3e8 are
+// LINETRAMP (above); the pair is spent.
 //
 // texCol is the odd one out: it is in doWall's own tail, which only exists
 // because wallShade moved out to TX_SHADE. The 28-byte hole at $98e4 would
@@ -988,7 +1026,6 @@
 .const TX_PIX    = $9fe1
 .const TX_COL    = $cdda
 .const TX_UPD    = $0de8
-.const TX_WSPAN  = $83e8
 .const TX_CLIP   = $0cf3
 
 .const TX_UENDS_END = $c000
@@ -1000,7 +1037,6 @@
 .const TX_PIX_END   = $a000
 .const TX_COL_END   = $ce08
 .const TX_UPD_END   = $0e00
-.const TX_WSPAN_END = $8400
 .const TX_CLIP_END  = $0d00         // UDIV8
 
 // The fourth boot-only block: the .pseudopc images of TX_SEED, TX_FETCH and

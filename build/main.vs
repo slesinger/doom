@@ -18,7 +18,7 @@ al C:dbde .lnGetH
 al C:c30 .sphereVisible
 al C:9cf6 .spanCells
 al C:97fe .sideBack
-al C:57a4 .txFetchSrc
+al C:57b1 .txFetchSrc
 al C:52c2 .mapCopyTail
 al C:cd56 .colAdvance
 al C:ff40 .musIrq
@@ -34,7 +34,7 @@ al C:52f6 .mapMaxLenHi
 al C:ce80 .bspPop
 al C:9b7b .m8b
 al C:9b72 .m8a
-al C:57f5 .txVSetSrc
+al C:5802 .txVSetSrc
 al C:9b08 .flip
 al C:de75 .lnDone
 al C:cdda .texCol
@@ -77,7 +77,7 @@ al C:ca00 .rowCellLo
 al C:9b60 .mul8
 al C:9500 .colTab
 al C:ce95 .bspDone
-al C:57a4 .txSeedEnd
+al C:57b1 .txSeedEnd
 al C:52f2 .mapMaxLenLo
 al C:cb3 .wallShade
 al C:52d9 .mapCopyDone
@@ -113,11 +113,12 @@ al C:52ee .mapLoadHi
 al C:ce4d .bspLoop
 al C:541e .miFail
 al C:ffd8 .miExit
-al C:57f5 .txFetchEnd
+al C:83e8 .bobStep
+al C:5802 .txFetchEnd
 al C:acc .moveOK
 al C:5c00 .jmpStepSrc
 al C:5237 .mapFail
-al C:583a .txVSetEnd
+al C:5847 .txVSetEnd
 al C:9cd .checkMove
 al C:80b .upstartEnd
 al C:96a0 .xOfsHi
@@ -137,7 +138,7 @@ al C:5509 .reuProbe
 al C:de90 .lnFree
 al C:5a26 .lnStepEnd
 al C:9d41 .spanDone
-al C:83e8 .wallSpan
+al C:7ec .wallSpan
 al C:99e6 .scrSta
 al C:9cd2 .spanFill
 al C:c600 .sqrHi

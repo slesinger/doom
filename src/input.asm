@@ -777,7 +777,7 @@ playerFrame:
         beq !noJump+                // two tests fold into one branch -- which
         jmp jumpStep                // is what makes this block exactly 17 B
 !noJump:
-        jmp setEyeZ
+        jmp bobStep                 // on foot: the walk bob sets the eye
 
 .errorif * > JUMPCODE_END, "the jump's frame hook overflows into the BSP stack"
 
@@ -834,5 +834,46 @@ jmpStepEnd:
 jumpTab:
         .byte 12, 22, 28, 28, 22, 12, 4, $ff
 .errorif * > JUMPTAB_END, "the jump arc overflows into the collision helpers"
+
+//------------------------------------------------------------
+.pc = BOBCODE "the walk bob"
+//------------------------------------------------------------
+// bobStep — the eye rises and falls while the player is moving, as Doom's
+// does. playerFrame's on-foot path, so it ends in setEyeZ on its behalf.
+//
+// The wave is a triangle over the low three bits of frameCnt, reflected at 4
+// and doubled: 0 2 4 6 6 4 2 0, one entry per frame, BOBPEAK at the top. It
+// is computed rather than looked up because 23 bytes is what the hole holds
+// (BOBCODE, defs.asm).
+//
+// The test is IN_MOVE and not "did the player actually move", which is what
+// walking into a wall makes of it: the bob carries on against a wall, exactly
+// as Doom's does, because Doom bobs on the *command* too.
+//
+// Turning is not movement -- IN_MOVE is the four translation bits -- so
+// standing and looking around leaves the eye still, and the standing path
+// costs three instructions to reach `sta camJZ` with A already zero.
+//
+// One thing it shares with the jump, and the reason the peak is 6 rather than
+// Doom's 8: camJZ raises the eye, and stepOK measures a step as the drop
+// below the eye, so a bobbing player climbs onto a ledge up to BOBPEAK units
+// taller than MAXSTEP on the frames near the top of the wave. Six units of
+// leniency against a 24-unit step is under the width of one texel; the jump
+// already grants 28 deliberately.
+//------------------------------------------------------------
+bobStep:
+        lda zInput
+        and #IN_MOVE                // standing still: A = 0, and the eye is
+        beq !zero+                  // the sector's floor plus EYE exactly
+        lda frameCnt                // the phase. It is free: mainLoop counts
+        and #7                      // frames anyway, and eight of them at
+        cmp #4                      // 16.71 fps is very nearly Doom's own
+        bcc !+                      // 20-tic bob period
+        eor #7                      // reflect 4-7 back down to 3-0
+!:      asl                         // 0-3 -> 0-BOBPEAK, in eye units
+!zero:  sta camJZ
+        jmp setEyeZ
+
+.errorif * > BOBCODE_END, "the walk bob overflows into the converter tables"
 
 .pc = mainSegPC "main code (cont)"
