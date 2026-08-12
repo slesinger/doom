@@ -9,6 +9,7 @@
 #   make walktest   drive the player along a wall and into a corner, and
 #                   judge the path against E1M1's own linedefs
 #   make doortest   open a door, hold it, close it -- judged against SECTAB
+#   make jumptest   jump, and judge the eye against the arc table
 #   make stats      emulated ms/frame + renderer workload counters
 #   make profile    per-frame call counts for the hot routines
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
@@ -82,7 +83,7 @@ REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats profile framehash walktest doortest assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile framehash walktest doortest jumptest assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest music setup clean \
         intro run-intro shot-intro run-intro-u64 intro-config
 
@@ -376,6 +377,19 @@ doortest: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/doortest.py $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# The jump acceptance test. It judges camZ against the arc table in
+# src/input.asm rather than against a picture: the eye rising is the whole
+# feature, and one zero-page byte is all of its state.
+jumptest: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/jumptest.py $(MONPORT); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

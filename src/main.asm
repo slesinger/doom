@@ -54,7 +54,7 @@ main:
         jmp bootMain
 mainLoop:
         jsr readInput
-        jsr movePlayer
+        jsr playerFrame             // walk, jump, and set the eye -- input.asm
         jsr lineFrame               // doors and moving sectors -- lines.asm
         jsr renderFrame             // 3D -> MATRIX
         jsr convert                 // MATRIX -> back buffer
@@ -140,6 +140,9 @@ bootMain:
         sta camA
         lda miSpawnSec
         sta camSec
+        lda #0                      // on the floor, and not mid-jump: zero
+        sta camJZ                   // page 0 is whatever the loader left
+        sta camJT                   // (src/input.asm)
         jsr setEyeZ
         // The engine's own descent must agree with the one wad2reu.py did
         // offline. It is checked rather than trusted because a sign flip in

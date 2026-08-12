@@ -726,5 +726,113 @@ padClass:
 !zero:  lda #0
         rts
 
-.errorif * > bspStkLo, "collision helpers overflow into the BSP stack"
+.errorif * > JUMPCODE, "collision helpers overflow into the jump"
+
+//------------------------------------------------------------
+//  Jumping — SPACE, the same key that opens a door.
+//
+//  What the player gets is 0.42 s off the floor and a peak of JUMPPEAK
+//  world units, which is two thirds of eye height: enough that the room
+//  visibly moves in a direction the walls cannot, which is the point.
+//
+//  The arc is a table (jumpTab, below) rather than a velocity and a gravity.
+//  Doom integrates, and integrating here would cost an add, a subtract, a
+//  sign test and a second zero-page byte for the velocity -- and would put
+//  the peak at the mercy of rounding, which is exactly the number that must
+//  not drift: nothing in the renderer or the collision test stops the eye
+//  rising through a ceiling, so the peak is what keeps it below one.
+//
+//  camJZ is fed to setEyeZ (src/render/bsp.asm) and to nothing else. Two
+//  things fall out of that, and both are wanted:
+//
+//    - the eye follows the floor while airborne, so jumping on a lift or in
+//      a doorway does what it looks like it should;
+//    - stepOK measures a step as `zBackF + EYE`, which is the step *below the
+//      eye*. With the eye camJZ higher, a ledge is camJZ shorter, so a jump
+//      climbs onto anything within MAXSTEP + camJZ. Ledge-jumping is free,
+//      and it is the reason the feature is worth its 43 bytes.
+//
+//  Holding SPACE re-jumps on landing, because the take-off test is a level
+//  and not an edge. That is bunny-hopping, it costs nothing, and the door
+//  key it shares is edge-triggered on its own side (zLnUse, src/lines.asm),
+//  so a held SPACE still opens a door exactly once.
+//------------------------------------------------------------
+.pc = JUMPCODE "jump: the frame hook"
+
+//------------------------------------------------------------
+// playerFrame — mainLoop's movement call. Walk, then step the arc, then set
+// the eye. It replaces `jsr movePlayer` at the call site rather than being
+// called after it because the main segment has one byte free and this way
+// costs none of it.
+//
+// movePlayer ends in setEyeZ itself, on the path where the move succeeded;
+// that one runs with the *previous* frame's camJZ and is overwritten here a
+// few hundred cycles later. Leaving it is a byte cheaper than removing it.
+//------------------------------------------------------------
+playerFrame:
+        jsr movePlayer
+        lda zInput                  // SPACE, or an arc that has not landed:
+        and #IN_USE                 // either one is a frame of the jump. The
+        ora camJT                   // arc owns the key until it ends, so the
+        beq !noJump+                // two tests fold into one branch -- which
+        jmp jumpStep                // is what makes this block exactly 17 B
+!noJump:
+        jmp setEyeZ
+
+.errorif * > JUMPCODE_END, "the jump's frame hook overflows into the BSP stack"
+
+//------------------------------------------------------------
+.pc = JUMPBOOT "boot: jump arc relocator source"
+//------------------------------------------------------------
+// jumpStep — advance the arc by one frame.
+//
+// $ff ends it: the arc lands the player exactly, on the frame the table
+// says, rather than when a velocity happens to cross zero.
+//
+// It runs at $ffe4, in the 22 bytes between the music IRQ handler and the
+// CPU vectors, because below MATRIX there is no sixteen-byte hole left --
+// the one this used to occupy, $0f40, turned out to be frameCnt and the map
+// checksums, and boot overwrote the routine before the first frame. That
+// address is RAM in both banking states the engine uses, for the same reason
+// MUSCODE is (defs.asm), so nothing here has to touch $01.
+//
+// Like LINECODE* and MUSCODE it cannot be in the PRG image at all, so it is
+// assembled here in MATRIX with .pseudopc and copied up by lineBoot
+// (src/lines.asm) -- which is already called at boot and already sets the
+// banking this needs, so the copy costs no main-segment bytes.
+//------------------------------------------------------------
+jmpStepSrc:
+.pseudopc JUMPCODE2 {
+jumpStep:
+        ldx camJT                   // the cursor: 0 on the take-off frame, so
+        inx                         // the first entry read is jumpTab's first
+        lda jumpTab-1,x
+        bpl !+
+        ldx #0                      // the arc is over: both feet down again,
+        txa                         // and A = 0 is the height that means it
+!:      sta camJZ
+        stx camJT
+        jmp setEyeZ
+}
+jmpStepEnd:
+
+// The Src/End pair is named for probe.py's relocated-block check (`make
+// check`), which compares $ffe4 in live RAM against this image in the PRG
+// file. That check is exactly what the $0f40 version of this block did not
+// have, and it is why the bug survived a green build.
+.errorif JUMPCODE2 + jmpStepEnd - jmpStepSrc > JUMPCODE2_END, "the jump arc overflows into the CPU vectors"
+.errorif * > JUMPBOOT + $40, "the jump relocator source overflows its slack in MATRIX"
+
+//------------------------------------------------------------
+.pc = JUMPTAB "jump: the arc"
+//------------------------------------------------------------
+// Eye height above the sector floor, one entry per frame, $ff-terminated.
+// Symmetric, because a Doom jump is: the shape is a parabola sampled at
+// 16.7 fps, flattened at the top by one frame so the peak reads as a peak
+// at this frame rate rather than as a single-frame spike.
+//------------------------------------------------------------
+jumpTab:
+        .byte 12, 22, 28, 28, 22, 12, 4, $ff
+.errorif * > JUMPTAB_END, "the jump arc overflows into the collision helpers"
+
 .pc = mainSegPC "main code (cont)"

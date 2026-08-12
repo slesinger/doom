@@ -134,6 +134,12 @@ lineBoot:
         inx
         cpx #lnActEnd-lnActSrc
         bne !-
+        ldx #0                      // jumpStep, up at $ffe4 -- src/input.asm.
+!:      lda jmpStepSrc,x            // Nothing to do with doors; it is here
+        sta JUMPCODE2,x             // because this routine is already called
+        inx                         // at boot with the banking it needs, and
+        cpx #jmpStepEnd-jmpStepSrc  // a `jsr` of its own would cost three
+        bne !-                      // bytes the main segment does not have
         lda #BANK_IO
         sta $01
         rts

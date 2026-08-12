@@ -152,6 +152,9 @@ TEXBLOCKS = [("Seed", 0x0770), ("Fetch", 0x03A0), ("VSet", 0x02B0)]
 # `.const LINECODE/LINECODE2/LINECODE3`, and the labels lines.asm gives their
 # .pseudopc images. All three are under the I/O space.
 LINEBLOCKS = [("Think", 0xDBD0), ("Step", 0xDE40), ("Act", 0xDF00)]
+# `.const JUMPCODE2` -- jumpStep, above the music IRQ handler and below the
+# CPU vectors. Copied up by lineBoot; see the jump comment in src/input.asm.
+JUMPBLOCKS = [("Step", 0xFFE4)]
 LINESPEC = 0xDB40        # `.const LINESPEC` -- the special-line table
 MAXLINES = 16            # `.const MAXLINES`
 BLK_LINEDEFS = 7         # docs/reu-format.md §3
@@ -414,6 +417,10 @@ def check_linecode(m, prg_path):
     return check_reloc(m, prg_path, "LINECODE", "ln", LINEBLOCKS, "doors code")
 
 
+def check_jumpcode(m, prg_path):
+    return check_reloc(m, prg_path, "JUMPCODE", "jmp", JUMPBLOCKS, "jump code")
+
+
 def cmd_diff(m, prg_path, settle):
     load, img = load_prg(prg_path)
     m.exit_mon()
@@ -435,7 +442,8 @@ def cmd_diff(m, prg_path, settle):
         print(f"  {n:7d}  {name}")
 
     rc = (check_reu(m) | check_map(m) | check_music(m) | check_lines(m)
-          | check_texcode(m, prg_path) | check_linecode(m, prg_path))
+          | check_texcode(m, prg_path) | check_linecode(m, prg_path)
+          | check_jumpcode(m, prg_path))
 
     bad = [d for d in diffs if region(d[0]).startswith("***")]
     print(f"\nunexpected differences: {len(bad)}")

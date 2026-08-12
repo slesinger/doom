@@ -253,8 +253,40 @@
 .const NODESPHSZ = 6                // cx, cy, r -- the record's 2 pad bytes
                                     // exist only to make the stride a shift
 
-// Collision helpers, out of line from the main segment. $0e70-$0eff, 144 B.
+// Collision helpers, out of line from the main segment. $0e70-$0eee, 127 B:
+// the tail of the page belongs to the jump now (JUMPCODE, below).
 .const COLLCODE = $0e70
+
+// Jumping (src/input.asm), in three fragments, because thirty-odd contiguous
+// bytes no longer exist below MATRIX:
+//
+//   JUMPCODE   $0eef-$0eff  17 B  playerFrame: the mainLoop hook and the
+//                                 take-off test. Freed by moving the texture
+//                                 clip parameter out to TX_CLIP's new home in
+//                                 the wall-shading block's slack.
+//   JUMPCODE2  $ffe4-$fff9  22 B  jumpStep: one frame of the arc, in what is
+//                                 left of MUSCODE's block above the music IRQ
+//                                 handler and below the CPU vectors. Not in
+//                                 the PRG image: copied up by lineBoot.
+//   JUMPTAB    $0e68-$0e6f   8 B  the arc itself, JUMPFRAMES entries and an
+//                                 $ff. SSECHDR's tail hole.
+//   JUMPBOOT   $5c00         18 B jumpStep's .pseudopc image, boot-only.
+//
+// JUMPCODE2 was $0f40 first, on the reading that the gap between the BSP stack
+// and BFACECODE was free. It is not: $0f40-$0f50 is frameCnt, reuScratch and
+// the map checksums (below), so boot overwrote the routine and the jump
+// silently did nothing. $ffe4 costs the copy but is genuinely unowned, and is
+// RAM in both banking states, so jumpStep needs no `sei` and no $01.
+//
+// playerFrame is exactly 17 bytes and full; folding the two take-off tests
+// into one `ora camJT` is what pays for the `jmp` the far block now needs.
+.const JUMPCODE  = $0eef
+.const JUMPCODE_END = $0f00
+.const JUMPCODE2 = $ffe4            // above musCodeEnd
+.const JUMPCODE2_END = $fffa        // the NMI vector
+.const JUMPTAB   = $0e68
+.const JUMPTAB_END = $0e70          // COLLCODE
+.const JUMPBOOT  = MATRIX + $4c00   // $5c00, after BOOTCODE5's $5900-$5b12
 
 // segFacing, the world-space backface test, in the free RAM between the BSP
 // stack and MATRIX. $0f51-$0fc3.
@@ -285,7 +317,9 @@
 .const SPHEND    = $0e00            // MAPINFO: what the block above must clear
 .const SPHCODE3  = $0e20
 
-// $ff40-$fff9, 186 B, is free RAM and deliberately still unclaimed. BITMAP1
+// $ff40-$fff9, 186 B, is free RAM, and as of the jump it is fully spent: the
+// music IRQ handler has $ff40-$ffe3 and jumpStep has the remaining 22 bytes
+// (JUMPCODE2, above). BITMAP1
 // ends at $ff3f and nothing follows it; code can live there at all because both
 // banking states the engine uses ($34 and $35) have HIRAM = 0, so the KERNAL is
 // out and it is RAM in either window (src/irqtest.asm established that). The
@@ -303,7 +337,8 @@
 // boot segment, and musInit copies it up before the first frame. The PRG
 // still ends at $CFDA. See src/music.asm.
 .const MUSCODE     = $ff40          // the IRQ handler's run address
-.const MUSCODE_END = $fff9          // $fffa-$ffff are the vectors themselves
+.const MUSCODE_END = JUMPCODE2 - 1  // the jump has the tail now; $fffa-$ffff
+                                    // above that are the vectors themselves
 
 // The music player's RAM, in what was sphereVisible's block. 51 of the 60
 // bytes; nothing else in the engine wants a block this small.
@@ -520,6 +555,23 @@
 // second after sliding along the first, and one to commit what is left.
 .const SLIDETRY = 3
 
+// Jumping (SPACE, the same key that opens a door -- see IN_USE below).
+//
+// The arc is a *table*, not a velocity and a gravity: it costs one indexed
+// load a frame against an add, a subtract and a sign test, and the machine
+// had seventeen free bytes for the code and eight for the table, in two
+// different holes. It also makes the peak exact, which matters -- the eye may
+// not rise through a ceiling, and nothing here tests for one. EYE + JUMPPEAK
+// = 69 world units, which clears E1M1's lowest room and its door openings
+// (72) by three.
+//
+// Seven frames at 16.7 fps is 0.42 s in the air. The table is read from
+// index 1 (jumpTab-1,x in jumpStep), so there is no filler byte, and $ff
+// ends the arc rather than a length -- one compare either way, and a
+// terminator survives being retuned by hand.
+.const JUMPPEAK = 28                // the highest entry below; see the sum above
+.const JUMPFRAMES = 7               // table entries before the $ff
+
 //------------------------------------------------------------
 // Ultimate 64 / C64 Ultimate turbo control
 //
@@ -592,7 +644,8 @@
 .const IN_BACK   = %00000010        // S        / joy down
 .const IN_LEFT   = %00000100        // A        / joy left    -- turn left
 .const IN_RIGHT  = %00001000        // D        / joy right   -- turn right
-.const IN_USE    = %00010000        // SPACE    / joy fire     -- open a door
+.const IN_USE    = %00010000        // SPACE    / joy fire     -- open a door,
+                                    //                           and jump
 .const IN_SLEFT  = %01000000        // Q                      -- strafe left
 .const IN_SRIGHT = %10000000        // E                      -- strafe right
 .const IN_ROW7   = IN_SLEFT | IN_USE
@@ -734,6 +787,12 @@
 .const zTexAx  = $c0        // 0 = x, 2 = y: the endpoint texUEnds is correcting.
                             // In memory rather than in X for the same reason
                             // zSlAx is -- mul8 wants X for itself.
+
+// The jump's whole state, in the two bytes between the texture block and
+// TEXBUF. camJT is the arc's cursor and the "in the air" flag both: zero is
+// standing on the floor, and the take-off test is `bne` on it.
+.const camJZ   = $c2        // eye height above the sector floor, 0 on foot
+.const camJT   = $c3        // index into jumpTab, 1-based; 0 = not jumping
 
 // The wall texture working set, $c4-$eb. In zero page and not in colTop's
 // tail, which is where it was first put, for two reasons: `lda texStrip,x` in
@@ -882,15 +941,23 @@
 //   TX_SEED   $0770-$07ff  144  124  vSeed, texSetup            (boot)
 //   TX_FETCH  $03a0-$03ff   96   81  texFetch                   (boot)
 //   TX_VSET   $02b0-$02ff   80   69  texVSet                    (boot)
-//   TX_SHADE  $0cb3-$0cff   77   64  wallShade
-//   TX_UADV   $cfdb-$cfff   37   33  uAdvance
+//   TX_SHADE  $0cb3-$0cf2   64   64  wallShade
+//   TX_UADV   $cfdd-$cfff   35   33  uAdvance
 //   TX_PIX    $9fe1-$9fff   31   26  texPix
 //   TX_COL    $cdda-$ce07   46   27  texCol
 //   TX_UPD    $0de8-$0dff   24   22  texUpd
 //   TX_WSPAN  $83e8-$83ff   24   13  wallSpan
-//   TX_CLIP   $0eef-$0eff   17   12  texClip0/texClip1
+//   TX_CLIP   $0cf3-$0cff   13   12  texClip0/texClip1
 //
-// Two of those need saying out loud:
+// Two of those moved for the jump (JUMPCODE, above), and both moves are
+// pure address changes -- every block here is entered by jsr:
+//
+//   TX_CLIP left $0eef for TX_SHADE's own slack, which handed the tail of the
+//   $0e00 page to playerFrame. It is exact now: 12 bytes in 13.
+//   TX_UADV moved up two bytes into the four it was leaving unused below
+//   $d000, which is what setEyeZ spent on adding camJZ to the eye.
+//
+// Two more need saying out loud:
 //
 // $bf40 is the gap between BITMAP0's last byte ($bf3f -- a bitmap is 8000
 // bytes, not 8192) and SCREEN1. It is RAM in both banking states the engine
@@ -917,24 +984,24 @@
 .const TX_FETCH  = $03a0
 .const TX_VSET   = $02b0
 .const TX_SHADE  = $0cb3
-.const TX_UADV   = $cfdb
+.const TX_UADV   = $cfdd
 .const TX_PIX    = $9fe1
 .const TX_COL    = $cdda
 .const TX_UPD    = $0de8
 .const TX_WSPAN  = $83e8
-.const TX_CLIP   = $0eef
+.const TX_CLIP   = $0cf3
 
 .const TX_UENDS_END = $c000
 .const TX_SEED_END  = $0800
 .const TX_FETCH_END = $0400
 .const TX_VSET_END  = $0300
-.const TX_SHADE_END = $0d00
+.const TX_SHADE_END = TX_CLIP       // the clip parameter has the slack now
 .const TX_UADV_END  = $d000
 .const TX_PIX_END   = $a000
 .const TX_COL_END   = $ce08
 .const TX_UPD_END   = $0e00
 .const TX_WSPAN_END = $8400
-.const TX_CLIP_END  = $0f00
+.const TX_CLIP_END  = $0d00         // UDIV8
 
 // The fourth boot-only block: the .pseudopc images of TX_SEED, TX_FETCH and
 // TX_VSET, plus the three copy loops that put them where they run. Same

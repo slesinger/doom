@@ -859,6 +859,56 @@ Frame cost is **not yet measured** — the one `make u64-fps` reading taken
 (`compute 53.8 ms` against §10's 46.7) was collected while the machine was in
 use, so it says nothing. Re-run it idle.
 
+## 11a. Jumping *(added 2026-08-12, out of sequence)*
+
+Not in the M2 scope and built anyway, because it is the cheapest way left to
+make the world read as three-dimensional: everything else the engine does to
+sell depth — the walls, the shading, the textures — moves when the *player*
+turns, and nothing until now moved when the world stayed still. Forty-two
+bytes of code and two of zero page.
+
+**SPACE, the key that already opens doors.** `IN_USE` is a level here, not an
+edge (`lines.asm` keeps its own edge for the door), so holding it bunny-hops
+and a held key still opens a door exactly once.
+
+**The arc is a table, not physics.** `jumpTab` is seven bytes of eye height
+above the floor and an `$ff`; `jumpStep` walks it one entry a frame. A
+velocity and a gravity would have cost more code, a second zero-page byte, and
+— the reason it was not done — a peak at the mercy of rounding. Nothing in the
+renderer or the collision test stops the eye rising through a ceiling, so
+`EYE + JUMPPEAK = 69` against E1M1's lowest openings (72) is the whole safety
+argument, and it has to be exact.
+
+**`setEyeZ` is the only place that reads `camJZ`**, which buys two behaviours
+for no bytes: the eye follows a moving floor while airborne, and `stepOK`'s
+step test — `zBackF + EYE`, i.e. the step measured *below the eye* — sees a
+ledge as `camJZ` shorter, so a jump climbs anything within `MAXSTEP + camJZ`.
+Ledge-jumping was not implemented; it was already there once the eye moved.
+
+**Where the 43 bytes came from**, since §8.3's hunt had already spent the low
+RAM: the code is in three fragments (`JUMPCODE`, `JUMPCODE2`, `JUMPTAB` in
+`defs.asm`). `playerFrame` (17 B at `$0eef`) was paid for by moving `TX_CLIP`
+into `TX_SHADE`'s slack and nudging `TX_UADV` two bytes up into the four it was
+wasting below `$d000`; `jumpTab` fits `SSECHDR`'s tail hole; and `jumpStep`
+runs at `$ffe4`, in the 22 bytes between the music IRQ handler and the CPU
+vectors. `mainLoop` calls `playerFrame` in place of `movePlayer`, which is why
+the main segment's last free byte is still free.
+
+**`jumpStep` cost a lesson as well as 18 bytes.** It was first put at `$0f40`,
+read off the memory map as the gap between the BSP stack and `BFACECODE`. It is
+not a gap: `$0f40-$0f50` is `frameCnt`, `reuScratch` and the map checksums, so
+boot overwrote the routine and the jump silently did nothing on a build that
+was green — the `.errorif` guards only prove a block does not overlap the
+*next* block, never that the address is unowned. The fix is the relocation
+pattern `LINECODE*` and `MUSCODE` already use: assemble with `.pseudopc`, copy
+up in `lineBoot`, and let `probe.py`'s relocated-block check (`make check`)
+compare live RAM at `$ffe4` against the image every run. That check is what the
+`$0f40` version did not have, and it is the reason this class of bug is now
+caught rather than played around.
+
+`make jumptest` judges it against the table in the source rather than against
+a picture: the eye must walk the arc, clear the ceiling, and land.
+
 ## 12. Phase 10 — Sprites
 
 The hardest phase, and the one whose scope must stay narrow: **things are drawn,

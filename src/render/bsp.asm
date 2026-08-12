@@ -315,15 +315,21 @@ secBack:
         rts
 
 //------------------------------------------------------------
-// setEyeZ — eye height follows camSec's floor.
+// setEyeZ — eye height follows camSec's floor, plus the jump arc.
+//
+// camJZ is 0 for every frame the player is on the floor, so this is the M2
+// formula with two more bytes in it (src/input.asm). The first add cannot
+// carry -- EYE + JUMPPEAK is 69 -- so the sum reaches the floor's low byte
+// with the carry the 16-bit add needs.
 //------------------------------------------------------------
 setEyeZ:
         ldy camSec
         lda #BANK_RAM
         sta $01
-        lda mapSecFloorLo,y
+        lda camJZ
         clc
         adc #EYE
+        adc mapSecFloorLo,y
         sta camZ
         lda mapSecFloorHi,y
         adc #0
