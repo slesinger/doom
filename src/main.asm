@@ -17,8 +17,10 @@
 //    $0F00-$0F3F  BSP stack          $0F40-$0F50  frameCnt, reu/map status
 //    $0F51-$0FC3  seg backface test  $0FC4-$0FF7  music player state
 //    $1000-$7DFF  MATRIX (28160 B, 110 pages)  -- also stages MAPHDR at $5000,
-//                 the boot-only map loader at $5100 (BOOTCODE) and the music
-//                 boot code at $5300 (MUSBOOT)
+//                 the boot-only map loader at $5100 (BOOTCODE), the music
+//                 boot code at $5300 (MUSBOOT) and the rest of the boot-only
+//                 code -- the boot sequence itself, reuProbe, clearHudRows --
+//                 at $5500 (BOOTCODE3)
 //    $8000-$83FF  SCREEN0            (VIC bank 2)
 //    $8400-$973F  converter tables
 //    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
@@ -43,6 +45,47 @@
 
 .pc = $0810 "main code"
 main:
+        // The boot sequence itself is boot-only, so it is assembled into MATRIX
+        // with everything else that runs once (bootMain, below). All that is
+        // left at the load address is the jump into it -- and mainLoop, which
+        // is not boot-only and stays here.
+        jmp bootMain
+mainLoop:
+        jsr readInput
+        jsr movePlayer
+        jsr renderFrame             // 3D -> MATRIX
+        jsr convert                 // MATRIX -> back buffer
+        jsr framePace               // hold the rate at 25 fps -- clock.asm
+        jsr flip                    // show it
+        jsr frameMark               // close the frame: which raster frame did
+                                    // it land on, and what did it cost
+        inc frameCnt                // host-visible frame counter (defs.asm)
+        bne mainLoop
+        inc frameCnt+1
+        jmp mainLoop
+
+#import "input.asm"
+// SPHCODE is the first fixed allocation above the code, so it -- not MAPINFO
+// and not the BSP stack at $0f00 -- is what the main segment has to clear.
+// Deleting testmap.asm bought about 190 B of headroom here and the sphere
+// compares have now spent all but one byte of it, so the next thing that grows
+// in this segment fails the build. That is the intent: the two are competing
+// for the same block, and the assembler should say which one lost.
+//
+// M2 bought the headroom back the way §8.3 said to: reuProbe and clearHudRows
+// are boot-only and now assemble into MATRIX (BOOTCODE3, below), which is what
+// the sliding collision test above is spending.
+.errorif * > SPHCODE, "main code overflows into the sphere test"
+
+//------------------------------------------------------------
+// Boot-only code, assembled into MATRIX. Nothing here may be called after the
+// first frame: spanFill overwrites all of it. See BOOTCODE3 in defs.asm.
+//------------------------------------------------------------
+.pc = BOOTCODE3 "boot: reu probe + hud clear"
+
+#import "reu.asm"
+
+bootMain:
         sei
         // RAM at $a000 and $e000, I/O at $d000. This is the engine's default
         // banking state and the one every routine may assume; mapload.asm and
@@ -135,20 +178,6 @@ mapHalt:
         lda mapErr
         sta $d020
         jmp mapHalt
-mainLoop:
-        jsr readInput
-        jsr movePlayer
-        jsr renderFrame             // 3D -> MATRIX
-        jsr convert                 // MATRIX -> back buffer
-        jsr framePace               // hold the rate at 25 fps -- clock.asm
-        jsr flip                    // show it
-        jsr frameMark               // close the frame: which raster frame did
-                                    // it land on, and what did it cost
-        inc frameCnt                // host-visible frame counter (defs.asm)
-        bne mainLoop
-        inc frameCnt+1
-        jmp mainLoop
-
 //------------------------------------------------------------
 // turboOn — engage the C64 Ultimate's turbo mode.
 //
@@ -175,9 +204,15 @@ turboOn:
         sta TURBOREG
         rts
 
+
 //------------------------------------------------------------
 // The converter only writes cells 0-879 (rows 0-21); rows 22-24
 // are the HUD area. Blank them once in both buffers.
+//
+// COLBUF's own rows 22-24 ($0770-$07e7) are deliberately *not* cleared: flip
+// copies only the first 880 bytes of it to $d800, so nothing ever reads them
+// back (IMPLEMENTATION_PLAN.md §8.3's table says so, and this is the code that
+// made the claim true).
 //------------------------------------------------------------
 clearHudRows:
         lda #0
@@ -194,22 +229,13 @@ clearHudRows:
         bne !-
 !:      sta SCREEN0+880,x           // screen/color rows 22-24: 120 bytes
         sta SCREEN1+880,x
-        sta COLBUF+880,x
         sta $d800+880,x
         inx
         cpx #120
         bcc !-
         rts
 
-#import "input.asm"
-#import "reu.asm"
-// SPHCODE is the first fixed allocation above the code, so it -- not MAPINFO
-// and not the BSP stack at $0f00 -- is what the main segment has to clear.
-// Deleting testmap.asm bought about 190 B of headroom here and the sphere
-// compares have now spent all but one byte of it, so the next thing that grows
-// in this segment fails the build. That is the intent: the two are competing
-// for the same block, and the assembler should say which one lost.
-.errorif * > SPHCODE, "main code overflows into the sphere test"
+.errorif * > BOOTCODE3 + $200, "boot block 3 overflows its 512 bytes"
 
 // Imported after that assertion, not before it, because it does not belong to
 // the main segment any more: it assembles into MATRIX (BOOTCODE in defs.asm).

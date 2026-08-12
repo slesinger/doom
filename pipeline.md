@@ -2,13 +2,13 @@
 
 This document traces one complete frame, from the moment the player presses a
 movement key to the moment the resulting pixels are visible in VIC-II memory.
-It is the "how it actually works" companion to the four architecture documents:
+It is the "how it actually works" companion to the other documents:
 
 | Document | Answers |
 |---|---|
 | `design.md` | *Why* the engine is shaped this way (target architecture) |
 | `algorithm.md` | *What* the stages are, in abstract pseudo-code |
-| `data_structures.md` | *What the data looks like* (target formats) |
+| `docs/reu-format.md` | *What the data looks like* — the frozen formats the engine actually reads |
 | `3d-renderer-design.md` | *How the final raster stage works* (converter design) |
 | **`pipeline.md`** (this file) | **The end-to-end compute path, as built, with numbers** |
 | `IMPLEMENTATION_PLAN.md` | What is built, what is broken, what is next |
@@ -19,17 +19,24 @@ deliberately differs from the target architecture in the design documents, the
 difference is called out in a *Deviation* note. Sections marked **(planned)**
 describe stages that do not exist yet.
 
-> **Status caveat.** The test-map renderer runs to a visible frame and
-> `make check` is green — see [§13](#13-known-defects-and-unenforced-invariants)
-> for the defects that were fixed to get there and the invariants that are still
-> unenforced. What this document describes is the *portal* renderer; Milestone 1
-> replaces portal traversal with a BSP walk over real E1M1 geometry
-> (`IMPLEMENTATION_PLAN.md` §3), which changes §7 and §9.1 and leaves §8, §10
-> and §12 intact. The math here has been hand-traced and agrees with values
-> captured from the live machine (§11). The cycle counts in §12 are still
-> static instruction counts, but the frame rate no longer is: the test-map
-> build has now been measured on a real C64 Ultimate at **50.0 fps, PAL
-> vsync-locked** (§12.3), which puts frame compute under 20 ms at 64 MHz.
+> **Status caveat — read this before §5, §7, §11 or §12.1.** This document was
+> written against the *portal* renderer and the hand-built three-sector test
+> map. Milestone 1 replaced both with a BSP walk over real E1M1 geometry, and
+> four sections have not followed it: **§7 describes a traversal that no longer
+> exists**, §11 traces a frame through a map that was deleted, and §12.1's
+> budget is that map's. §5 was reconciled on 2026-08-12 along with §12.2 and
+> §12.3, which are current. **§8, §9 and §10 — per-wall geometry, the column
+> loop, the converter — the BSP change did not touch, and they remain the
+> reason to read this.** `IMPLEMENTATION_PLAN.md` §9.4 has the section-by-
+> section accounting.
+>
+> [§13](#13-known-defects-and-unenforced-invariants) lists the defects that were
+> fixed to get to a visible frame and the invariants that are still unenforced;
+> its zero-page appendix is also portal-era. The cycle counts in §12.1 are
+> static instruction counts, but the frame rate is measured: the engine now
+> runs on a real C64 Ultimate at **16.63 fps with compute at 37.6-38.6 ms
+> against a 59.85 ms deadline** (§12.3), every frame on the three-raster-frame
+> crossing.
 
 ---
 
@@ -400,19 +407,22 @@ speedup on the single hottest primitive in the engine.**
 
 ## 5. Stage 3 — Sector resolution and collision
 
-**Source:** `src/input.asm:155` (`checkSector`)
-**Output:** `camSec` (possibly a new sector), or `camX`/`camY` reverted
-**Cost:** ~1.3k cycles per wall tested; 6 walls in sector A = ~8k worst case
+**Source:** [`src/input.asm:247`](src/input.asm#L247) (`checkMove`) — M1 called
+this `checkSector` and tested the hand-built map's sectors; it now tests the
+segs of the subsector `bspFindSsec` descends to.
+**Output:** `camSec`/`camSsec` (possibly new), or `camX`/`camY` slid or reverted
+**Cost:** ~1.3k cycles per seg tested; E1M1 averages 3.09 segs per subsector
 
 This is where "scene resolution" begins: the engine must know **which sector
 the camera is in** before it can render, because the sector supplies the floor
-and ceiling planes, the shading bytes and the starting node for portal
-traversal.
+and ceiling planes and the shading bytes.
 
 ### 5.1 The convexity assumption
 
-Every sector is **convex**, with walls wound clockwise in standard math axes
-(x east, y north) so the interior lies to the **right** of each directed wall.
+Every subsector is **convex** — a BSP leaf is convex by construction, which is
+what the hand-built map had to assert about its sectors by hand — with its segs
+wound clockwise in standard math axes (x east, y north) so the interior lies to
+the **right** of each directed seg.
 For a convex polygon, "inside" is simply "on the interior side of every edge" —
 no ray casting, no winding number, no edge-crossing parity.
 
@@ -456,22 +466,27 @@ dead during movement).
 On the first wall where the point tests **outside**:
 
 ```
-        lda wBack,x
+        lda sgBack,x        ; wBack, in M1's hand-built map
         cmp #$ff
-        beq !blocked+       ; solid wall -> undo the whole move
-        sta camSec          ; portal    -> enter the neighbouring sector
+        beq !blocked+       ; one-sided seg -> undo the whole move
+        sta camSec          ; two-sided     -> enter the neighbouring sector
         ; and drop the eye to the new floor: camZ = secFloor[new] + EYE
 !blocked:
         ; restore camX/camY from oldX/oldY
 ```
 
-**Collision is undo-based, not slide-based.** Hitting a wall cancels the entire
-frame's motion, including the component parallel to the wall. This is the
-cheapest correct blocking model — no projection onto the wall normal, no
-re-test after sliding — and it is why `oldX`/`oldY` are saved before any
-displacement is applied. `algorithm.md` specifies `collision.slide_move`;
-sliding is a Milestone-2 item and needs the parallel component
-`v - n(v·n)/(n·n)`, which costs a dot product and a divide per blocked wall.
+**Collision was undo-based, not slide-based** — this describes M1. Hitting a
+wall cancelled the entire frame's motion, including the component parallel to
+the wall, which is the cheapest correct blocking model and is why `oldX`/`oldY`
+are saved before any displacement is applied.
+
+> **M2 (2026-08-12) made it slide-based**, which is what `algorithm.md`'s
+> `collision.slide_move` always specified. `checkMove` now projects the
+> remaining motion onto the *seg direction* — the same vector as
+> `v - n(v·n)/(n·n)`, one fewer sign to get wrong — and re-tests, up to three
+> times per frame. The cost is two divides and four multiplies per blocked
+> wall, on blocked frames only. See `src/input.asm` (`slideVec`),
+> `IMPLEMENTATION_PLAN.md` §9.2, and `make walktest`.
 
 **Optimization approach.** Convexity is doing enormous work here. It converts
 point-in-sector from an O(n) ray cast with parity bookkeeping into an O(n)
@@ -480,13 +495,20 @@ same assumption pays off again in §8 (no wall sorting) and §9 (a single
 top/bottom line pair per wall). It is the load-bearing constraint of the whole
 renderer, and it is enforced by the map format, not checked at runtime.
 
-> **Limitation.** After following a portal, `checkSector` returns immediately
-> without re-testing containment in the *new* sector. A single frame's motion
-> that crosses two boundaries (through a corner, or a corridor narrower than
-> `MOVE_SPEED`) will leave the camera outside its recorded sector. At
-> `MOVE_SPEED = 14` and a minimum corridor width of 256 units this cannot
-> happen in the test map, but it is not a general guarantee. The fix is to loop
-> `checkSector` until it reports no crossing, with an iteration cap.
+> **Limitation, still open.** After following a portal, the test returns
+> immediately without re-testing containment in the *new* subsector. A single
+> frame's motion that crosses two boundaries (through a corner, or a corridor
+> narrower than `MOVE_SPEED`) is only tested against the first.
+>
+> M2's slide loop does *not* close this, and the iteration cap it added is not
+> the fix it was expected to be: re-descending the BSP with the destination
+> point returns the subsector that **contains** that point, so every seg of it
+> then tests as inside and the extra iteration finds nothing. Only a blocked
+> destination is re-tested usefully. The real fix is to march the motion
+> subsector by subsector, testing the *segment* old→new against each one's
+> segs. At `MOVE_SPEED = 21` against E1M1's subsector sizes it has not been
+> observed, and `make walktest` intersects every frame-to-frame step with every
+> one-sided linedef in the map, which is what would catch it.
 
 ---
 
@@ -1288,15 +1310,17 @@ spans until the column is finally closed — `algorithm.md`'s
 ### 12.2 Memory map (authoritative — from `src/defs.asm`)
 
 ```
-$0002-$008F  zero page: math / renderer / converter / camera / span / accumulators
+$0002-$00A5  zero page: math / renderer / converter / camera / span /
+             accumulators / the sliding collision test ($98-$a5)
 $0100-$01FF  6510 stack
 $0200-$029F  colTop[160]      renderer clip window, first open row (owns the page)
 $02A0-$02AF  frame timer      ftInt/ftComp/ftCMin/ftCMax + the raster histogram
 $0300-$039F  colBot[160]      renderer clip window, first closed row (owns the page)
 $0400-$07E7  COLBUF           colour RAM staging (880 + 120 HUD bytes)
-$0810-$0C29  main + input + REU code
+$0810-$0C2D  mainLoop + input + movement + the sliding collision test
 $0C30-$0CB2  sphereVisible + sphereTest
 $0D00-$0D31  udiv8            udiv's eight-iteration short path
+$0D33-$0D3B  MUSREU           the nine REU registers the music IRQ saves/restores
 $0D40-$0DE7  ftInit / frameStat / frameMark   the per-frame compute timer
 $0E00-$0E1F  MAPINFO          resident block 0
 $0E20-$0E5C  nodeSphere       the per-node sphere fetch
@@ -1305,8 +1329,13 @@ $0E70-$0EEE  collision helpers
 $0F00-$0F3F  BSP descent stack (32 x 16-bit child words)
 $0F40-$0F50  frameCnt, reuOK, mapOK, mapErr, mapSum
 $0F51-$0FC3  segFacing        world-space seg backface test
+$0FC4-$0FF7  music player RAM  musBuf DMA window, musPtr/musLoop/musEnd, status
 $1000-$7DFF  MATRIX           28160 B = 110 pages, cell-major chunky buffer
-             ... staging MAPHDR at $5000 and the boot-only map loader at $5100
+             ... staging MAPHDR at $5000, and three boot-only code blocks:
+                 $5100-$5299  mapLoad
+                 $5300-$54C5  musInit
+                 $5500-$564A  reuProbe/reuInit, turboOn, clearHudRows and
+                              main's own boot sequence (bootMain)
 $8000-$83FF  SCREEN0          (VIC bank 2)
 $8400-$973F  converter tables dither 4 KB, scrTab/colTab 512 B, xOfs 320 B
 $9740-$97BF  SEGBUF           one subsector's segs, DMA target
@@ -1314,36 +1343,45 @@ $97C0-$98E3  bsp node test    sideOf / nodeStep / bspFindSsec
 $98E4-$98FE  instrumentation counters (INSTRUMENT = 1 builds only)
 $9900-$9B4A  converter code
 $9B4B-$9B5A  cntBump          the counter helper
-$9B60-$9D7C  math + spanFill code
+$9B60-$9D7B  math + spanFill code
 $9D80-$9F8D  walls helper routines
-$9F8E-$9FEB  CIA2 ms clock + framePace
+$9F8E-$9FD8  CIA2 ms clock + framePace
 $A000-$BF3F  BITMAP0          (VIC bank 2)
 $C000-$C3FF  SCREEN1          (VIC bank 3)
 $C400-$CA2B  math tables      sqr 1024 B, sin 512 B, rowCell 44 B
-$CA30-$CE06  doWall
-$CE08-$CFF8  bsp traversal    renderFrame, renderSsec, ssecHdr/ssecSegs
+$CA30-$CDFC  doWall
+$CE08-$CFDA  bsp traversal    renderFrame, renderSsec, ssecHdr/ssecSegs
 $D000-$DEFF  NODES + SECTORS  resident, under the I/O space ($01 = $34 to read)
 $E000-$FF3F  BITMAP1          (VIC bank 3, under Kernal ROM -- write-only)
+$FF40-$FFF9  MUSCODE          the music IRQ handler, copied up by musInit --
+                              not part of the PRG image, see below
 ```
 
-Three things worth knowing about this map:
+Some things worth knowing about this map:
 
 - **Low RAM is fragmented, and every fragment is asserted.** The code blocks
-  between `$0C30` and `$0FC3` are there because that is where the holes were,
+  between `$0C30` and `$0FF7` are there because that is where the holes were,
   not because anything about them belongs together. Every one is bounded by an
   `.errorif` against whatever follows it, so growing one past its block fails
   the build with the block's name in the message — which is what makes the
   arrangement maintainable rather than merely tight.
-- **`mapLoad` is assembled into MATRIX**, at `$5100`. It runs once, before the
-  first frame, and `spanFill` overwrites it during that frame; `MAPHDR` already
-  staged there on the same argument. That freed 411 contiguous bytes of low RAM
-  and is what let `sphereTest` grow from the box test to the exact one
-  (`IMPLEMENTATION_PLAN.md` §15). Nothing in that file may be called after boot.
-- **`$FF40-$FFF9` is 186 bytes of free RAM and is being kept free** for M2's
-  audio interrupt, which has to reach the vector at `$FFFE`. Code placed there
-  works, but it extends the PRG image across `$D000-$DFFF`, so loading it writes
-  filler over the I/O space — fine under VICE's RAM injection, untested on the
-  U64's DMA path.
+- **Boot-only code is assembled into MATRIX**, and this is the lever the
+  engine reaches for whenever low RAM runs out. `mapLoad` went first, at
+  `$5100`: it runs once, before the first frame, and `spanFill` overwrites it
+  during that frame — `MAPHDR` was already staged there on the same argument.
+  That freed 411 contiguous bytes and is what let `sphereTest` grow from the
+  box test to the exact one. M2 spent the lever twice more: `musInit` at
+  `$5300`, and at `$5500` the REU probe, `turboOn`, `clearHudRows` and `main`'s
+  own boot sequence — ~200 bytes, which is what the sliding collision test of
+  §5.3 is assembled into. Nothing in any of those blocks may be called after
+  boot.
+- **`$FF40-$FFF9` holds the music IRQ handler**, which has to be reachable from
+  the vector at `$FFFE`. The PRG image still ends at `$CFDA`: `music.asm`
+  assembles the handler with `.pseudopc MUSCODE` inside a boot block and
+  `musInit` copies it up. That indirection is deliberate — reaching past
+  `$CFDA` in the image itself would write 4 KB of filler across `$D000-$DFFF`
+  on load, which is fine under VICE's RAM injection and untested on the U64's
+  DMA path.
 - **The math tables end at `$CA2C` and the walls code begins at `$CA30`.**
   Four bytes of slack. Adding a single table entry to `sqr`, `sin` or `rowCell`
   will silently overrun into executable code unless `WALLSCODE` moves first.
@@ -1599,7 +1637,7 @@ Mapping `algorithm.md`'s abstract stages onto what exists today:
 | `algorithm.md` stage | Implemented as | State |
 |---|---|---|
 | `PollInput` | `readInput` | ✅ complete |
-| `SimulatePlayer` | `movePlayer` | ⚠️ integer coords, no sliding, no `dt` |
+| `SimulatePlayer` | `movePlayer` + `checkMove`/`slideVec` | ⚠️ integer coords, no `dt`; sliding landed in M2 §9.2 |
 | `ResolveCamera` | inline in `renderFrame` | ✅ complete |
 | `PredictStreaming` | `ssecHdr`/`ssecSegs`, `nodeSphere` — per visit, not predictive | ⚠️ no prefetch |
 | `BuildVisibleSectorSet` | BSP descent + bounding-sphere rejection | ⚠️ no PVS, no supersectors |
@@ -1638,13 +1676,13 @@ The next milestones, in dependency order:
    → a **BSP walk over real E1M1 geometry** replacing both `testmap.asm` and the
    portal traversal of §7.
 3. Textured walls: adds a `u` coordinate through the near-plane clip (§8.2),
-   per-column `u/v` steps from the depth-bucket LUTs of
-   `data_structures.md` §3.6, and turns `spanFill` into a texture-sampling
-   loop.
+   per-column `u/v` steps, and turns `spanFill` into a texture-sampling loop.
+   `IMPLEMENTATION_PLAN.md` §10 is the design — intensity-only texturing, so
+   the ramp nibble and therefore the multicolor attribute constraint survive.
 4. Deferred floor/ceiling spans — removes the overdraw measured in §12.1.
 5. Sprites as column-clipped billboards, reusing `colTop`/`colBot` unchanged.
 6. Music, and the audio-versus-render budget split of `design.md`.
 
-Steps 3-6 are the point at which the target architecture in `design.md`,
-`data_structures.md` and `algorithm.md` stops being aspirational and starts
-being load-bearing. Until then, this document describes the whole machine.
+Steps 3-6 are the point at which the target architecture in `design.md` and
+`algorithm.md` stops being aspirational and starts being load-bearing. Until
+then, this document describes the whole machine.

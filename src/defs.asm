@@ -255,6 +255,14 @@
 // like mapLoad does -- see BOOTCODE. mapLoad ends at $52a0.
 .const MUSBOOT   = MATRIX + $4300   // $5300
 
+// The third boot-only block, and the one that paid for §9.2: reuProbe, reuInit
+// and clearHudRows all ran once and then sat in the main segment for the rest
+// of the run. Moving them here returned ~200 bytes below $0c30, which is what
+// the sliding collision test is assembled into. Same argument as BOOTCODE and
+// MUSBOOT, and IMPLEMENTATION_PLAN.md §8.3's first lever: boot-only code has no
+// business in the only RAM the engine cannot get more of.
+.const BOOTCODE3 = MATRIX + $4500   // $5500-$56ff, after MUSBOOT ($5300-$54c5)
+
 // CIA1 Timer A is the music tick. The KERNAL leaves it free-running as its own
 // 60 Hz interrupt source and nothing in the engine reads it -- readInput uses
 // $DC00/$DC01, the data ports, and clock.asm deliberately took CIA2 instead.
@@ -385,6 +393,12 @@
 .const MAXSTEP = 24                 // tallest step the player can climb
 .const MINHEAD = 56                 // headroom needed to fit through an opening
 .const PLRAD   = 16                 // player radius, Doom's own value
+
+// How many times checkMove may project the remaining motion onto a blocking
+// seg and try again before it gives up and undoes the move. Three is what an
+// inside corner needs: one attempt to find the first wall, one to find the
+// second after sliding along the first, and one to commit what is left.
+.const SLIDETRY = 3
 
 //------------------------------------------------------------
 // Ultimate 64 / C64 Ultimate turbo control
@@ -531,6 +545,26 @@
 
 // The bounding sphere's radius, world units, live across the transform.
 .const zRad    = $94
+
+//------------------------------------------------------------
+// zero page — the sliding collision test ($98-$a3)
+//
+// Above everything else for the same reason msLast was: $02-$8f is the
+// engine's allocation and $90 upwards has been untouched since boot. These
+// could have shared the movement scratch at $68-$7b, and deliberately do not:
+// slideVec runs *between* two runs of the seg loop, so anything it borrowed
+// from the renderer's accumulators would have to be proved dead across both.
+//------------------------------------------------------------
+.const zSlTX   = $98        // the blocking seg's direction, x1-x0 / y1-y0
+.const zSlTY   = $9a
+.const zSlL    = $9c        // |t|, approximated (see slideVec)
+.const zSlUX   = $9e        // t normalised, 8.8 fixed point: 256 = 1.0
+.const zSlUY   = $a0
+.const zSlDot  = $a2        // 256 * (motion . t-hat)
+.const zSlTry  = $a4        // attempts left in the two-boundary loop
+.const zSlAx   = $a5        // 0 = x, 2 = y: which axis slideVec is on. In
+                            // memory rather than in X because mul8 and udiv
+                            // both want X for themselves.
 
 
 //------------------------------------------------------------

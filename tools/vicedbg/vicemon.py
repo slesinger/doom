@@ -65,6 +65,15 @@ class Mon:
             raise RuntimeError(f"mem_get failed, err={err}")
         return b[2:2 + struct.unpack("<H", b[:2])[0]]
 
+    def mem_set(self, start, data, bank=BANK_DEFAULT, side_effects=0, memspace=0):
+        """Write `data` at `start`. The counterpart of mem_get; the monitor
+        takes an inclusive end address, so a one-byte write has end == start."""
+        body = struct.pack("<BHHBH", side_effects, start, start + len(data) - 1,
+                           memspace, bank) + bytes(data)
+        _, err, _ = self.cmd(0x02, body)
+        if err:
+            raise RuntimeError(f"mem_set failed, err={err}")
+
     def regs(self, memspace=0):
         """-> {register id: value}. Pair with register_names() for labels."""
         _, _, b = self.cmd(0x31, bytes([memspace]))

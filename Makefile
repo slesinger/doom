@@ -6,6 +6,8 @@
 #   make shot       headless VICE run, screenshot to build/shot.png
 #   make check      the regression gate: build + shot content + live-RAM diff
 #   make debug      live-RAM vs PRG diff under the VICE binary monitor
+#   make walktest   drive the player along a wall and into a corner, and
+#                   judge the path against E1M1's own linedefs
 #   make stats      emulated ms/frame + renderer workload counters
 #   make profile    per-frame call counts for the hot routines
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
@@ -79,7 +81,7 @@ REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats profile framehash assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile framehash walktest assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest music setup clean \
         intro run-intro shot-intro run-intro-u64 intro-config
 
@@ -344,6 +346,21 @@ debug: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/probe.py diff $(PRG) $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# The movement acceptance test: does the player slide along a wall instead of
+# stopping dead on it, and does a run into an inside corner end up inside the
+# map? Same backgrounded-VICE dance as `debug`, and the same randomised port for
+# the same reason. tools/vicedbg/walktest.py drives the running engine over the
+# monitor and judges the path it takes against E1M1's own linedefs.
+walktest: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/walktest.py $(MONPORT); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

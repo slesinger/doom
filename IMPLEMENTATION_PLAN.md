@@ -244,7 +244,7 @@ Named here so nothing has to be rediscovered:
 - **Sliding along walls** and **one boundary per frame** — Phase 5's two open
   items, untouched. Now §9.2.
 - **`data_structures.md` has never been reconciled** with the formats
-  `wad2reu.py` actually emits. Now §9.3.
+  `wad2reu.py` actually emits. Now §9.3 — and the answer was to delete it.
 - **The uploader sends one span from offset 0**, so the 405 KB music block makes
   every `make run-u64` a multi-minute upload. Now §9.1, and it is a blocker.
 - **Quality scaling.** The clock a feedback loop needs exists; nothing reads it.
@@ -464,7 +464,34 @@ cost twenty minutes and it was asked for by name in this plan, which is the
 only reason a kilobyte of imaginary RAM did not end up underneath §12's sprite
 design.
 
-### 9.2 Sliding along walls, and the two-boundary loop
+### 9.2 Sliding along walls, and the two-boundary loop *(closed 2026-08-12)*
+
+> **Done, except for one half of the second claim.** `checkMove` now projects a
+> blocked move onto the seg it hit and re-tests, up to `SLIDETRY` = 3 times
+> (`src/input.asm`, `slideVec`). `make walktest` is the acceptance test and it
+> is green: a 20-degree run along a 704-unit wall in E1M1 covers **96% of the
+> unobstructed distance** along it, and a run into a 90-degree inside corner
+> ends **12 units** from the vertex without crossing a linedef. M1 would have
+> scored 0% and stopped at first contact.
+>
+> **`pipeline.md` §5.3 is reduced, not closed, and the plan's reasoning above
+> was wrong about why.** Re-descending the BSP with the *destination* cannot
+> catch a second boundary: `bspFindSsec` returns the subsector that *contains*
+> that point, so every one of its segs then tests as inside and the extra
+> iteration is a no-op. What the iteration cap does buy is real but narrower —
+> a blocked-and-slid destination is re-tested from the top, which is what makes
+> an inside corner resolve against both of its walls in one frame. A move that
+> passes *legally* through an opening and out through a wall of the next
+> subsector is still tested only against the first boundary. Closing that needs
+> a march along the motion, subsector by subsector, testing the *segment*
+> old->new rather than the destination point; it is not written, and at 21
+> units per frame against E1M1's subsector sizes it has not been observed.
+>
+> RAM: the routine is ~250 bytes and the main segment had 2. It was paid for
+> out of §8.3's first lever — `reuProbe`, `clearHudRows`, `turboOn` and the
+> boot sequence itself are boot-only and now assemble into MATRIX as
+> `BOOTCODE3` ($5500). `make check` and `make framehash` are unchanged by all
+> of it.
 
 M1's single biggest gameplay defect: a blocked move is undone whole, so walking
 into a wall at a shallow angle stops you dead. Both open items want the same
@@ -495,18 +522,58 @@ step/headroom rules (floor step > 24 blocks, headroom < 56 blocks).
 *Done when:* you can walk the length of a wall at 20° without stopping, and a
 scripted diagonal run into an inside corner neither leaks nor sticks.
 
-### 9.3 `data_structures.md` reconciled
+### 9.3 `data_structures.md` reconciled *(closed 2026-08-12 — deleted)*
 
-It has described a format the tool does not emit since Phase 3, and M2 changes
-the formats again (§10.2, §11.2). Reconcile it once now, against
-`docs/reu-format.md`, which is authoritative — or delete it and redirect, if
-everything in it is now said better there. Deciding that is part of the job.
+> **Outcome: the document is gone**, and that was the reconciliation. Section
+> by section, everything in it was either superseded by a frozen document or
+> was describing code that no longer exists:
+>
+> | `data_structures.md` | Why it went |
+> |---|---|
+> | §1-2 `MAPBIN` container, sections, portal entries, supersectors, PVS, collision grid, `ThingSpawn` | A format the project decided against. The engine uses the WAD's own BSP, and `docs/reu-format.md` is the frozen, boot-checked container |
+> | §3 LUT bank taxonomy | There is one tier and everything is in it. What exists is in `pipeline.md` §12.2, from `defs.asm` |
+> | §4 sprite catalog and billboard encoding | Contradicted in detail by §12.2 below, which is RAM-aware and measured where the old text was speculative |
+> | §5 frame working sets | `pipeline.md` §12.2 and §13.2 |
+> | §6-7 optimisation rules, build outputs (`map.bin`, `lut.bin`, `sprite.bin`, `stream_plan.bin`) | `wad2reu.py` emits one image and `docs/reu-format.md` §8 documents what its validator checks |
+> | §8 "as implemented (M1)" | `src/testmap.asm` was deleted in Phase 4 |
+>
+> The references in `README.md`, `pipeline.md` (the doc table, §14) and
+> `docs/georam-vs-reu.md` were rewritten to name the surviving authority
+> directly rather than to point through it.
+>
+> The memory map still has **four independent copies**: `defs.asm`, the image's
+> own load-address bytes, `probe.py`'s allowed-region table, and
+> `docs/reu-format.md`. The first two are cross-checked at boot and the third
+> fails `make check` when it drifts; `pipeline.md` §12.2 is a fifth and is
+> transcribed by hand. Nothing enforces the last two, which is why they are the
+> ones that rot — deleting a document that nothing enforced is one fewer.
 
-The memory map has **four independent copies**: `defs.asm`, the image's own
-load-address bytes, `probe.py`'s allowed-region table, and `docs/reu-format.md`.
-The first two are cross-checked at boot and the third fails `make check` when it
-drifts. The document is the one nothing enforces, which is why it is the one that
-rots.
+### 9.4 `pipeline.md` still describes the portal renderer *(found while closing §9.3)*
+
+Not planned work — found by following §9.3's references out of the deleted
+document and into the one that survives. `pipeline.md` opens with a caveat that
+it describes "the *portal* renderer" and that Milestone 1 "replaces portal
+traversal with a BSP walk", written in the future tense before Phase 4 landed.
+That replacement happened, and these sections did not follow it:
+
+| Section | What it describes | What is there now |
+|---|---|---|
+| §5 | `checkSector` over a sector's walls | `checkMove` over a subsector's segs. **Header, cost line and §5.1-5.3 reconciled 2026-08-12**; the rest of the section's math is unchanged and still correct |
+| §7 | portal traversal — `renderSector`, `popLoop`, the `pStkSec`/`pStkXL`/`pStkXR` window stack | `bsp.asm`: a BSP descent with bounding-sphere rejection and `openCols` as the termination condition. **Nothing in §7 exists in `src/`** |
+| §11 | a frame traced through the three-sector test map, checked against the live machine | `src/testmap.asm` was deleted in Phase 4. The trace is arithmetically sound and describes geometry the engine can no longer load |
+| §12.1 | the cycle budget, itemised, from that same test map | E1M1 at three raster frames. §12.2 and §12.3 **were reconciled 2026-08-12** and are current |
+| §13's appendix | zero page and low RAM, including `pStkSec` at `$03A0` | that block is the BSP descent stack at `$0F00` |
+
+§8, §9 and §10 — per-wall geometry, the column loop, the converter — are
+untouched by the BSP change and are still accurate, which is why the document
+is still worth having.
+
+**This is the same debt §9.3 just closed, one document over**, and it is larger:
+`data_structures.md` described a format nobody built, whereas these sections
+describe code that was built, shipped, measured and then deleted, which is a
+more convincing kind of wrong. It is not scheduled — §10 is worth more than it
+— but §11's worked frame is the natural thing to re-trace against E1M1 once
+textures change what a wall costs anyway, and doing it then is close to free.
 
 ## 10. Phase 8 — Textured walls
 

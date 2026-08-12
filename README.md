@@ -48,7 +48,7 @@ one hardware reading that was believed for half a session and was an artifact.
 
 ## Documentation
 
-The five documents divide along one axis: **what we intend to build** versus
+The documents divide along one axis: **what we intend to build** versus
 **what is actually there**.
 
 ### Start here
@@ -66,17 +66,21 @@ The five documents divide along one axis: **what we intend to build** versus
 |---|---|
 | [`design.md`](design.md) | *Why* the engine is shaped this way: the throughput-pipeline model, the REU-versus-RAM asymmetry, the stage-by-stage optimization strategy. |
 | [`algorithm.md`](algorithm.md) | *What* the stages are, in abstract pseudo-code (`PipeScript`), with the determinism and budget rules. |
-| [`data_structures.md`](data_structures.md) | *What the data looks like*: map container format, LUT banks, sprite assets, frame working sets. |
 | [`3d-renderer-design.md`](3d-renderer-design.md) | *How the final raster stage works*: the chunky→multicolor converter, the ramp/intensity byte format, double buffering. |
 
-> **Reading the design documents against the code.** `design.md`,
-> `algorithm.md` and `data_structures.md` describe the **target** engine —
-> REU streaming, PVS visibility, textured walls, sprites, music. Milestone 1
-> implements a subset with deliberate simplifications (integer world
-> coordinates instead of 16.16, an 8-bit angle instead of 16-bit, flat shading
-> instead of textures). `pipeline.md` §2 and §14 map the differences
-> explicitly, and each design document now carries a status note pointing at
-> the relevant section.
+> **Reading the design documents against the code.** `design.md` and
+> `algorithm.md` describe the **target** engine — REU streaming, PVS
+> visibility, textured walls, sprites, music. The engine implements a subset
+> with deliberate simplifications (integer world coordinates instead of 16.16,
+> an 8-bit angle instead of 16-bit, flat shading instead of textures).
+> `pipeline.md` §2 and §14 map the differences explicitly, and each design
+> document carries a status note pointing at the relevant section.
+>
+> There was a third, `data_structures.md`, describing a map container and asset
+> layout the project ultimately did not build. It was deleted rather than
+> reconciled (`IMPLEMENTATION_PLAN.md` §9.3): **`docs/reu-format.md` is the
+> authority on every data format the engine actually reads**, and
+> `pipeline.md` §12.2 on where it all sits in memory.
 
 [`debug-notes/`](debug-notes/00-index.md) holds the forensic write-ups from the
 black-screen debugging passes — six hypotheses, the ones that were wrong, and
@@ -150,7 +154,15 @@ make run                           # VICE with the map image attached
 make check VICEWRAP='xvfb-run -a'  # THE regression gate: build + shot + debug
 make shot  VICEWRAP='xvfb-run -a'  # headless run, screenshot to build/shot.png
 make debug VICEWRAP='xvfb-run -a'  # live-RAM vs PRG diff
+make walktest VICEWRAP='xvfb-run -a'   # movement: slide along a wall, wedge in
+                                       # a corner, cross nothing
 ```
+
+`make walktest` is the movement counterpart of `make check`: it drives the
+running engine over the binary monitor along two scripted paths and judges the
+path it took against E1M1's own linedefs, so "the player slid along the wall"
+and "the player did not end up inside one" are separate, checkable claims
+rather than something to squint at on screen (`IMPLEMENTATION_PLAN.md` §9.2).
 
 ### On real hardware
 

@@ -1,6 +1,6 @@
 //============================================================
 //  input.asm — WASDQE keyboard + joystick port 2, player movement
-//  with subsector containment (slide-free blocking collision)
+//  with subsector containment and sliding collision
 //
 //  W/S   forward / back        A/D   turn left / right
 //  Q/E   strafe left / right   joy 2 up/down/left/right = W/S/A/D
@@ -11,6 +11,11 @@
 //  copy of the geometry. Subsectors are convex, so the containment
 //  test is the sign of one cross product per seg, unchanged from
 //  when it was sectors that were convex.
+//
+//  A blocked move is not undone whole: what is left of the motion is
+//  projected onto the seg it hit and tried again, so a wall passes
+//  the player along it instead of stopping them (slideVec, and
+//  IMPLEMENTATION_PLAN.md §9.2). `make walktest` is the test.
 //============================================================
 
 
@@ -212,8 +217,9 @@ moveDone:
 
 //------------------------------------------------------------
 // checkMove: the player has already been moved. Test the new point
-// against the segs of the subsector they were standing in; undo the
-// move if it crossed a blocking one, otherwise re-locate them.
+// against the segs of the subsector they were standing in; slide
+// along the wall it crossed, and undo the move only when sliding
+// cannot save it.
 //
 // Interior test, unchanged from the convex-sector version: with the
 // front sector on the right of each directed seg, inside means
@@ -225,9 +231,18 @@ moveDone:
 // interior boundaries between subsectors, not walls -- and it is why
 // leaving the subsector is normal rather than exceptional.
 //
-// The limitation is pipeline.md §5.3's, inherited unchanged: one
-// frame's motion that crosses two boundaries at once is only tested
-// against the first.
+// M1 undid a blocked move whole, so walking into a wall at a shallow
+// angle stopped the player dead. Now a blocked attempt projects what
+// is left of the motion onto the seg it hit (slideVec) and tests the
+// new destination from the top -- up to SLIDETRY times, which is what
+// lets an inside corner resolve against both of its walls in one
+// frame rather than stopping on the first.
+//
+// The segs are streamed once, before the loop: the subsector does not
+// change between attempts, so an attempt costs no REU traffic. That
+// matters because the projection is exact enough to leave the
+// destination a rounding error outside the seg it just slid along,
+// and attempt 2 has to re-test it rather than trust it.
 //------------------------------------------------------------
 checkMove:
         lda camSsec                 // the segs the renderer will not have
@@ -238,9 +253,13 @@ checkMove:
         lda zSegCnt
         bne !+
         jmp moveOK                  // a subsector with no segs blocks nothing
-!:      sta zWCnt
-        jsr ssecSegs                // the sphere is the renderer's business:
+!:      jsr ssecSegs                // the sphere is the renderer's business:
                                     // collision wants the segs unconditionally
+        lda #SLIDETRY
+        sta zSlTry
+!attempt:
+        lda zSegCnt
+        sta zWCnt
         lda #0
         sta zWIdx                   // seg cursor: a byte offset (SEGSZ)
 !seg:   ldx zWIdx
@@ -308,9 +327,9 @@ checkMove:
         bcc !inside+                // no -- a collinear seg further along
         ldy sgBack,x                // outside: one-sided seg, or a step?
         cpy #$ff
-        beq moveBlocked
+        beq moveSlide
         jsr stepOK
-        bcc moveBlocked
+        bcc moveSlide
         jmp moveOK                  // through the opening: re-locate below
 !inside:
         lda zWIdx
@@ -321,8 +340,38 @@ checkMove:
         beq moveOK
         jmp !seg-
 
+// The move crossed the seg at zWIdx and that seg blocks. Project what is left
+// of this frame's motion onto it and test the whole thing again from the new
+// destination; give up after SLIDETRY attempts, or when the seg is degenerate
+// and there is no direction to slide along.
+//
+// The retry recomputes the destination from oldX/oldY rather than nudging
+// camX/camY, because zMvDX/zMvDY is now the *projected* motion, not the
+// motion that has already been applied.
+moveSlide:
+        dec zSlTry
+        beq moveBlocked
+        ldx zWIdx
+        jsr slideVec
+        bcc moveBlocked
+        lda oldX
+        clc
+        adc zMvDX
+        sta camX
+        lda oldX+1
+        adc zMvDX+1
+        sta camX+1
+        lda oldY
+        clc
+        adc zMvDY
+        sta camY
+        lda oldY+1
+        adc zMvDY+1
+        sta camY+1
+        jmp !attempt-
+
 moveBlocked:
-        lda oldX                    // undo: no sliding in M1
+        lda oldX                    // nothing survived the projection: undo
         sta camX
         lda oldX+1
         sta camX+1
@@ -381,6 +430,207 @@ stepOK:
 !ok:    sec
         rts
 !block: clc
+        rts
+
+//------------------------------------------------------------
+// slideVec: X = the blocking seg's byte offset in SEGBUF. Replaces
+// zMvDX/zMvDY with their component along that seg. Carry set if it
+// produced a direction, clear if the seg is degenerate and there is
+// none.
+//
+//     d' = t-hat * (d . t-hat)
+//
+// which is the same vector as the plan's d - n(d.n), written in the
+// seg's own direction instead of its normal -- one fewer sign to get
+// wrong, and t is what SEGBUF already stores.
+//
+// t-hat is carried as 8.8 fixed point (256 = 1.0), so the dot product
+// comes out scaled by 256 and the second multiply's >>16 takes both
+// scalings out at once -- no shift chain, just the top half of the
+// product. Both components stay well inside 16 bits: |t-hat| <= 1.0
+// and |d| <= MOVE_SPEED, so 256*(d.t-hat) is at most ~5400.
+//
+// |t| is approximated as max + min/2 rather than computed: there is no
+// square root in the engine, and the error only scales the slide -- it
+// never turns it, which is the part that would let a slide push through
+// the wall it is sliding along. Worst case (a 45-degree wall at
+// max = 2*min) the player is passed along it about 20% slower than the
+// true projection would; a wall on either axis is exact.
+//
+// Every step past the first runs twice, once per axis, and the three
+// vectors it walks -- t, t-hat and the motion -- are each a pair of
+// zero-page words two bytes apart. So the axis is an index rather than
+// a copy of the code, at the cost of holding it in zSlAx across the
+// calls that need X for themselves (mul8 and udiv both use it).
+//------------------------------------------------------------
+slideVec:
+        txa                         // Y = the seg, X is the axis from here on
+        tay
+        lda sgX1,y                  // t = (x1-x0, y1-y0)
+        sec
+        sbc sgX0,y
+        sta zSlTX
+        lda sgX1+1,y
+        sbc sgX0+1,y
+        sta zSlTX+1
+        lda sgY1,y
+        sec
+        sbc sgY0,y
+        sta zSlTY
+        lda sgY1+1,y
+        sbc sgY0+1,y
+        sta zSlTY+1
+        ldx #0                      // zSlL = |tx|, zA = |ty|
+        jsr slideAbs
+        lda zA
+        sta zSlL
+        lda zA+1
+        sta zSlL+1
+        ldx #2
+        jsr slideAbs
+        lda zSlL                    // order them: zSlL = max, zA = min
+        cmp zA
+        lda zSlL+1
+        sbc zA+1
+        bcs !max+
+        ldy zSlL
+        lda zA
+        sta zSlL
+        sty zA
+        ldy zSlL+1
+        lda zA+1
+        sta zSlL+1
+        sty zA+1
+!max:   lsr zA+1                    // zSlL = max + min/2
+        ror zA
+        lda zSlL
+        clc
+        adc zA
+        sta zSlL
+        lda zSlL+1
+        adc zA+1
+        sta zSlL+1
+        ora zSlL
+        bne !+
+        clc                         // a zero-length seg: no direction
+        rts
+!:      lda #0                      // t-hat, 8.8, one axis at a time
+        sta zSlAx
+!norm:  ldx zSlAx
+        lda zSlTX,x
+        ldy zSlTX+1,x
+        jsr slideNorm
+        ldx zSlAx
+        lda zA
+        sta zSlUX,x
+        lda zA+1
+        sta zSlUX+1,x
+        jsr slideNextAx
+        bcc !norm-
+        sta zSlDot                  // A = 0: 256*(d . t-hat) = dx*ux + dy*uy
+        sta zSlDot+1
+!dot:   ldx zSlAx
+        lda zMvDX,x
+        sta zA
+        lda zMvDX+1,x
+        sta zA+1
+        lda zSlUX,x
+        sta zB
+        lda zSlUX+1,x
+        sta zB+1
+        jsr ssmul32
+        lda zSlDot
+        clc
+        adc zP+0
+        sta zSlDot
+        lda zSlDot+1
+        adc zP+1
+        sta zSlDot+1
+        jsr slideNextAx
+        bcc !dot-
+!proj:  ldx zSlAx                   // d' = t-hat * dot, both 8.8 -> >> 16
+        lda zSlUX,x
+        sta zA
+        lda zSlUX+1,x
+        sta zA+1
+        jsr slideProj
+        ldx zSlAx
+        lda zA
+        sta zMvDX,x
+        lda zA+1
+        sta zMvDX+1,x
+        jsr slideNextAx
+        bcc !proj-
+        sec
+        rts
+
+//------------------------------------------------------------
+// slideAbs: X = axis -> zA = |t[axis]|.
+//------------------------------------------------------------
+slideAbs:
+        lda zSlTX,x
+        sta zA
+        lda zSlTX+1,x
+        sta zA+1
+        bpl !+
+        jsr negA
+!:      rts
+
+//------------------------------------------------------------
+// slideNextAx: step the axis index on by one word. Carry set when
+// both axes are done, and A = 0 there -- which is what seeds zSlDot.
+//------------------------------------------------------------
+slideNextAx:
+        lda zSlAx
+        clc
+        adc #2
+        cmp #4
+        bcs !+
+        sta zSlAx
+        clc
+        rts
+!:      lda #0
+        sta zSlAx
+        sec
+        rts
+
+//------------------------------------------------------------
+// slideNorm: A/Y = one component of t (lo/hi) -> zA = that component
+// over |t|, in 8.8. The dividend is the component shifted left eight
+// bits, which is just where it is stored in zD -- no shifting.
+//------------------------------------------------------------
+slideNorm:
+        sta zD+1
+        sty zD+2
+        lda #0
+        sta zD+0
+        lda zSlL
+        sta zV
+        lda zSlL+1
+        sta zV+1
+        jsr sdiv                    // signed: the component carries t's sign
+        lda zD+0
+        sta zA
+        lda zD+1
+        sta zA+1
+        rts
+
+//------------------------------------------------------------
+// slideProj: zA (8.8 unit component) * zSlDot -> zA, the product's top
+// sixteen bits, i.e. (8.8 * 8.8) >> 16 back in world units. The product
+// is signed and its high half is the arithmetic shift, so there is
+// nothing to correct.
+//------------------------------------------------------------
+slideProj:
+        lda zSlDot
+        sta zB
+        lda zSlDot+1
+        sta zB+1
+        jsr ssmul32
+        lda zP+2
+        sta zA
+        lda zP+3
+        sta zA+1
         rts
 
 //------------------------------------------------------------

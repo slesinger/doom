@@ -191,10 +191,10 @@ slowly-varying dimension of the table.** A lookup costs 4 cycles when it lands
 on the currently-mapped page and 12 when it does not, so the table's layout has
 to align with the loop that reads it.
 
-`data_structures.md` §3 lists the LUTs the target architecture wants and
 `pipeline.md` §12.2 shows what actually fits today: `sqr` 1024 B, `sin` 512 B,
-`scrTab`/`colTab` 512 B, 4 KB of dither. §3.2's **reciprocal LUT does not
-exist** — the engine divides — and §3.6's texture step LUTs do not exist,
+`scrTab`/`colTab` 512 B, 4 KB of dither. The two tables an engine like this
+would most want are the two that do not exist: there is **no reciprocal LUT**
+— the engine divides, ~880 cycles a time — and **no texture step LUTs**,
 because there is nowhere to put them.
 
 | LUT | Size | Access pattern | Fit |
@@ -202,9 +202,9 @@ because there is nowhere to put them.
 | `sqr` quarter-square (mul8) | 1 KB | two random reads per multiply, across 4 pages | **keep in RAM** — 2 page writes per multiply is a loss |
 | `sin`/`cos` 2.14 | 512 B | random by angle | **keep in RAM** — hot, tiny, already fits |
 | 16-bit reciprocal 1/z | 128 KB | `z` hi byte → page, lo byte → offset | **GeoRAM.** `z` varies smoothly along a wall, so the page is usually already right. Replaces `udiv` in the column loop |
-| texture step / depth bucket (§3.6) | tens of KB | one bucket per wall | **GeoRAM.** Page = depth bucket, chosen once per wall |
+| texture step / depth bucket | tens of KB | one bucket per wall | **GeoRAM.** Page = depth bucket, chosen once per wall |
 | texture columns | 100s of KB | one page per screen column | **GeoRAM**, as above |
-| column ray LUT (§3.3) | 160 entries | sequential by column | RAM |
+| column ray LUT | 160 entries | sequential by column | RAM |
 
 The distinction is not "big versus small" — it is **how often the page changes
 relative to how often you read**. Tables read once per wall or once per column
