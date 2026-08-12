@@ -41,15 +41,22 @@ the same reason the hand-built test map was SoA before it was deleted.
 
 ## 2. Header
 
-At REU offset `$000000`, 64 bytes:
+At REU offset `$000000`, 128 bytes:
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic, ASCII `D64U` |
-| 4 | 1 | format version — **4** |
+| 4 | 1 | format version — **5** |
 | 5 | 1 | block count `N` |
 | 6 | 2 | reserved, zero |
 | 8 | 8×`N` | block descriptors |
+
+It was 64 bytes through version 4, which held seven descriptors. Version 5's
+special lines are the eighth block, so the header doubled — it costs nothing,
+since the first block starts at `$000100` either way, and it stops the next
+block from being a format change to the header as well. `mapload.asm`'s
+`MAXDESCS` is derived from `HDRSIZE` rather than written down, so the two
+cannot drift.
 
 `mapload.asm` rejects the image if the magic or the version does not match,
 recording why in `mapErr` and leaving `mapOK` at 0. **As of Phase 4 that is
@@ -102,8 +109,16 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 4 | `NODESPH` | no — streamed | — | 1920 B |
 | 5 | `MUSIC` | no — streamed | — | 405136 B |
 | 6 | `WALLTEX` | no — streamed | — | 512 B |
+| 7 | `LINEDEFS` | no — streamed, read once at boot | `$DB40` | 80 B |
 
 Resident total: **3488 B**, of which 3456 sit under the I/O space (§6).
+
+`LINEDEFS` is the odd one: it is read exactly once, at boot, and then lives at a
+fixed address like a resident block. It is not one because a descriptor carries
+a load *page* and `$DB40` is not a page boundary — the 640 free bytes under I/O
+begin mid-page (§6). So `mapLoad` stages it in MATRIX with the streamed blocks
+and `lineLoad` copies it down. `tools/vicedbg/probe.py`'s `check_lines` is what
+asserts it arrived, since the resident-block check cannot see it.
 
 Blocks are stored in the image in id order, each padded to a 256-byte boundary —
 with one exception, `MUSIC`, which sits at a fixed offset above everything else
@@ -424,6 +439,36 @@ needs no such thing. The cost is that a diagonal wall's texture is stretched by
 up to √2 and that `u` does not honour the sidedef's own x offset — neither is
 visible at 8×8 and 160 columns.
 
+### 4.8 `LINEDEFS` — the special lines
+
+Block 7, 80 bytes, copied to `$DB40` at boot. Five parallel arrays of
+`MAXLINES` = 16, indexed the way every other table in this format is:
+
+| Array | At | Holds |
+|---|---|---|
+| `ldKind` | `$DB40` | `LK_*` in the low nibble, `LF_WALK`/`LF_REPEAT` above it; 0 = empty slot |
+| `ldSec` | `$DB50` | the sector that **moves** |
+| `ldTrig` | `$DB60` | the sector that **fires** it |
+| `ldTgtLo` | `$DB70` | where the moving height ends up, 16-bit … |
+| `ldTgtHi` | `$DB80` | … signed, in world units |
+
+Kinds: 1 door (its sector's **ceiling** moves), 2 lift, 3 floor, 4 exit — which
+is carried, drawn, and does nothing in M2, there being no level to exit to.
+
+**The tags and the target heights are resolved by `wad2reu.py`, not at
+runtime.** Doom searches every sector for a tag and every neighbour for a
+height; the engine can do neither — `SECTORS` carries no tag and the image
+holds no adjacency anywhere — and it does not have to, because nothing in M2
+changes what the answer would be. A door's target is the lowest neighbouring
+ceiling minus 4, a lift's is the lowest neighbouring floor, a floor's is the
+highest neighbouring floor plus 8.
+
+`ldTrig` is what makes activation a sector question rather than a geometric
+one (`IMPLEMENTATION_PLAN.md` §11.2a): a walkover line emits **one record per
+side**, so it fires from either direction, and a use-activated line sets
+`ldTrig` to the sector that moves — the player is holding the key while
+standing in a subsector with that sector behind one of its segs.
+
 ---
 
 ## 5. `SSECDATA` — the streamed subsector slots
@@ -534,10 +579,14 @@ $CA30-$CE06  doWall           one seg into the column windows
 $CE08-$CFF8  bsp traversal    renderFrame, renderSsec, ssecHdr/ssecSegs, sectors
    ...
 $D000-$DB3F  NODES            resident block 1   ]
-$DB40-$DBFF  free, 192 B                         ]  under the I/O space:
-$DC00-$DE3F  SECTORS          resident block 2   ]  visible only with
-$DE40-$DEFF  free, 192 B                         ]  $01 = $34
-$DF00-$DFFF  REU registers    never used as RAM
+$DB40-$DB8F  LINEDEFS         block 7, copied    ]  under the I/O space:
+$DB90-$DBCF  thinkers         8 moving sectors   ]  visible only with
+$DBD0-$DBFF  lineThink        + the SECTAB accessors ]  $01 = $34
+$DC00-$DE3F  SECTORS          resident block 2   ]
+$DE40-$DEFF  lnStep           the door state machine ]  All three code blocks
+$DF00-$DFFF  lnUse/lnEnter    activation, and lineInit ]  are .pseudopc images
+                              -- the REU registers are here with $01 = $35,   ]
+                              and this is RAM with $01 = $34 (src/lines.asm)  ]
    ...
 $FF40-$FFE3  music handler    musIrq, copied there by musInit -- NOT in the
                               PRG image, which still ends at $CFDA (§4.6)

@@ -40,6 +40,9 @@
 // indexed by id, so this and docs/reu-format.md §3 must stay in step.
 .const MAPNBLK = 4
 
+// The one streamed block this file reads at boot -- see lineLoad.
+.const BLK_LINEDEFS = 7
+
 .const MAPINFOSZ = 32
 .const NODETABSZ = NODETAB_END - NODETAB
 .const SECTABSZ  = SECTAB_END - SECTAB
@@ -113,7 +116,19 @@ mapBlockLoop:
         ldy #bdFlags
         lda (zMLDesc),y
         and #1
-        beq mapNextBlock                // streamed: nothing to do at boot
+        bne !resident+
+        // Streamed blocks are nobody's business at boot -- except block 7,
+        // the special lines, which is streamed only because its home under
+        // I/O does not start on a page and a descriptor carries a load *page*
+        // (docs/reu-format.md §4.8). It is read here, once, like a resident
+        // block, and split into place by lineLoad.
+        ldy #bdId
+        lda (zMLDesc),y
+        cmp #BLK_LINEDEFS
+        bne mapNextBlock
+        jsr lineLoad
+        jmp mapNextBlock
+!resident:
 
         ldy #bdId
         lda (zMLDesc),y
@@ -219,6 +234,65 @@ mapFail:
         sta mapOK
         clc
         rts
+
+//------------------------------------------------------------
+// lineLoad — block 7 (the special lines) into LINESPEC, at $DB40.
+//
+// The same two-step every resident block makes, and for the same reason: the
+// REU drives the bus through the same PLA the CPU does, so it cannot write
+// under I/O, and $df01 is not reachable with I/O banked out. Stage into
+// MATRIX, then copy with $01 = BANK_RAM.
+//
+// It is not a resident block because a descriptor carries only the *page* of
+// its home and $DB40 is not one. Rather than widen the descriptor for one
+// block -- and change the format, mapLoad's tables and probe.py with it --
+// the block stays streamed and this reads it. The length is checked against
+// LINEDEFSZ so that an image built with a different MAXLINES fails here
+// rather than by writing over the thinker list.
+//
+// mapSum gets no entry: the sums are indexed by block id and the table is
+// MAPNBLK wide. tools/vicedbg/probe.py checks these 80 bytes directly
+// against the image instead, which is a stronger check than the sum anyway.
+//------------------------------------------------------------
+lineLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #LINEDEFSZ
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        bne !bad+
+        lda #<MATRIX
+        sta REU_C64ADDR
+        lda #>MATRIX
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #LINEDEFSZ
+        sta REU_LENGTH
+        lda #0
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        lda #BANK_RAM
+        sta $01
+        ldy #LINEDEFSZ-1
+!:      lda MATRIX,y
+        sta LINESPEC,y
+        dey
+        bpl !-
+        lda #BANK_IO
+        sta $01
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
 
 //------------------------------------------------------------
 // mapCopyStaged — MATRIX -> (zMLDst), zMLLen bytes, with RAM

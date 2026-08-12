@@ -149,6 +149,13 @@ REU_IMAGE = "build/assets.reu"
 # addresses are named here, and they are TX_SEED/TX_FETCH/TX_VSET in defs.asm.
 SYMFILE = "src/build/main.sym"
 TEXBLOCKS = [("Seed", 0x0770), ("Fetch", 0x03A0), ("VSet", 0x02B0)]
+# `.const LINECODE/LINECODE2/LINECODE3`, and the labels lines.asm gives their
+# .pseudopc images. All three are under the I/O space.
+LINEBLOCKS = [("Think", 0xDBD0), ("Step", 0xDE40), ("Act", 0xDF00)]
+LINESPEC = 0xDB40        # `.const LINESPEC` -- the special-line table
+MAXLINES = 16            # `.const MAXLINES`
+BLK_LINEDEFS = 7         # docs/reu-format.md §3
+LK_NAME = {1: "door", 2: "lift", 3: "floor", 4: "exit"}
 
 # mapErr values, from src/defs.asm.
 MERR = {0: "none", 1: "no REU", 2: "bad magic", 3: "wrong version",
@@ -304,21 +311,21 @@ def check_music(m):
     return 0
 
 
-def check_texcode(m, prg_path):
-    """Assert the three relocated wall-texturing blocks are still executable.
+def check_reloc(m, prg_path, tag, prefix, wanted, what):
+    """Assert that a set of relocated code blocks is still executable.
 
-    tex.asm does not fit in the RAM above $0801: three of its eleven blocks run
-    in the free tails of colTop ($02B0), colBot ($03A0) and COLBUF ($0770),
-    below where a PRG image can load, so they are assembled into MATRIX with
-    .pseudopc and texBoot copies them down at boot (src/defs.asm, BOOTCODE4).
+    Some of this engine's code cannot be in the PRG image where it runs. The
+    texture blocks run below $0801, under the load address; the doors blocks
+    run under the I/O space, where an image that reached them would write 4 KB
+    across $d000-$dfff as it loaded. Both are therefore assembled into MATRIX
+    with .pseudopc and copied into place at boot (BOOTCODE4/BOOTCODE5).
 
-    That puts executable code inside three pages the renderer indexes into
-    every column, and `diff` cannot see it: those addresses are outside the
-    image, so it has nothing to compare them against, and the source copies at
-    $5700 are in MATRIX and painted over by the first frame. So compare live
-    RAM against the .pseudopc images in the PRG *file* instead. A column index
-    that ran past 159 -- the exact bug spanFill's bounds check exists for --
-    now corrupts code rather than a clip window, and this is what would say so.
+    `diff` cannot see any of it: those addresses are outside the image, so it
+    has nothing to compare them against, and the source copies in MATRIX are
+    painted over by the first frame. So compare live RAM against the .pseudopc
+    images in the PRG *file* instead. A column index that ran past 159 -- the
+    exact bug spanFill's bounds check exists for -- now corrupts code rather
+    than a clip window, and this is what would say so.
 
     The block addresses come from build/main.sym rather than being repeated
     here, because they move whenever the bin-packing does.
@@ -326,15 +333,15 @@ def check_texcode(m, prg_path):
     try:
         sym = open(SYMFILE).read()
     except OSError as e:
-        print(f"\nTEXCODE: cannot read {SYMFILE} ({e})")
+        print(f"\n{tag}: cannot read {SYMFILE} ({e})")
         return 1
     labels = dict(re.findall(r"^\.label (\w+)=\$([0-9a-fA-F]+)$", sym, re.M))
     try:
-        blocks = [(name, int(labels[f"tx{name}Src"], 16),
-                   int(labels[f"tx{name}End"], 16), run)
-                  for name, run in TEXBLOCKS]
+        blocks = [(name, int(labels[f"{prefix}{name}Src"], 16),
+                   int(labels[f"{prefix}{name}End"], 16), run)
+                  for name, run in wanted]
     except KeyError:
-        print("\nTEXCODE: build/main.sym has no txSrc/txEnd labels -- stale?")
+        print(f"\n{tag}: build/main.sym has no {prefix}*Src/End labels -- stale?")
         return 1
 
     load, img = load_prg(prg_path)
@@ -349,14 +356,62 @@ def check_texcode(m, prg_path):
             bad.append(f"{name} at ${run:04X}: {n} of {len(want)} bytes differ, "
                        f"first at +${first:02X}")
     if bad:
-        print("\nTEXCODE: *** relocated texture code has been overwritten ***")
+        print(f"\n{tag}: *** relocated {what} has been overwritten ***")
         for line in bad:
             print(f"  {line}")
         return 1
     total = sum(e - s for _, s, e, _ in blocks)
-    print(f"\nTEXCODE: {len(blocks)} relocated blocks intact, {total} bytes "
+    print(f"\n{tag}: {len(blocks)} relocated blocks intact, {total} bytes "
           f"({', '.join(f'${r:04X}' for _, _, _, r in blocks)})")
     return 0
+
+
+def check_lines(m):
+    """Assert that the special-line table reached the RAM under I/O.
+
+    check_map cannot: block 7 is streamed rather than resident, because a
+    descriptor carries a load *page* and $DB40 is not one. So mapLoad stages it
+    in MATRIX and lineLoad copies it down (src/mapload.asm), and only the image
+    itself says what should be there.
+
+    Eighty bytes deciding which sectors are doors. Zeros here render exactly
+    like a map with no doors in it, which is why this is asserted rather than
+    watched for.
+    """
+    try:
+        img = open(REU_IMAGE, "rb").read()
+    except OSError as e:
+        print(f"\nLINES: {REU_IMAGE} is unreadable ({e})")
+        return 1
+    for i in range(img[5]):
+        bid, flags, o0, o1, o2, length, _ = struct.unpack_from(
+            "<BBBBBHB", img, 8 + i * 8)
+        if bid != BLK_LINEDEFS:
+            continue
+        want = img[(o0 | o1 << 8 | o2 << 16):][:length]
+        got = bytes(m.mem_get(LINESPEC, LINESPEC + length - 1, bank=1))
+        m.exit_mon()
+        if got != want:
+            n = sum(1 for a, b in zip(got, want) if a != b)
+            print(f"\nLINES: *** the table at ${LINESPEC:04X} does not match "
+                  f"block 7: {n} of {length} bytes differ ***")
+            return 1
+        kinds = Counter(k & 0x0F for k in want[:MAXLINES] if k)
+        print(f"\nLINES: {sum(kinds.values())} special lines at "
+              f"${LINESPEC:04X}, +{length} verified (" +
+              " ".join(f"{LK_NAME.get(k, k)}:{n}"
+                       for k, n in sorted(kinds.items())) + ")")
+        return 0
+    print("\nLINES: the image carries no block 7 -- no doors in this map")
+    return 0
+
+
+def check_texcode(m, prg_path):
+    return check_reloc(m, prg_path, "TEXCODE", "tx", TEXBLOCKS, "texture code")
+
+
+def check_linecode(m, prg_path):
+    return check_reloc(m, prg_path, "LINECODE", "ln", LINEBLOCKS, "doors code")
 
 
 def cmd_diff(m, prg_path, settle):
@@ -379,7 +434,8 @@ def cmd_diff(m, prg_path, settle):
     for name, n in counts.most_common():
         print(f"  {n:7d}  {name}")
 
-    rc = check_reu(m) | check_map(m) | check_music(m) | check_texcode(m, prg_path)
+    rc = (check_reu(m) | check_map(m) | check_music(m) | check_lines(m)
+          | check_texcode(m, prg_path) | check_linecode(m, prg_path))
 
     bad = [d for d in diffs if region(d[0]).startswith("***")]
     print(f"\nunexpected differences: {len(bad)}")

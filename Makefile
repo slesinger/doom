@@ -8,6 +8,7 @@
 #   make debug      live-RAM vs PRG diff under the VICE binary monitor
 #   make walktest   drive the player along a wall and into a corner, and
 #                   judge the path against E1M1's own linedefs
+#   make doortest   open a door, hold it, close it -- judged against SECTAB
 #   make stats      emulated ms/frame + renderer workload counters
 #   make profile    per-frame call counts for the hot routines
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
@@ -81,7 +82,7 @@ REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats profile framehash walktest assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile framehash walktest doortest assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest music setup clean \
         intro run-intro shot-intro run-intro-u64 intro-config
 
@@ -361,6 +362,20 @@ walktest: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/walktest.py $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# The doors acceptance test (§11), and the same dance again. It judges the
+# engine against SECTAB rather than against a picture, which is the whole point
+# of the phase: a door is two bytes of sector height and the renderer never
+# learns what one is.
+doortest: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/doortest.py $(MONPORT); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

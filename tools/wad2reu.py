@@ -37,20 +37,26 @@ import math
 import os
 import struct
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 # ----------------------------------------------------------------------------
 # Format constants. These MUST match src/defs.asm and docs/reu-format.md.
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 4                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+VERSION = 5                     # 2 added the bounding spheres (SSEC_HDR, block 4)
                                 # 3 added the music stream (block 5) and the
                                 #   page-unit length flag it needs
                                 # 4 added the wall texture tiles (block 6) and
                                 #   the texture family id in the seg's low nibble
+                                # 5 added the special linedefs (block 7): doors,
+                                #   lifts and walkover triggers, with tags and
+                                #   target heights resolved here rather than
+                                #   searched for at runtime
 
-HEADER_SIZE = 64
+HEADER_SIZE = 128               # 15 descriptors. 64 through version 4, which
+                                # held 7 and the eighth block outgrew; the
+                                # first block starts at $000100 either way
 BLOCK_ALIGN = 256
 
 MAXNODES = 240                  # capacity of the resident node arrays
@@ -76,6 +82,7 @@ NODESPH_SHIFT = 3
 BLK_MAPINFO, BLK_NODES, BLK_SECTORS, BLK_SSECDATA, BLK_NODESPH = 0, 1, 2, 3, 4
 BLK_MUSIC = 5
 BLK_WALLTEX = 6
+BLK_LINEDEFS = 7
 
 # Wall texture tiles -- IMPLEMENTATION_PLAN.md §10.2 Stage A.
 #
@@ -121,6 +128,75 @@ TEX_GAIN = TEX_SWING / 25.0
 # what a 128x128 Doom texture spans at 1 pixel per unit; it is the size most of
 # E1M1's wall textures actually are.
 TEX_UNITS_SHIFT = 4
+
+# ----------------------------------------------------------------------------
+# Special linedefs -- IMPLEMENTATION_PLAN.md §11, docs/reu-format.md §4.8.
+#
+# M1 dropped LINEDEFS entirely: the engine renders segs and collides against
+# segs, and a linedef is neither. What comes back is only the lines that *do*
+# something -- special != 0 -- which in E1M1 is 19 of 475, and of those 19 the
+# eight scrollers are not sector motion. So the resident table is eleven
+# records, and that is what changes the design the plan sketched.
+#
+# §11.2 asked for a seg -> linedef reference, and worried about which of two
+# bad ways to carry it (an 11th byte on the hottest record in the engine, or a
+# geometry search at use time). Neither is needed, and neither is the geometry:
+# activation is by *sector*, decided in IMPLEMENTATION_PLAN.md §11.2a because
+# Doom's own segment-crossing test needs ~660 B of code against the 640 B of
+# RAM under I/O that is the whole budget for this phase.
+#
+# So a record carries no endpoints. It carries the sector that moves, and the
+# sector whose entry (or whose presence in front of the eye) fires it. A
+# walkover line emits *two* records, one per side, because Doom's W1 and WR
+# fire from either direction and a single trigger sector only sees one.
+#
+# Three things are resolved here that Doom resolves at runtime, because doing
+# them offline costs nothing and saves the engine a search it has no data for:
+#
+#   - **the tag.** Doom scans every sector for a matching tag. The engine has
+#     no tag array and SECTAB has no room for one, so a tag is resolved to a
+#     sector id here. A tag matching several sectors emits one record each.
+#   - **the target height.** "Lower to the lowest neighbouring floor" needs the
+#     sector adjacency the engine also does not have. The height is computed
+#     here from the WAD's own linedefs and stored. This is exact for M2, where
+#     nothing else moves a floor; it stops being exact the day two thinkers can
+#     act on neighbouring sectors, which is an M3 problem and is noted in
+#     docs/reu-format.md §4.8.
+#
+# Record, 5 bytes, SoA (src/defs.asm LINESPEC):
+#
+#   kind      LK_* below, plus LF_* flags                        1 B
+#   sector    the sector this line moves                         1 B
+#   trig      the sector whose entry, or whose presence ahead
+#             of the eye, fires it                               1 B
+#   target    signed 16-bit height the sector moves to           2 B
+MAXLINES = 16                   # capacity of the resident arrays; E1M1 uses 13
+LINE_ARRAYS = 5
+LINEDEF_BYTES = MAXLINES * LINE_ARRAYS          # 80
+
+LK_NONE, LK_DOOR, LK_LIFT, LK_FLOOR, LK_EXIT = 0, 1, 2, 3, 4
+
+LF_WALKOVER = 0x10              # crossing the line fires it; else the use key
+LF_REPEAT = 0x20                # fires again after it has run; else once only
+
+# Doom line special -> what M2 does with it. `sector` says where the moving
+# sector comes from: "back" is the line's own back sidedef (Doom's DR doors),
+# "tag" is every sector carrying the line's tag.
+#
+# Everything not in this table becomes a no-op and --validate reports it by
+# number, so a map cannot silently lose a mechanism (§11.2 item 5).
+LINE_SPECIALS = {
+    1:  (LK_DOOR,  LF_REPEAT, "back"),          # DR door, open wait close
+    88: (LK_LIFT,  LF_WALKOVER | LF_REPEAT, "tag"),   # WR lift, lower wait raise
+    36: (LK_FLOOR, LF_WALKOVER, "tag"),         # W1 floor lower to 8 above highest
+    11: (LK_EXIT,  0, "back"),                  # S1 exit -- drawn, does nothing
+}
+
+# Doom's door target: the lowest neighbouring ceiling, four units below it, so
+# the door leaves a visible lintel rather than sealing flush.
+DOOR_LINTEL = 4
+# Doom's "lower floor to 8 above the highest neighbouring floor".
+FLOOR_STEP_ABOVE = 8
 
 # Block descriptor flags (docs/reu-format.md §2).
 #
@@ -582,6 +658,22 @@ class Seg:
                 f"f={self.front} b={self.back} r={self.ramp} t={self.tex})")
 
 
+class Line:
+    """A special linedef, with its tag, trigger and target already resolved."""
+    __slots__ = ("kind", "sector", "trig", "target", "doom")
+
+    def __init__(self, kind, sector, trig, target, doom):
+        self.kind = kind                # LK_* | LF_*
+        self.sector = sector            # the sector this line moves
+        self.trig = trig                # the sector that fires it
+        self.target = target            # height it moves to
+        self.doom = doom                # the WAD's own special number, --report
+
+    def __repr__(self):
+        return (f"Line(kind=${self.kind:02x} sec={self.sector} "
+                f"trig={self.trig} target={self.target} doom={self.doom})")
+
+
 class Node:
     __slots__ = ("px", "py", "dx", "dy", "right", "left")
 
@@ -611,6 +703,8 @@ class MapData:
         self.ramp_misses = Counter()
         self.tex_misses = Counter()     # wall textures with no family (Stage A)
         self.tex_used = Counter()       # segs per family, for --report
+        self.lines: list[Line] = []     # special linedefs only (block 7)
+        self.line_drops = Counter()     # Doom specials M2 does not implement
 
     @property
     def numsegs(self):
@@ -654,6 +748,104 @@ def descend(m: MapData, x: int, y: int) -> int:
 # ----------------------------------------------------------------------------
 # E1M1 (and any other WAD map) — read the shipped BSP, repack it
 # ----------------------------------------------------------------------------
+
+def extract_lines(m: MapData, lines, sides, verts, wsecs) -> None:
+    """Fill m.lines with the special linedefs, tags and targets resolved.
+
+    Doom does both of those resolutions at runtime, walking every sector for a
+    tag and every neighbour for a height. The engine can do neither -- SECTAB
+    carries no tag and there is no adjacency anywhere in the image -- and it
+    does not have to, because nothing in M2 changes what the answer would be.
+    See the LINE_SPECIALS comment for the one case that stops being exact.
+    """
+    # Sector adjacency, from the WAD's own two-sided lines. A sector is not its
+    # own neighbour: Doom's height searches exclude the moving sector, which is
+    # the difference between a door that opens and a door that computes its
+    # target as its own closed ceiling and never moves.
+    neigh = defaultdict(set)
+    for _v1, _v2, _flags, _spec, _tag, right, left in lines:
+        if right == 0xFFFF or left == 0xFFFF:
+            continue
+        a, b = sides[right][5], sides[left][5]
+        if a != b:
+            neigh[a].add(b)
+            neigh[b].add(a)
+
+    def lowest_ceiling(sec):
+        return min((wsecs[n][1] for n in neigh[sec]), default=wsecs[sec][1])
+
+    def lowest_floor(sec):
+        return min((wsecs[n][0] for n in neigh[sec]), default=wsecs[sec][0])
+
+    def highest_floor(sec):
+        return max((wsecs[n][0] for n in neigh[sec]), default=wsecs[sec][0])
+
+    for _idx, (_v1, _v2, _flags, spec, tag, right, left) in enumerate(lines):
+        if not spec:
+            continue
+        if spec not in LINE_SPECIALS:
+            m.line_drops[spec] += 1
+            continue
+        kind, flags, where = LINE_SPECIALS[spec]
+
+        front_sec = sides[right][5] if right != 0xFFFF else None
+        back_sec = sides[left][5] if left != 0xFFFF else None
+
+        if where == "back":
+            if back_sec is None:
+                # A one-sided line has no sector behind it to move. That is
+                # normal for LK_EXIT (nothing moves) and a mapping error for a
+                # door, which is what the drop counter is for.
+                if kind != LK_EXIT:
+                    m.line_drops[spec] += 1
+                    continue
+                targets = [front_sec]
+            else:
+                targets = [back_sec]
+        else:
+            targets = [i for i, s in enumerate(wsecs) if s[6] == tag]
+            if not targets:
+                m.line_drops[spec] += 1
+                continue
+
+        # Which sector fires it. A door is opened by facing the door sector
+        # itself, so the trigger is the sector that moves. A walkover fires on
+        # entering either sector the line divides -- Doom's W1 and WR trigger
+        # from both sides, and a trigger sector only sees one, so the line
+        # emits a record per side.
+        if flags & LF_WALKOVER:
+            trigs = [s for s in (front_sec, back_sec) if s is not None]
+        else:
+            trigs = [None]                      # "the sector that moves"
+
+        for sec in targets:
+            if kind == LK_DOOR:
+                target = lowest_ceiling(sec) - DOOR_LINTEL
+            elif kind == LK_LIFT:
+                target = lowest_floor(sec)
+            elif kind == LK_FLOOR:
+                target = highest_floor(sec) + FLOOR_STEP_ABOVE
+            else:
+                target = 0
+            for trig in trigs:
+                m.lines.append(Line(kind | flags, sec,
+                                    sec if trig is None else trig,
+                                    target, spec))
+
+    if len(m.lines) > MAXLINES:
+        raise ValueError(
+            f"{m.name}: {len(m.lines)} special lines, MAXLINES is {MAXLINES} "
+            "-- raise it here and the LINEGEO/LINESPEC arrays in src/defs.asm "
+            "together, and check they still fit the two holes under I/O")
+    # A door whose target is at or below its closed ceiling never opens, and it
+    # renders and collides exactly like a wall, so nothing on the machine would
+    # say so. Doom has the same failure and calls it a mapping error.
+    for ln in m.lines:
+        if ln.kind & 0x0F == LK_DOOR and ln.target <= wsecs[ln.sector][1]:
+            raise ValueError(
+                f"{m.name}: door sector {ln.sector} opens to {ln.target} but "
+                f"is closed at {wsecs[ln.sector][1]} -- it would never move")
+
 
 def load_wad_map(wad: Wad, mapname: str) -> MapData:
     L = wad.map_lumps(mapname)
@@ -738,6 +930,8 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
         px, py, dx, dy = nd[0:4]
         m.nodes.append(Node(px, py, dx, dy, right=nd[12], left=nd[13]))
     m.root = len(m.nodes) - 1
+
+    extract_lines(m, lines, sides, verts, wsecs)
 
     start = next((t for t in things if t[3] == 1), None)
     if start is None:
@@ -989,6 +1183,23 @@ def pack_sectors(m: MapData) -> bytes:
     return b"".join(bytes(c) for c in cols)
 
 
+def pack_linedefs(m: MapData) -> bytes:
+    """Block 7: the special lines, SoA, MAXLINES bytes per field.
+
+    Streamed rather than resident, and copied into place at $DB40 by lineLoad:
+    a resident block's home is a *page* in its descriptor (docs/reu-format.md
+    §2) and the free RAM under I/O does not start on one.
+    """
+    cols = [bytearray(MAXLINES) for _ in range(LINE_ARRAYS)]
+    for i, ln in enumerate(m.lines):
+        t = _s16(ln.target, "line target height")
+        cols[0][i] = ln.kind & 0xFF
+        cols[1][i] = ln.sector & 0xFF
+        cols[2][i] = ln.trig & 0xFF
+        cols[3][i], cols[4][i] = t & 0xFF, t >> 8
+    return b"".join(bytes(c) for c in cols)
+
+
 def _sphere(points) -> tuple:
     """A bounding circle for `points`, as (cx, cy, r) in whole map units.
 
@@ -1147,6 +1358,7 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     sectors = pack_sectors(m)
     ssecdata = pack_ssecdata(m)
     nodesph = pack_nodesph(m)
+    linedefs = pack_linedefs(m)
 
     # MAPINFO needs SSECDATA's offset, and SSECDATA's offset depends only on
     # the fixed sizes ahead of it, so the layout is computed before packing it.
@@ -1159,6 +1371,7 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     ofs_ssecdata = ofs_sectors + align(len(sectors))
     ofs_nodesph = ofs_ssecdata + align(len(ssecdata))
     ofs_walltex = ofs_nodesph + align(len(nodesph))
+    ofs_lines = ofs_walltex + align(len(walltex))
 
     ofs_music = MUSIC_OFFSET if music else 0
 
@@ -1176,11 +1389,22 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"") -> bytes:
     ]
     if walltex:
         blocks.append((BLK_WALLTEX, 0, ofs_walltex, walltex, 0))
+    # Streamed, and read exactly once: mapLoad stages it into MATRIX at boot
+    # and lineLoad splits it into the two holes under I/O. It is not resident
+    # because a resident block's home is a *page* in the descriptor and neither
+    # hole starts on one (docs/reu-format.md §4.8).
+    blocks.append((BLK_LINEDEFS, 0, ofs_lines, linedefs, 0))
     if music:
         blocks.append((BLK_MUSIC, BF_PAGES, ofs_music, music, 0))
 
-    used = align(ofs_walltex + len(walltex)) if walltex \
-        else align(ofs_nodesph + len(nodesph))
+    if 8 + 8 * len(blocks) > HEADER_SIZE:
+        raise ValueError(
+            f"{len(blocks)} blocks need {8 + 8 * len(blocks)} header bytes and "
+            f"the header is {HEADER_SIZE}. Raise it here and HDRSIZE in "
+            "src/defs.asm together -- mapload.asm derives MAXDESCS from it and "
+            "rejects the image with mapErr=4 (bad block count).")
+
+    used = align(ofs_lines + len(linedefs))
     if used > REU_PROBE_OFFSET:
         raise ValueError(
             f"image is {used} B and would reach REU ${REU_PROBE_OFFSET:06X}, "
@@ -1358,6 +1582,64 @@ def validate(m: MapData, img: bytes) -> list[str]:
     check(p["blocks"][BLK_NODESPH]["flags"] & 1 == 0, "NODESPH must not be resident")
     check(info["sph_base"] == p["blocks"][BLK_NODESPH]["ofs"],
           "MAPINFO's sphere base does not point at the NODESPH block")
+
+    # The special lines (block 7). The failure this is really aimed at is a
+    # line that is *present and inert* -- a door whose sector id is wrong moves
+    # some other part of the map, and a kind the engine does not know is a wall
+    # that never opens. Neither shows up as anything but "the door is broken".
+    ld = p["blocks"].get(BLK_LINEDEFS)
+    check(ld is not None, "image has no LINEDEFS block")
+    if ld is not None:
+        check(ld["flags"] & BF_RESIDENT == 0,
+              "LINEDEFS must not be resident: its two homes are not page-aligned")
+        check(ld["length"] == LINEDEF_BYTES,
+              f"LINEDEFS is {ld['length']} B, expected {LINEDEF_BYTES}")
+        cols = [ld["data"][i * MAXLINES:(i + 1) * MAXLINES]
+                for i in range(LINE_ARRAYS)]
+        seen = 0
+        for i in range(MAXLINES):
+            kind = cols[0][i]
+            if kind == 0:
+                continue
+            seen += 1
+            sec = cols[1][i]
+            trig = cols[2][i]
+            target = cols[3][i] | cols[4][i] << 8
+            if target & 0x8000:
+                target -= 0x10000
+            base = kind & 0x0F
+            check(base in (LK_DOOR, LK_LIFT, LK_FLOOR, LK_EXIT),
+                  f"line {i} has unknown kind ${kind:02X}")
+            check(sec < len(m.sectors),
+                  f"line {i} moves sector {sec}, past numsec {len(m.sectors)}")
+            check(trig < len(m.sectors),
+                  f"line {i} is fired by sector {trig}, past numsec "
+                  f"{len(m.sectors)}")
+            # A door whose trigger is not the sector it moves cannot be found
+            # by the use scan, which walks the segs of the subsector the player
+            # is in and matches their back sector.
+            check(base != LK_DOOR or trig == sec,
+                  f"door line {i} moves sector {sec} but is triggered by "
+                  f"{trig}; the use scan only ever finds the moving sector")
+            if base == LK_DOOR:
+                check(target > m.sectors[sec].ceil,
+                      f"door line {i} opens to {target}, at or below its "
+                      f"closed ceiling {m.sectors[sec].ceil}")
+            if base == LK_LIFT:
+                check(target < m.sectors[sec].floor,
+                      f"lift line {i} lowers to {target}, at or above its "
+                      f"raised floor {m.sectors[sec].floor}")
+            check(kind & 0x0F != LK_EXIT or kind & LF_WALKOVER == 0,
+                  f"line {i} is a walkover exit, which M2 does not implement")
+        check(seen == len(m.lines),
+              f"LINEDEFS round-trip: {seen} live records, {len(m.lines)} lines")
+        # Two walkover records that share a trigger sector fire together and
+        # one of them is redundant; two *different* mechanisms sharing one is
+        # a map that plays wrong in a way nothing on the machine reports.
+        walk = [(cols[2][i], cols[0][i] & 0x0F) for i in range(MAXLINES)
+                if cols[0][i] & LF_WALKOVER]
+        check(len(set(walk)) == len(walk),
+              f"two walkover records share a trigger sector: {walk}")
 
     # 10. the music stream, if there is one. miMusBase is what src/music.asm
     # follows, and a zero there means silence -- so the failure this catches is
@@ -1615,13 +1897,23 @@ def report(m: MapData, img: bytes) -> None:
     print(f"  spawn          ({m.spawn[0]}, {m.spawn[1]}) angle {m.spawn[2]} "
           f"-> subsector {p['info']['spawn_ssec']} sector {p['info']['spawn_sec']}")
     print("  wall ramps     " + "  ".join(f"{k}:{v}" for k, v in used.most_common()))
+    kinds = {LK_DOOR: "door", LK_LIFT: "lift", LK_FLOOR: "floor", LK_EXIT: "exit"}
+    live = Counter(kinds[ln.kind & 0x0F] for ln in m.lines)
+    print(f"  special lines  {len(m.lines)} / {MAXLINES}   "
+          + "  ".join(f"{k}:{v}" for k, v in sorted(live.items())))
+    if m.line_drops:
+        # Named, not counted: a dropped special is a mechanism the map has and
+        # the engine does not, and the plan (§11.2) asks for it by number so
+        # that "the map plays wrong" has somewhere to start.
+        print("  dropped lines  " + "  ".join(
+            f"doom special {k} x{v}" for k, v in sorted(m.line_drops.items())))
     sph = p["node_sph"]
     print(f"  node spheres   max radius {max((r for _, _, r in sph), default=0)}"
           f"  mean {sum(r for _, _, r in sph) / max(1, len(sph)):.0f}")
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
                       (BLK_NODESPH, "NODESPH"), (BLK_WALLTEX, "WALLTEX"),
-                      (BLK_MUSIC, "MUSIC")):
+                      (BLK_LINEDEFS, "LINEDEFS"), (BLK_MUSIC, "MUSIC")):
         if bid not in p["blocks"]:
             continue
         b = p["blocks"][bid]

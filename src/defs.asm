@@ -114,6 +114,94 @@
 .errorif SECTAB < NODETAB_END, "node table overruns the sector table"
 .errorif SECTAB_END > $df00, "resident map tables overrun the REU registers"
 
+//------------------------------------------------------------
+// Doors and moving sectors (IMPLEMENTATION_PLAN.md §11) — tables *and* code,
+// in the RAM under the I/O space.
+//
+// This is the largest free RAM in the machine and M2 had not touched it:
+// $DB40-$DBFF (192 B, the tail of NODETAB's page), $DE40-$DEFF (192 B, after
+// SECTAB) and $DF00-$DFFF (256 B, under the REU's own registers). 640 bytes,
+// against the ~90 bytes of low RAM that tex.asm left in ten fragments.
+//
+// Putting *code* there is new and it is not a stunt: every routine in this
+// phase reads sector heights, which are at $DC00 and only exist with
+// $01 = BANK_RAM, so the whole feature had to run in that banking state
+// anyway. What it costs is the trampoline (lineTramp, in low RAM) and an
+// `sei` around it -- with I/O banked out the music IRQ would write its SID
+// registers into RAM, so the window is closed rather than merely survived.
+// The window is a few hundred cycles a frame; the CIA latch keeps running
+// underneath it, so the tick is delayed, never lost (src/music.asm).
+//
+// The line tables are loaded, not assembled: block 7 of the image, split
+// into these two homes by lineLoad at boot (docs/reu-format.md §4.8). They
+// are streamed rather than resident because a block descriptor carries only
+// a load *page* and neither hole starts on one.
+// A record carries no geometry: activation is by sector, not by a line
+// crossing (IMPLEMENTATION_PLAN.md §11.2a). `ldSec` is the sector that moves,
+// `ldTrig` the sector whose entry -- or whose presence in front of the eye --
+// fires it. For a door those are the same sector, which is what the use scan
+// matches against a seg's back sector; for a walkover they differ, and the
+// line emits one record per side so it fires from either direction.
+.const MAXLINES = 16                // must match wad2reu.py MAXLINES
+
+.const LINESPEC = $db40             // 5 SoA arrays of MAXLINES
+.const ldKind   = LINESPEC + 0*MAXLINES
+.const ldSec    = LINESPEC + 1*MAXLINES
+.const ldTrig   = LINESPEC + 2*MAXLINES
+.const ldTgtLo  = LINESPEC + 3*MAXLINES
+.const ldTgtHi  = LINESPEC + 4*MAXLINES
+.const LINESPEC_END = LINESPEC + 5*MAXLINES     // $db90
+.const LINEDEFSZ = 5*MAXLINES       // block 7's length, checked at load
+
+// Line kinds and flags, from wad2reu.py's LK_*/LF_*.
+.const LK_NONE  = 0
+.const LK_DOOR  = 1                 // use: ceiling up, wait, back down
+.const LK_LIFT  = 2                 // walkover: floor down, wait, back up
+.const LK_FLOOR = 3                 // walkover: floor down, once, no return
+.const LK_EXIT  = 4                 // use: nothing yet -- M3's level change
+.const LK_MASK  = %00001111
+.const LF_WALK  = %00010000         // crossing fires it, not the use key
+.const LF_REPEAT = %00100000        // may fire again once it has finished
+
+// The thinker list: eight moving sectors, which is more than E1M1 ever has
+// active at once. SoA, one array per field, indexed by slot.
+.const MAXTHINK = 8
+.const THINK    = LINESPEC_END      // $db90
+.const thKind   = THINK + 0*MAXTHINK
+.const thSec    = THINK + 1*MAXTHINK
+.const thTgtLo  = THINK + 2*MAXTHINK    // where it is going
+.const thTgtHi  = THINK + 3*MAXTHINK
+.const thHomeLo = THINK + 4*MAXTHINK    // the height it started at
+.const thHomeHi = THINK + 5*MAXTHINK
+.const thState  = THINK + 6*MAXTHINK    // TH_* below; 0 = slot free
+.const thWait   = THINK + 7*MAXTHINK    // frames left in TH_WAIT
+.const THINK_END = THINK + 8*MAXTHINK   // $dbd0
+
+.const TH_FREE  = 0
+.const TH_GOING = 1                 // moving towards the target
+.const TH_WAIT  = 2                 // holding open / down
+.const TH_BACK  = 3                 // returning home
+
+// Movement per *frame*, which is 59.85 ms, not Doom's 28.6 ms tic. Doom's
+// door is 2 units/tic and its lift 4, so 1.5x the frame period and a further
+// 2x the tic-to-frame ratio put them at 4 and 8. The waits are Doom's own
+// (VDOORWAIT 150 tics, PLATWAIT 105) converted to frames at 16.71 fps.
+.const DOOR_SPEED = 4
+.const LIFT_SPEED = 8
+.const FLOOR_SPEED = 2
+.const DOOR_WAIT = 71               // 150 tics = 4.3 s
+.const LIFT_WAIT = 50               // 105 tics = 3.0 s
+
+// Code, in what the tables leave of the three holes. The split is by run
+// order rather than by size: LINECODE is the per-frame thinker, LINECODE2 the
+// activation paths, LINECODE3 the room the phase has left to grow into.
+.const LINECODE  = THINK_END        // $dbd0-$dbff, 48 B
+.const LINECODE_END  = $dc00
+.const LINECODE2 = $de40            // $de40-$deff, 192 B, after SECTAB
+.const LINECODE2_END = $df00
+.const LINECODE3 = $df00            // $df00-$dfff, 256 B, under the REU regs
+.const LINECODE3_END = $e000
+
 // MAPINFO's page alignment is load-bearing: a block descriptor carries only
 // the high byte of its load address (docs/reu-format.md §2). What used to be
 // the free tail of this page is now SPHCODE3 and SSECHDR.
@@ -188,9 +276,9 @@
 // grow from the box test to the exact one -- before that the largest free block
 // below MATRIX was sixty bytes and the test had to be shaped to fit it.
 //
-// Three blocks are free and are now the largest unclaimed RAM below MATRIX:
-// $0cb3-$0cff, $0d33-$0d3f (SPHCODE's and UDIV8's own tails) and
-// $0fc4-$0fff (60 B, where sphereVisible used to live).
+// All three of these blocks' tails are now spent: $0cb3-$0cf2 and $0d33-$0d3f
+// are texture code and MUSREU, and $0fc4-$0fff is the music player's RAM.
+// Below MATRIX the largest unclaimed run left is five bytes.
 .const SPHCODE   = $0c30
 .const UDIV8     = $0d00            // udiv's short path -- math.asm
 .const FTCODE    = $0d40            // frame-time statistics -- clock.asm
@@ -298,6 +386,19 @@
 .const BSPCODE  = $ce08             // after the walls segment, up to $cfff
 .const BSPCODE2 = TABLES_FREE + SEGBUFSZ    // $97c0, tail of TABLES_FREE
 
+// The doors trampoline (src/lines.asm), split across the last two holes in the
+// machine that are big enough to hold a piece of it. Everything else about the
+// feature runs in the RAM under I/O; these two fragments exist because the REU
+// fetch and the `sei` have to happen with I/O still banked in, and the main
+// segment has one spare byte.
+//
+// LINETRAMP is the tail of SCREEN1's matrix. The VIC reads 1000 bytes of a
+// screen and this is the 24 after them, the same trick tex.asm's wall span
+// plays on SCREEN0 at $83e8 -- and the reason clearHudRows stops at 120 bytes.
+.const LINETRAMP = SCREEN1 + 1000   // $c3e8, 24 B to the end of the matrix
+// LINESEGS is between the texture strip unpack and the BSP walk. 19 B.
+.const LINESEGS  = $cdf5
+
 // seg record field offsets within SEGBUF, indexed by the seg's byte offset in
 // X. docs/reu-format.md §5.1 froze this layout; a seg is 10 bytes.
 .const SEGSZ    = 10
@@ -345,12 +446,17 @@
 // must move in lockstep with wad2reu.py's VERSION, because mapload.asm
 // halts the machine on any other number. 4 added the wall texture tiles
 // (block 6, miTexBase) and the texture family in sgRamp's low nibble.
-.const MAPFMT_VERSION = 4
+// 5 added the special lines (block 7): doors, lifts and walkover triggers,
+// with their tags and target heights resolved by wad2reu.py rather than
+// searched for here -- the engine has neither a tag array nor sector
+// adjacency (IMPLEMENTATION_PLAN.md §11.2a).
+.const MAPFMT_VERSION = 5
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5
 .const hdrDescs     = MAPHDR + 8    // blockCount x 8 bytes
-.const HDRSIZE      = 64
+.const HDRSIZE      = 128           // 15 descriptors; it was 64 and held 7,
+                                    // which version 5's eighth block outgrew
 
 // block descriptor field offsets, relative to a descriptor base
 .const bdId     = 0
@@ -473,15 +579,23 @@
 .const REU_PROBE_BANK = 0
 
 //------------------------------------------------------------
-// zInput bits. Keyboard and joystick merge with a single `ora`, so the
-// low four bits must keep matching joystick 2's up/down/left/right.
+// zInput bits. Keyboard and joystick merge with a single `ora`, so the low
+// four bits must keep matching joystick 2's up/down/left/right -- and IN_USE
+// is bit 4 for the same reason, which is where the fire button reads.
+//
+// Bit 4 is also SPACE's own bit in keyboard row 7, and bit 6 is Q's, so that
+// row needs no branches at all: mask the two bits out of the inverted read and
+// `ora` them straight in. The bit assignment is doing work, in other words --
+// M2's use key made the row cheaper than it was with one key on it.
 //------------------------------------------------------------
 .const IN_FWD    = %00000001        // W        / joy up
 .const IN_BACK   = %00000010        // S        / joy down
 .const IN_LEFT   = %00000100        // A        / joy left    -- turn left
 .const IN_RIGHT  = %00001000        // D        / joy right   -- turn right
-.const IN_SLEFT  = %00010000        // Q                      -- strafe left
-.const IN_SRIGHT = %00100000        // E                      -- strafe right
+.const IN_USE    = %00010000        // SPACE    / joy fire     -- open a door
+.const IN_SLEFT  = %01000000        // Q                      -- strafe left
+.const IN_SRIGHT = %10000000        // E                      -- strafe right
+.const IN_ROW7   = IN_SLEFT | IN_USE
 .const IN_MOVE   = IN_FWD | IN_BACK | IN_SLEFT | IN_SRIGHT
 
 //------------------------------------------------------------
@@ -637,6 +751,34 @@
 // the column it needs when u changes and never comes back to it.
 .const TEXBUF   = $c4               // 32 B, nibble-packed, column-major
 .const texStrip = $e4               // 8 B, one u column, finished chunky bytes
+
+//------------------------------------------------------------
+// zero page — doors and moving sectors ($ec-$f0), src/lines.asm
+//
+// The last of the free zero page, and the only zero page this phase takes:
+// the tables and the thinkers are all under I/O, where the code is.
+//------------------------------------------------------------
+.const zLnI    = $ec        // index into the line table
+.const zLnSec  = $ed        // the sector a scan is matching, then activating
+.const zLnKind = $ee        // that line's kind, LK_* with the flags stripped
+.const zLnUse  = $ef        // use key: 0 until released, so a held key opens
+                            // a door once rather than every frame
+.const camSecOld = $f0      // camSec at the end of the last frame; a walkover
+                            // fires on the change, not on standing in it
+.const zLnFlag = $f1        // LF_WALK, or 0 for the use-activated lines
+.const zLnCnt  = $f2        // segs left in the use scan
+                            // $f3 is free -- lnUse's seg cursor is checkMove's
+                            // zWIdx, because segFacing reloads X from it
+.const zTmpH   = $f4        // the height a thinker is moving, 16-bit
+.const zTmpD   = $f6        // and its distance left to the target
+                            // $f8 is free -- it was lineFrame's "run the use
+                            // scan this frame" flag until the edge test moved
+                            // to lineTick's side of the bank switch
+.const zLnHPtr = $f9        // the SECTAB array a thinker is moving: floors, or
+                            // ceilings 2*MAXSEC further on. One pointer instead
+                            // of a floor/ceiling branch in each of four places,
+                            // and the hi byte of a height is the same pointer
+                            // at y + MAXSEC because a sector id is under 96.
 
 
 //------------------------------------------------------------
@@ -799,6 +941,14 @@
 // argument as BOOTCODE/MUSBOOT/BOOTCODE3 -- MATRIX is 28 KB of scratch until
 // the first frame. ~320 B, after BOOTCODE3's $5500-$564a.
 .const BOOTCODE4 = MATRIX + $4700   // $5700
+
+// The fifth, and the same argument again: the .pseudopc images of the three
+// blocks that run under I/O (LINECODE*, src/lines.asm) and the three copy
+// loops that put them there. Those blocks cannot be in the PRG image at all --
+// reaching past $cffb would extend it over $d000-$dfff and make loading it a
+// 4 KB write across the I/O space, which is exactly the thing the note above
+// MUSCODE refuses to do. ~530 B, after BOOTCODE4's $5700-$5839.
+.const BOOTCODE5 = MATRIX + $4900   // $5900
 
 // The millisecond clock and the frame pacer, in the gap between the walls
 // helpers and BITMAP0. 114 B, $9f8e-$9fff.

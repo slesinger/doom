@@ -26,10 +26,12 @@
 //    $9740-$97BF  SEGBUF             $97C0-$98E3  bsp node test
 //    $9900-$9FFF  converter + math/span code + clock
 //    $A000-$BF3F  BITMAP0            (VIC bank 2)
-//    $C000-$C3FF  SCREEN1            (VIC bank 3)
+//    $C000-$C3FF  SCREEN1            (VIC bank 3) -- lineFrame in its tail
 //    $C400-$CA2B  math tables (sqr, sin, rowCell)
 //    $CA30-$CE06  doWall             $CE08-$CFF8  bsp traversal
 //    $D000-$DB3F  NODES              $DC00-$DE3F  SECTORS   (under I/O)
+//    $DB40-$DBFF  line table, thinkers and lineThink        (under I/O)
+//    $DE40-$DFFF  the rest of doors, lifts and floors       (under I/O)
 //    $E000-$FF3F  BITMAP1
 //    $FF40-....   music IRQ handler — copied there at boot, not in the PRG
 //============================================================
@@ -53,6 +55,7 @@ main:
 mainLoop:
         jsr readInput
         jsr movePlayer
+        jsr lineFrame               // doors and moving sectors -- lines.asm
         jsr renderFrame             // 3D -> MATRIX
         jsr convert                 // MATRIX -> back buffer
         jsr framePace               // hold the rate at 25 fps -- clock.asm
@@ -159,6 +162,18 @@ bootMain:
         // music block leaves musOK at 0 and the engine renders in silence --
         // see src/music.asm.
         jsr musInit
+        // The doors feature, which runs entirely in the RAM under I/O: first
+        // its three code blocks, copied out of MATRIX where they had to be
+        // assembled (lineBoot, and BOOTCODE5 in defs.asm), then the thinker
+        // list and camSecOld, so that the sector the player spawns in does not
+        // read as one they just walked into. Still inside the boot `sei`, so
+        // the window needs no masking of its own.
+        jsr lineBoot
+        lda #BANK_RAM
+        sta $01
+        jsr lineInit
+        lda #BANK_IO
+        sta $01
         // Seed the frame-time statistics *here*, not next to msInit: their
         // reference point is the last flip, and before the first one that is
         // the boot sequence. Seeded up there, frame 1 reports reuProbe and
@@ -261,4 +276,5 @@ clearHudRows:
 #import "render/walls.asm"
 #import "render/bsp.asm"
 #import "render/tex.asm"
+#import "lines.asm"
 #import "clock.asm"

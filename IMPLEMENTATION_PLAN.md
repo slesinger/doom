@@ -350,7 +350,7 @@ that was uncomfortably tight.
 
 | | Estimate | Basis |
 |---|---:|---|
-| Wall textures | 6-9 ms | §10.4 |
+| Wall textures | ~~6-9 ms~~ **8.7 ms spent** | §10.4; measured on hardware 2026-08-12, §10's landing note |
 | Doors and moving sectors | < 0.5 ms | §11; the renderer needs no change |
 | Sprites | 6-8 ms | §12.4, dominated by REU streaming |
 | HUD | < 0.5 ms | §13; redrawn only when a value changes |
@@ -579,6 +579,52 @@ textures change what a wall costs anyway, and doing it then is close to free.
 
 The defining feature of M2 and the one with the real risk in it.
 
+> **Stage A landed 2026-08-12** (`f5f8d93` host side, `6618dd6` engine side).
+> Hardware, `make u64-fps`: `16.63 fps (60.1 ms/frame)`, `compute 46.7 ms last,
+> 46.7 min, 46.7 max (deadline 59.85 ms)`, `raster frames 3x168 4+x0 -- 100%`.
+> `make check` green, `TEXCODE: 3 relocated blocks intact, 274 bytes`.
+>
+> **Textures cost +8.7 ms**, the top of §10.4's 6-9 ms estimate — 37.6 → 46.7 ms
+> measured on the machine, not extrapolated. **13.1 ms of budget remains** for
+> doors (<0.5), sprites (6-8) and the HUD (<0.5), which fits with ~4 ms of
+> margin and no room for a surprise.
+>
+> **Stage B is therefore out of M2.** §10.2's gate was "only if Stage A measures
+> well inside its budget"; it measured at the top of it. Revisit in M3, after
+> §10.3's subspan divide buys back the affine-v drift and some cycles with it.
+>
+> Where the build differs from §10.2-§10.3 as designed, and why:
+>
+> | As built | Why |
+> |---|---|
+> | An 8-byte **lazy strip**, unpacked when u's texel index changes, not a 64-byte per-seg strip table | u is monotonic across a seg, so a column unpacks at most once. The table cost ~2048 cycles/seg (~3.2 ms/frame) for nothing |
+> | u is **lineSetup's fifth line**, exact per column | `lineSetup` already computes `((v1-v0)<<8)/dx` and seeds at `c0`, which *is* u's setup — worth ~190 bytes. §10.3's subspan divide is not needed for u at all |
+> | v's step is **affine per seg**, taken at mid `ry` | This is where §10.3's deferred divide actually shows: v's vertical scale drifts toward a seg's ends. v's *anchor* is exact at every column |
+> | u is the seg's **dominant world axis >> 4**, no texture offset | Continuity across a BSP split for free, and no 11th byte on the seg record — §4's reverted 6-byte experiment is the standing warning |
+> | The family id rides in the **low nibble of `sgRamp`**, reserved and zero through M1 | Same reason: a format bump beats widening the hottest record |
+>
+> **RAM, and it is the phase's real story:** 653 bytes of code against a largest
+> free hole of 192. `tex.asm` is **eleven `.pc` blocks**, one per routine, all
+> entered by `jsr` — the TX_* table in `defs.asm` says which hole each lands in.
+> Three of them run **below `$0801`**, in the free tails of `colTop`, `colBot`
+> and `COLBUF`, where a PRG image cannot load: they are `.pseudopc`'d into
+> `BOOTCODE4` (`$5700`) and copied down by `texBoot`. `probe.py`'s
+> **`check_texcode`** compares those three against the PRG's own images on every
+> `make check`, because `diff` structurally cannot see them — they are outside
+> the image, and the source copies in MATRIX are painted over by the first
+> frame. A column index that ran past 159 now corrupts *code*, and this is the
+> thing that would say so.
+>
+> Two traps, both found the hard way:
+> - **`$98e4` looks like a free 28-byte hole and is `instrument.asm`'s
+>   counters.** They only assemble when `INSTRUMENT = 1`, so putting code there
+>   does not fail the build — it silently breaks `make stats`.
+> - **`INSTRUMENT = 1` does not build**, and did not at `f5f8d93` either
+>   (`doWall overflows into the BSP traversal`). Pre-existing. `make stats` and
+>   `make profile` report frame times but no hit counts until the `Count` macros
+>   are slimmed — which matters, because §4 says a hit count is the only honest
+>   way to price the next small change.
+
 ### 10.1 The insight the format hands us
 
 The chunky buffer is one byte per pixel, `ramp << 4 | intensity`. `chunky2mc`
@@ -723,6 +769,53 @@ not, without a line of new collision code.
    and the validator reports what it dropped, so the map does not silently lose
    a mechanism.
 
+### 11.2a What replaced §11.2, and why *(decided 2026-08-12)*
+
+Two of §11.2's five items dissolved once E1M1's specials were counted, and the
+third was decided by RAM rather than by design.
+
+**E1M1 has 19 special lines out of 475**, and eight of those are scrolling-wall
+specials that move no sector. **Eleven lines do something**: 8 DR doors, 1 WR
+lift, 1 W1 floor, 1 S1 exit. So:
+
+- **Item 2, the seg → linedef reference, is not needed at all.** Neither the
+  11th byte on the seg record nor the geometry search: the whole special set is
+  resident, and activation runs against the *lines*, never against a seg.
+- **Tags and target heights are resolved in `wad2reu.py`**, not at runtime.
+  Doom scans every sector for a tag and every neighbour for a height; the
+  engine has neither a tag array (SECTAB has no room) nor any adjacency. Both
+  are exact for M2 and stop being exact when two thinkers can act on
+  neighbouring sectors, which is M3's problem and is noted in the format doc.
+- **Activation is sector-based, not geometric.** The use key takes the point
+  `USERANGE` units ahead of the eye and fires the door whose sector that point
+  is in; a walkover fires when the player's `camSec` becomes a line's trigger
+  sector. Doom's own test — does the motion segment cross the line, four cross
+  products per line — was written and then not shipped: it needs ~660 B of code
+  against **640 B of RAM under I/O, which is the whole budget** (below). What
+  it costs is fidelity at the edges: a trigger fires on entering the sector
+  rather than on crossing the exact line, and in principle a door could be used
+  through a thin wall. **Logged for M3**, next to §12.1's per-seg opening list,
+  which is deferred for exactly the same reason.
+
+**The RAM this phase runs in is new, and it is the largest free block left.**
+`$DB40-$DBFF` (192 B, the tail of `NODETAB`'s page), `$DE40-$DEFF` (192 B,
+after `SECTAB`) and `$DF00-$DFFF` (256 B, under the REU's own registers) — 640
+bytes that M1 and Phase 8 never touched, against the ~90 bytes of low RAM
+`tex.asm` left in ten fragments. Both the tables and the code live there.
+
+Putting *code* under I/O is not a stunt: every routine in the phase reads or
+writes sector heights at `$DC00`, which only exist with `$01 = BANK_RAM`, so
+the whole feature had to bank anyway. Two consequences that are easy to get
+wrong and are written into `src/lines.asm`'s header:
+
+1. **The window must be `sei`'d, not merely survived.** With I/O banked out the
+   music IRQ writes its SID registers into the RAM underneath them — silently.
+   The CIA latch keeps running, so the tick is late, never lost.
+2. **Code under I/O cannot call code that touches I/O.** Unbanking to reach the
+   REU would make the calling code itself disappear. So anything needing a DMA
+   — fetching the player's subsector for the use scan — happens in the
+   trampoline, before the bank switch.
+
 ### 11.3 The one thing to watch
 
 **A door that closes on the player.** Doom's answer is to reverse the door;
@@ -734,6 +827,37 @@ reverse — not in the collision code.
 *Done when:* the E1M1 start-room door opens on use, closes behind you, and the
 first lift runs; `make framehash` differs between open and closed and is stable
 in each state; `make debug` is clean across a scripted walk that triggers both.
+
+### 11.4 How it landed *(2026-08-12)*
+
+Green on `make check`, `make walktest` and the new **`make doortest`**, which
+judges the phase against SECTAB rather than against a picture: a door opens to
+its target, holds, and returns; a lift fires on entering its trigger sector; a
+use press in another room moves nothing. `make framehash` is **unchanged at
+`27f1774c…`** — the renderer genuinely never learned what a door is (§11.1).
+
+Where it differs from §11.2, beyond §11.2a's sector-based activation:
+
+| §11.2 said | What is there |
+|---|---|
+| the thinker reverses a door closing on the player | **not built.** §11.3's case is still open — E1M1's DR doors reopen on use, which is the escape |
+| — | the whole feature is in the **640 bytes under I/O**, code included, so its three blocks are `.pseudopc` images copied by `lineBoot` (BOOTCODE5). A block at `$dbd0` would extend the PRG over `$d000-$dfff` and make *loading* it a 4 KB write across the I/O space |
+| — | the image header grew **64 → 128 bytes**; block 7 was the eighth descriptor and seven is all the old header held (`mapErr=4`) |
+| — | `IN_USE` is bit 4 because that is both joystick fire's bit in `$dc00` and SPACE's in keyboard row 7, and `IN_SLEFT` is bit 6 because that is Q's — row 7 became a mask with no branches, and the use key cost **−2 bytes** |
+
+Three traps, all of which cost a debugging pass and are commented where they
+bite: `lnHPtr` must preserve X (both callers hold a thinker index in it);
+`segFacing` reloads X from `zWIdx`, so a caller's cursor has to live there; and
+`ldx` sets Z, which silently inverted the use key's edge test.
+
+**`segFacing` tests which side of the seg the player is on, not where they are
+looking**, so a door sharing their subsector opens whichever way they face.
+That is the visible price of §11.2a; M3's geometric line test is what removes
+it.
+
+Frame cost is **not yet measured** — the one `make u64-fps` reading taken
+(`compute 53.8 ms` against §10's 46.7) was collected while the machine was in
+use, so it says nothing. Re-run it idle.
 
 ## 12. Phase 10 — Sprites
 

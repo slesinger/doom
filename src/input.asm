@@ -63,20 +63,19 @@ readInput:
         lda #IN_RIGHT               // D = turn right
         ora zInput
         sta zInput
-!:      lda #%01111111              // row 7: Q(6)
-        sta $dc00
-        lda $dc01
-        and #%01000000
-        bne !+
-        lda #IN_SLEFT               // Q = strafe left
+!:      lda #%01111111              // row 7: Q(6) = strafe left, SPACE(4) = use.
+        sta $dc00                   // Both keys sit on their own zInput bit
+        lda $dc01                   // (defs.asm), so this row is a mask, not a
+        eor #$ff                    // pair of tests.
+        and #IN_ROW7
         ora zInput
         sta zInput
-!:      lda #$ff                    // joystick port 2 (active low)
+        lda #$ff                    // joystick port 2 (active low)
         sta $dc00
         lda $dc00
         eor #$ff
-        and #%00001111              // up/down/left/right -> fwd/back/left/right
-        ora zInput
+        and #%00011111              // up/down/left/right/fire, in that order,
+        ora zInput                  // are zInput's low five bits
         sta zInput
         rts
 
@@ -565,7 +564,8 @@ slideVec:
         rts
 
 //------------------------------------------------------------
-// slideAbs: X = axis -> zA = |t[axis]|.
+// slideAbs: X = axis -> zA = |t[axis]|. `sta` leaves the flags alone, so the
+// sign tested is still the one the load of the high byte set.
 //------------------------------------------------------------
 slideAbs:
         lda zSlTX,x
@@ -573,7 +573,7 @@ slideAbs:
         lda zSlTX+1,x
         sta zA+1
         bpl !+
-        jsr negA
+        jmp negA                    // negA ends in the rts this needs
 !:      rts
 
 //------------------------------------------------------------
