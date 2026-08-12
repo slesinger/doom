@@ -14,6 +14,7 @@
 byte that differs from the loaded image outside the regions the engine is allowed
 to write at runtime. A clean run prints zero unexpected differences.
 """
+import re
 import struct
 import sys
 import time
@@ -142,6 +143,12 @@ MAP_OK = 0x0F47          # `.const mapOK`  in src/defs.asm
 MAP_ERR = 0x0F48         # `.const mapErr` in src/defs.asm
 MAP_SUM = 0x0F49         # `.const mapSum` in src/defs.asm, 4 x 16-bit
 REU_IMAGE = "build/assets.reu"
+
+# The three wall-texturing blocks that run below $0801 -- see check_texcode.
+# The .pseudopc source addresses come out of the symbol file; only the run
+# addresses are named here, and they are TX_SEED/TX_FETCH/TX_VSET in defs.asm.
+SYMFILE = "src/build/main.sym"
+TEXBLOCKS = [("Seed", 0x0770), ("Fetch", 0x03A0), ("VSet", 0x02B0)]
 
 # mapErr values, from src/defs.asm.
 MERR = {0: "none", 1: "no REU", 2: "bad magic", 3: "wrong version",
@@ -297,6 +304,61 @@ def check_music(m):
     return 0
 
 
+def check_texcode(m, prg_path):
+    """Assert the three relocated wall-texturing blocks are still executable.
+
+    tex.asm does not fit in the RAM above $0801: three of its eleven blocks run
+    in the free tails of colTop ($02B0), colBot ($03A0) and COLBUF ($0770),
+    below where a PRG image can load, so they are assembled into MATRIX with
+    .pseudopc and texBoot copies them down at boot (src/defs.asm, BOOTCODE4).
+
+    That puts executable code inside three pages the renderer indexes into
+    every column, and `diff` cannot see it: those addresses are outside the
+    image, so it has nothing to compare them against, and the source copies at
+    $5700 are in MATRIX and painted over by the first frame. So compare live
+    RAM against the .pseudopc images in the PRG *file* instead. A column index
+    that ran past 159 -- the exact bug spanFill's bounds check exists for --
+    now corrupts code rather than a clip window, and this is what would say so.
+
+    The block addresses come from build/main.sym rather than being repeated
+    here, because they move whenever the bin-packing does.
+    """
+    try:
+        sym = open(SYMFILE).read()
+    except OSError as e:
+        print(f"\nTEXCODE: cannot read {SYMFILE} ({e})")
+        return 1
+    labels = dict(re.findall(r"^\.label (\w+)=\$([0-9a-fA-F]+)$", sym, re.M))
+    try:
+        blocks = [(name, int(labels[f"tx{name}Src"], 16),
+                   int(labels[f"tx{name}End"], 16), run)
+                  for name, run in TEXBLOCKS]
+    except KeyError:
+        print("\nTEXCODE: build/main.sym has no txSrc/txEnd labels -- stale?")
+        return 1
+
+    load, img = load_prg(prg_path)
+    bad = []
+    for name, src, end, run in blocks:
+        want = img[src - load:end - load]
+        live = bytes(m.mem_get(run, run + len(want) - 1, bank=1))
+        m.exit_mon()
+        if live != want:
+            n = sum(1 for a, b in zip(want, live) if a != b)
+            first = next(k for k, (a, b) in enumerate(zip(want, live)) if a != b)
+            bad.append(f"{name} at ${run:04X}: {n} of {len(want)} bytes differ, "
+                       f"first at +${first:02X}")
+    if bad:
+        print("\nTEXCODE: *** relocated texture code has been overwritten ***")
+        for line in bad:
+            print(f"  {line}")
+        return 1
+    total = sum(e - s for _, s, e, _ in blocks)
+    print(f"\nTEXCODE: {len(blocks)} relocated blocks intact, {total} bytes "
+          f"({', '.join(f'${r:04X}' for _, _, _, r in blocks)})")
+    return 0
+
+
 def cmd_diff(m, prg_path, settle):
     load, img = load_prg(prg_path)
     m.exit_mon()
@@ -317,7 +379,7 @@ def cmd_diff(m, prg_path, settle):
     for name, n in counts.most_common():
         print(f"  {n:7d}  {name}")
 
-    rc = check_reu(m) | check_map(m) | check_music(m)
+    rc = check_reu(m) | check_map(m) | check_music(m) | check_texcode(m, prg_path)
 
     bad = [d for d in diffs if region(d[0]).startswith("***")]
     print(f"\nunexpected differences: {len(bad)}")

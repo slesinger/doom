@@ -285,43 +285,10 @@ sdiv:
 }
 
 spanFill:
-        lda zSY1                    // clamp the run's far end to the last
-        cmp #177                    // valid row (176 = 22 cell-rows * 8):
-        bcc !+                      // otherwise the cell loop below steps the
-        lda #176                    // pointer past rowCell's 22 entries, one
-        sta zSY1                    // full cell at a time, unbounded
-!:      sec
-        sbc zSY0
-        beq !nul+
-        bcs !go+
-!nul:   rts
-!go:    sta zSCnt
-        :CountA(cntPix)             // A is still the run length
-        txa
+        txa                         // X is the caller's; spanPrep wants it
         pha
-        ldx zSX                     // bounds-check before either table lookup:
-        cpx #160                    // an out-of-range index would read past
-        bcc !ok+                    // xOfs/rowCell into whatever follows them.
-!bad:   jmp spanEnd                 // spanEnd is out of branch range from here
-!ok:    lda zSY0                    // now that the cell step is inlined below
-        lsr
-        lsr
-        lsr
-        cmp #22
-        bcs !bad-
-        tay                         // Y = cell row of first pixel (bounds-checked)
-        lda xOfsLo,x
-        clc
-        adc rowCellLo,y
-        sta zSPtr
-        lda xOfsHi,x
-        adc rowCellHi,y
-        sta zSPtr+1                 // ptr = cell base incl. x&3 offset
-        lda zSY0
-        and #7
-        asl
-        asl
-        tay                         // Y = (row&7)*4, in-cell byte offset
+        jsr spanPrep
+        bcc spanEnd
         lda zSCol
         cpy #0
         beq spanCells               // aligned start: no head
@@ -381,6 +348,60 @@ spanEnd:
         pla
         tax
 spanDone:
+        rts
+
+//------------------------------------------------------------
+// spanPrep: everything both span fills need before their first store.
+//
+//   carry clear -> the run is empty, draw nothing
+//   carry set   -> zSCnt = length, zSPtr = the cell the run starts in,
+//                  Y = the in-cell byte offset of its first row
+//
+// Shared rather than duplicated because spanTex is otherwise the same sixty
+// bytes of clamping, bounds checks and table lookups, and there is nowhere in
+// this machine to put a second copy of them (src/render/tex.asm). It costs the
+// flat path a jsr/rts -- 12 cycles against a span that averages eleven pixels
+// at ~22 cycles each.
+//
+// Clobbers X, which is why spanFill saves the caller's before the call.
+//------------------------------------------------------------
+spanPrep:
+        lda zSY1                    // clamp the run's far end to the last
+        cmp #177                    // valid row (176 = 22 cell-rows * 8):
+        bcc !+                      // otherwise the cell loop steps the
+        lda #176                    // pointer past rowCell's 22 entries, one
+        sta zSY1                    // full cell at a time, unbounded
+!:      sec
+        sbc zSY0
+        beq !nul+
+        bcs !go+
+!nul:   clc
+        rts
+!go:    sta zSCnt
+        :CountA(cntPix)             // A is still the run length
+        ldx zSX                     // bounds-check before either table lookup:
+        cpx #160                    // an out-of-range index would read past
+        bcs !nul-                   // xOfs/rowCell into whatever follows them
+        lda zSY0
+        lsr
+        lsr
+        lsr
+        cmp #22
+        bcs !nul-
+        tay                         // Y = cell row of first pixel
+        lda xOfsLo,x
+        clc
+        adc rowCellLo,y
+        sta zSPtr
+        lda xOfsHi,x
+        adc rowCellHi,y
+        sta zSPtr+1                 // ptr = cell base incl. x&3 offset
+        lda zSY0
+        and #7
+        asl
+        asl
+        tay                         // Y = (row&7)*4, in-cell byte offset
+        sec
         rts
 mathCodeEnd:                        // main.asm asserts on this, not on `*`:
                                     // the block below assembles into low RAM.

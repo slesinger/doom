@@ -105,6 +105,11 @@ bootMain:
         sta $d021
         sta backBuf
         jsr clearHudRows
+        // Three of the wall texturing blocks run below $0801, where a PRG image
+        // cannot load them. They are assembled into MATRIX with .pseudopc and
+        // copied down here, before anything calls them -- see BOOTCODE4 in
+        // defs.asm and the relocator at the top of src/render/tex.asm.
+        jsr texBoot
         lda #0
         sta frameCnt
         sta frameCnt+1
@@ -255,4 +260,5 @@ clearHudRows:
 
 #import "render/walls.asm"
 #import "render/bsp.asm"
+#import "render/tex.asm"
 #import "clock.asm"

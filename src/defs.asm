@@ -55,6 +55,10 @@
 .const ftHist  = $02a8              // 4 x 16-bit: frames that cost 1, 2, 3, 4+
                                     // raster frames. $02a8-$02af
 
+// The wall texture working set is in zero page -- see the $c4 block below.
+// It was going to live here, in colTop's tail, and moving it out is what
+// widened this page's free tail to the 80 bytes texVSet is assembled into.
+
 // BSP descent stack, in the free RAM below MATRIX -- the address the portal
 // stack used to occupy. One 16-bit entry (a raw child word, subsector bit and
 // all) per node on the path from the root down to the leaf being rendered, so
@@ -516,10 +520,16 @@
 .const zBTop1  = $34
 .const zBBot0  = $36
 .const zBBot1  = $38
-.const zWallByte = $3a
-.const zBack   = $3b
-.const zWIdx   = $3c
-.const zWCnt   = $3d
+// Line 4 is the texture's u, in world units along the seg's dominant axis.
+// It is a "line" only in lineSetup's sense -- a quantity that is linear in
+// screen x and therefore wants the same divide-once-then-accumulate treatment
+// as the four row lines. Giving it index 4 is what makes the whole of texU
+// disappear: lineSetup already computes ((v1-v0) << 8)/dx and seeds the
+// accumulator at column c0, which is exactly the u setup, and clampAcc never
+// looks at line 4. It is also why zWallByte and its three neighbours moved to
+// $b0 -- $3a-$3d is where zTop0 + 4*4 lands, and the layout is load-bearing.
+.const zU0     = $3a
+.const zU1     = $3c
 .const zSecId  = $3e
 .const zWIdx2  = $3f        // seg's byte offset in SEGBUF, live inside doWall
 // The node index sideOf is working on. Shares zWIdx2 deliberately: one is live
@@ -576,6 +586,58 @@
                             // memory rather than in X because mul8 and udiv
                             // both want X for themselves.
 
+//------------------------------------------------------------
+// zero page — the line steps and the four renderer bytes they displaced
+// ($a6-$b3), and the wall texture state ($b4-$c1).
+//
+// Nothing above $a5 was allocated before M2's texturing: the engine's own
+// block is $02-$8f and $90 upwards has been untouched since boot, which is
+// what makes a five-line lineSetup affordable at all. The music interrupt
+// touches no zero page (src/music.asm), so there is no handler to agree with.
+//------------------------------------------------------------
+.const stepTop = $a6
+.const stepBot = $a8
+.const stepBT  = $aa
+.const stepBB  = $ac
+.const stepU   = $ae        // line 4: world units of u per screen column, 8.8
+
+.const zWallByte = $b0      // moved out of $3a-$3d to make room for zU0/zU1
+.const zBack   = $b1
+.const zWIdx   = $b2
+.const zWCnt   = $b3
+
+// Wall texture state, live from texSetup to the end of the seg's column loop.
+.const zTexOn  = $b4        // 0 = draw this seg flat, as M1 did
+.const zTexRamp = $b5       // the surface's ramp, already in the high nibble
+.const zTexBias = $b6       // depth intensity - 8, signed: the texel's bias
+.const zCurU   = $b7        // the u column texStrip currently holds, or $ff
+.const zVStep  = $b8        // texels of v per screen row, 8.8, negative
+.const zVAcc   = $ba        // v inside a span, 8.8, integer part masked to 0-7
+.const zVTop   = $bc        // v at the front ceiling: the anchor every span in
+                            // the seg measures from, exact in every column
+.const zClipT  = $be        // near-plane clip: t, and which endpoint moved.
+.const zClipW  = $bf        // 0 = neither, $01 = endpoint 0, $80 = endpoint 1
+.const zTexAx  = $c0        // 0 = x, 2 = y: the endpoint texUEnds is correcting.
+                            // In memory rather than in X for the same reason
+                            // zSlAx is -- mul8 wants X for itself.
+
+// The wall texture working set, $c4-$eb. In zero page and not in colTop's
+// tail, which is where it was first put, for two reasons: `lda texStrip,x` in
+// spanTex's inner loop is 3 cycles here against 4 there, over every wall pixel
+// on the screen; and moving it out of $02b0 is what left an 80-byte hole big
+// enough to assemble texVSet into. The renderer allocates $02-$8f and nothing
+// above $a5 was ever claimed, so this is the last of the free zero page rather
+// than a byte taken from anything.
+//
+// TEXBUF is one family's 32-byte tile, DMA'd per seg (docs/reu-format.md §4.7).
+// texStrip is one u column of it, unpacked to a byte per texel with the depth
+// bias applied and the ramp already or'd in -- so the per-pixel cost inside
+// spanTex is one indexed load and nothing else. Eight bytes, not the whole
+// 64-byte tile, because u is monotonic across a seg: the column loop unpacks
+// the column it needs when u changes and never comes back to it.
+.const TEXBUF   = $c4               // 32 B, nibble-packed, column-major
+.const texStrip = $e4               // 8 B, one u column, finished chunky bytes
+
 
 //------------------------------------------------------------
 // zero page — converter ($40-$4a)
@@ -622,14 +684,14 @@
 
 // 24-bit accumulators (frac, int lo, int hi) + 16-bit steps.
 // clampAcc indexes accTop+0/3/6/9; lineSetup uses accTop+i*3, stepTop+i*2.
+// Five lines, not four: line 4 is the texture u (see zU0). That is why the
+// steps no longer follow the accumulators -- accTop..accU now runs $68-$76,
+// over the two bytes stepTop used to occupy.
 .const accTop  = $68
 .const accBot  = $6b
 .const accBT   = $6e
 .const accBB   = $71
-.const stepTop = $74
-.const stepBot = $76
-.const stepBT  = $78
-.const stepBB  = $7a
+.const accU    = $74
 
 // Back sector heights, already relative to the eye. Filled by secBack from the
 // table under the I/O space, so that doWall and the collision test read them
@@ -659,11 +721,88 @@
 // The player spawn is no longer a constant: it comes from MAPINFO, which
 // wad2reu.py fills from the map's THINGS type 1 (docs/reu-format.md §4.1, §7).
 
-.const WALLS2         = $9d80      // walls helper routines after math code
+.const WALLS2         = $9d88      // walls helper routines after math code
+
+//------------------------------------------------------------
+// Wall texturing (src/render/tex.asm), in ELEVEN pieces.
+//
+// 653 bytes of code, and the largest hole in the machine is 192. That is the
+// whole story of this block: every routine in tex.asm is entered by jsr and
+// returns, so it can be assembled anywhere, and each one is put in the
+// smallest hole it fits. Nothing here is a design; it is a bin-packing.
+//
+// Three of the eleven are BELOW $0801 and therefore outside the PRG image,
+// which cannot load them. They are assembled with .pseudopc inside a boot
+// block and copied down before the first frame, exactly as the music IRQ
+// handler is copied up to MUSCODE. They are marked (boot) below.
+//
+//   TX_UENDS  $bf40-$bfff  192  182  texUEnds, texMulT, spanTex
+//   TX_SEED   $0770-$07ff  144  124  vSeed, texSetup            (boot)
+//   TX_FETCH  $03a0-$03ff   96   81  texFetch                   (boot)
+//   TX_VSET   $02b0-$02ff   80   69  texVSet                    (boot)
+//   TX_SHADE  $0cb3-$0cff   77   64  wallShade
+//   TX_UADV   $cfdb-$cfff   37   33  uAdvance
+//   TX_PIX    $9fe1-$9fff   31   26  texPix
+//   TX_COL    $cdda-$ce07   46   27  texCol
+//   TX_UPD    $0de8-$0dff   24   22  texUpd
+//   TX_WSPAN  $83e8-$83ff   24   13  wallSpan
+//   TX_CLIP   $0eef-$0eff   17   12  texClip0/texClip1
+//
+// Two of those need saying out loud:
+//
+// $bf40 is the gap between BITMAP0's last byte ($bf3f -- a bitmap is 8000
+// bytes, not 8192) and SCREEN1. It is RAM in both banking states the engine
+// uses and the VIC never fetches it, and it was simply unclaimed.
+//
+// $83e8 is the same gap at SCREEN0: the video matrix is 1000 bytes and ends
+// at $83e7. The VIC does read $83f8-$83ff as sprite pointers even with every
+// sprite disabled -- but it only reads them, and the engine has no sprites, so
+// what those eight bytes contain is nobody's business. The same 24 bytes exist
+// at $c3e8 behind SCREEN1 and are still free.
+//
+// texCol is the odd one out: it is in doWall's own tail, which only exists
+// because wallShade moved out to TX_SHADE. The 28-byte hole at $98e4 would
+// have fit it better and is where it was first put -- but that is where
+// instrument.asm's nine counters live, and they are only *assembled* in an
+// INSTRUMENT build, so the collision does not fail the build. It silently
+// breaks `make stats` instead, by pointing the host at code.
+//
+// Each block's .errorif in tex.asm names what it would overflow into, so
+// growing one past its hole fails the build by name rather than by symptom.
+//------------------------------------------------------------
+.const TX_UENDS  = $bf40
+.const TX_SEED   = $0770
+.const TX_FETCH  = $03a0
+.const TX_VSET   = $02b0
+.const TX_SHADE  = $0cb3
+.const TX_UADV   = $cfdb
+.const TX_PIX    = $9fe1
+.const TX_COL    = $cdda
+.const TX_UPD    = $0de8
+.const TX_WSPAN  = $83e8
+.const TX_CLIP   = $0eef
+
+.const TX_UENDS_END = $c000
+.const TX_SEED_END  = $0800
+.const TX_FETCH_END = $0400
+.const TX_VSET_END  = $0300
+.const TX_SHADE_END = $0d00
+.const TX_UADV_END  = $d000
+.const TX_PIX_END   = $a000
+.const TX_COL_END   = $ce08
+.const TX_UPD_END   = $0e00
+.const TX_WSPAN_END = $8400
+.const TX_CLIP_END  = $0f00
+
+// The fourth boot-only block: the .pseudopc images of TX_SEED, TX_FETCH and
+// TX_VSET, plus the three copy loops that put them where they run. Same
+// argument as BOOTCODE/MUSBOOT/BOOTCODE3 -- MATRIX is 28 KB of scratch until
+// the first frame. ~320 B, after BOOTCODE3's $5500-$564a.
+.const BOOTCODE4 = MATRIX + $4700   // $5700
 
 // The millisecond clock and the frame pacer, in the gap between the walls
 // helpers and BITMAP0. 114 B, $9f8e-$9fff.
-.const CLKCODE        = $9f8e
+.const CLKCODE        = $9f96
 
 // Free-running 16-bit frame counter, incremented once per completed flip.
 // Nothing in the engine reads it; it exists so that a host can DMA-read it

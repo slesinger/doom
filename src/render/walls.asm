@@ -54,6 +54,9 @@ done:   sta acc+2
 //------------------------------------------------------------
 doWall:
         stx zWIdx2
+        lda #0                      // no endpoint has been clipped yet; texUEnds
+        sta zClipW                  // reads this to decide whether u needs the
+                                    // same correction rx0/rx1 got below
         // ---- endpoint 0 -> camera space
         lda sgX0,x
         sec
@@ -147,6 +150,7 @@ doWall:
         sbc zRY0+1
         sta zA+1
         jsr clipT                   // zT+2 = t (0.8 fixed)
+        jsr texClip0                // u's endpoint 0 moves by the same t
         lda zRX1                    // rx0 += (rx1-rx0)*t >> 8
         sec
         sbc zRX0
@@ -182,6 +186,7 @@ doWall:
         sbc zRY1+1
         sta zA+1
         jsr clipT
+        jsr texClip1                // u's endpoint 1 moves by the same t
         lda zRX0                    // rx1 += (rx0-rx1)*t >> 8
         sec
         sbc zRX1
@@ -286,52 +291,10 @@ doWall:
         beq !scan-
         rts
 !visible:
-        // ---- wall shading byte from mid distance: light = (ry0+ry1)>>7
-        lda zRY0
-        clc
-        adc zRY1
-        sta zNum
-        lda zRY0+1
-        adc zRY1+1
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        lsr
-        ror zNum
-        // A is now the high byte of (ry0+ry1)>>7 and zNum the low one. Test A
-        // with tax, not with the `sta` this used to do: sta sets no flags, so
-        // the bne was reading the last `ror zNum` instead and every wall past
-        // 128 units came out at minimum intensity. Depth shading has never
-        // actually been visible until now.
-        tax
-        bne !dark+
-        lda #15
-        sec
-        sbc zNum
-        bcs !+
-!dark:  lda #1
-!:      cmp #2
-        bcs !+
-        lda #2                      // minimum visibility
-!:      ldx zWIdx2
-        // sgRamp is %rrrrtttt as of format 4: the low nibble is the texture
-        // family, not part of the shading byte, so it has to be masked off
-        // before the depth intensity goes in. Through M1 it was reserved and
-        // zero and this was a bare `ora sgRamp,x`.
-        sta zWallByte
-        lda sgRamp,x
-        and #$f0
-        ora zWallByte
-        sta zWallByte
+        // ---- wall shading byte from mid distance: light = (ry0+ry1)>>7.
+        // Out of line at TX_SHADE since M2's texturing: it runs once per seg,
+        // and this segment ran out of room for the texture hooks (tex.asm).
+        jsr wallShade
         // ---- rows at both ends: top (ceil) and bot (floor) lines
         lda zDzC
         sta zA
@@ -428,6 +391,11 @@ doWall:
         jsr lineSetup
         // ---- per-column loop
 !colloop:
+        // The texture's tile, u's line and v's step and anchor -- or zTexOn = 0
+        // and every wall span below falls through to the flat spanFill M1 used.
+        // After the lineSetup calls: u is line 4 and texSetup makes that call
+        // itself, and it needs zDzC, which is this seg's.
+        jsr texSetup
         ldx zC0
 colLoopHead:
 !col:   stx zSX
@@ -440,7 +408,8 @@ colLoopHead:
         bne !open+
 !closed:
         jmp !advance+
-!open:  ldy #0                      // clamp top line -> zTW
+!open:  jsr texUpd                  // reload texStrip if u's texel moved
+        ldy #0                      // clamp top line -> zTW
         jsr clampAcc
         sta zTW
         sta zWT                     // bot line clamps below wall top
@@ -471,7 +440,7 @@ colLoopHead:
         sta zSY1
         lda zWallByte
         sta zSCol
-        jsr spanFill
+        jsr wallSpan
         ldx zSX
         lda #176                    // close the column for good
         sta colTop,x
@@ -500,14 +469,14 @@ colLoopHead:
         sta zSY1
         lda zWallByte
         sta zSCol
-        jsr spanFill
+        jsr wallSpan
         lda zBB                     // lower wall [zBB, zBW)
         sta zSY0
         lda zBW
         sta zSY1
         lda zWallByte
         sta zSCol
-        jsr spanFill
+        jsr wallSpan
         ldx zSX
         lda zBT                     // narrow the window to the opening
         sta colTop,x
@@ -525,7 +494,8 @@ colAdvance:
         beq !+
         :AddStep(accBT, stepBT)
         :AddStep(accBB, stepBB)
-!:      ldx zSX
+!:      jsr uAdvance                // u keeps pace with screen x on closed
+        ldx zSX                     // columns too -- it is a function of x
         cpx zC1
         beq !colsDone+
         inx
