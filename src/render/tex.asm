@@ -145,16 +145,16 @@ texMulT:
 spanTex:
         jsr spanPrep                // shared with spanFill -- math.asm
         bcc !rts+
-        ldx zVAcc+1                 // X = v, masked to 0-7 by vSeed
+        ldx zVAcc+1                 // X = v, masked to 0-15 by vSeed
 !px:    lda texStrip,x
         sta (zSPtr),y
-        lda zVAcc                   // v += vStep, mod 8 texels: masking the
+        lda zVAcc                   // v += vStep, mod 16 texels: masking the
         clc                         // integer part every step is exact, and
         adc zVStep                  // holds for the negative step vStep always
         sta zVAcc                   // is -- v falls as the row rises
         txa
         adc zVStep+1
-        and #7
+        and #15
         tax
         dec zSCnt
         beq !rts+
@@ -258,7 +258,7 @@ vSeed:
         sta zVAcc
         lda zVAcc+1
         adc zVTop+1
-        and #7
+        and #15
         sta zVAcc+1
         rts
 !zero:  lda zVTop
@@ -317,43 +317,33 @@ txSeedEnd:
 txFetchSrc:
 .pseudopc TX_FETCH {
 //------------------------------------------------------------
-// texFetch — A = texture family 1-15. DMA its tile into TEXBUF and split the
-// shading byte into the ramp and the bias the unpack applies.
+// texFetch — A = texture family 1-15. Point texCol at that family's resident
+// tile, and split the shading byte into the ramp and the bias the unpack
+// applies.
 //
-// Requires I/O banked in, which is doWall's own state. The music interrupt may
-// land in the middle of the register writes below and issue a DMA of its own;
-// it saves and restores $DF02-$DF0A for exactly that reason (defs.asm's
-// MUSREU), so this needs no `sei` around it.
+// **Stage A DMA'd the tile here, per seg, and this is what replaced it.** A
+// 16x16 tile is 128 bytes; at ~68 walls a frame, re-fetching one per seg is
+// 8.7 KB/frame = 8.7 ms of REU time on hardware, against a whole remaining
+// budget of ~13. The tiles are resident at WALLTILE (defs.asm) and all that is
+// left per seg is a 16-bit address into a self-modified operand -- which also
+// retires Stage A's own 2.2 KB/frame of tile DMA, ~2.2 ms, before the finer
+// tile has cost anything.
+//
+// The name is kept because eleven `.pc` blocks, defs.asm's TX_* table, the
+// probe's relocated-block check and two documents all refer to it by name, and
+// nothing about *what the seg's caller wants* changed.
 //------------------------------------------------------------
 texFetch:
-        sta zT+2                    // family << 5 -> (zT hi : zT+2 lo)
-        lda #0
-        sta zT
-        ldx #5
-!:      asl zT+2
-        rol zT
-        dex
-        bne !-
-        lda zT+2
+        lsr                         // family >> 1, and family bit 0 into C:
+        tax                         // the tile is 128 B, so bit 0 is the $80
+        lda #0                      // and the rest is the page
+        bcc !+
+        lda #$80
+!:      sta txColBase+1
+        txa
         clc
-        adc miTexBase
-        sta REU_REUADDR
-        lda zT
-        adc miTexBase+1
-        sta REU_REUADDR+1
-        lda #0
-        adc miTexBase+2
-        sta REU_BANK
-        lda #<TEXBUF
-        sta REU_C64ADDR
-        lda #>TEXBUF
-        sta REU_C64ADDR+1
-        lda #32
-        sta REU_LENGTH
-        lda #0
-        sta REU_LENGTH+1
-        lda #REU_FETCH
-        sta REU_COMMAND
+        adc #>WALLTILE
+        sta txColBase+2
         lda zWallByte               // the ramp goes back on every texel
         and #$f0
         sta zTexRamp
@@ -373,14 +363,16 @@ txVSetSrc:
 //------------------------------------------------------------
 // texVSet — v's step and the anchor every span in this seg measures from.
 //
-//   v(row) = z(row) / 16,  z(row) = camZ + (88 - row) * ry / VFOCAL
+//   v(row) = z(row) / 8,  z(row) = camZ + (88 - row) * ry / VFOCAL
 //
-// so v falls by ry/2560 texels per row, which in 8.8 is ry/10, negative. Taken
+// so v falls by ry/1280 texels per row, which in 8.8 is ry/5, negative. Taken
 // at the seg's mid ry and held for the seg -- see the file header on what that
 // costs and what fixing it would.
 //
-// The anchor is v at the front ceiling, in 8.8 and mod 8 texels: one texel is
-// 16 world units, so v in 8.8 is z << 4, and mod 8 is the low eleven bits.
+// The anchor is v at the front ceiling, in 8.8 and mod 16 texels: one texel is
+// 8 world units, so v in 8.8 is z << 5, and mod 16 is the low twelve bits. The
+// shift overflowing 16 bits is not a case: everything above bit 11 is masked
+// off on the next instruction, and a shift is congruent mod 65536.
 //------------------------------------------------------------
 texVSet:
         lda camZ
@@ -390,13 +382,13 @@ texVSet:
         lda camZ+1
         adc zDzC+1
         sta zVTop+1
-        ldx #4
+        ldx #5
 !:      asl zVTop
         rol zVTop+1
         dex
         bne !-
         lda zVTop+1
-        and #7
+        and #15
         sta zVTop+1
         lda zRY0                    // zA = (ry0 + ry1) >> 1, 17 bits wide
         clc
@@ -407,9 +399,9 @@ texVSet:
         ror
         sta zA+1
         ror zA
-        lda #<6554                  // 6554/65536 = 0.1000: ry/10
+        lda #<13107                 // 13107/65536 = 0.2000: ry/5
         sta zB
-        lda #>6554
+        lda #>13107
         sta zB+1
         jsr umul16
         lda #0
@@ -528,28 +520,40 @@ texPix:
 //------------------------------------------------------------
 .pc = TX_COL "tex: strip unpack"
 //------------------------------------------------------------
-// texCol — A = u (0-7): unpack that column of the packed tile into texStrip.
+// texCol — A = u*8 (0, 8, ... 120): unpack that column into texStrip.
 //
 // The tile is column-major (docs/reu-format.md §4.7) precisely so that this is
-// four consecutive bytes: byte u*4+k holds v=2k in its high nibble and v=2k+1
-// in its low one.
+// eight consecutive bytes: byte u*8+k holds v=2k in its high nibble and v=2k+1
+// in its low one. txColBase's operand is the family's tile, written by
+// texFetch once per seg; X never exceeds 127 so no page ever crosses.
+//
+// **A is u*8 and not u** because texUpd's mask already produces it: one texel
+// is 8 world units and the tile is 16 wide, so `accU & $78` *is* the column's
+// byte offset, with no shift at either end. Three bytes here and three there,
+// which is what TX_COL's 27-byte hole had to find from somewhere.
+//
+// The packed byte is held on the stack rather than loaded twice, which is
+// three cycles a pair against a second operand to keep patched -- and TX_COL
+// is 46 bytes, which is the constraint that decides this kind of question in
+// this engine.
 //------------------------------------------------------------
 texCol:
-        asl
-        asl
-        tax                         // X = u*4, the column's first packed byte
+        tax                         // X = u*8, the column's first packed byte
         ldy #0
-!b:     lda TEXBUF,x
+!b:
+txColBase:
+        lda WALLTILE,x              // self-mod: WALLTILE + family*128
+        pha
         lsr
         lsr
         lsr
         lsr
         jsr texPix                  // even v
-        lda TEXBUF,x
+        pla
         and #$0f
         jsr texPix                  // odd v
         inx
-        cpy #8
+        cpy #16
         bcc !b-
         rts
 
@@ -563,12 +567,13 @@ texCol:
 //------------------------------------------------------------
 texUpd: lda zTexOn
         beq !rts+
-        lda accU+1                  // u's integer part is world units, and one
-        and #$70                    // texel is 16 of them: (u >> 4) & 7
-        lsr
-        lsr
-        lsr
-        lsr
+        lda accU+1                  // u's integer part is world units and one
+        and #$78                    // texel is 8 of them, so bits 3-6 left in
+                                    // place are ((u >> 3) & 15) * 8 -- which is
+                                    // the byte offset of the column in the tile
+                                    // and what texCol wants. zCurU holds it in
+                                    // the same form; $ff is still "none", since
+                                    // no masked value can be it.
         cmp zCurU
         beq !rts+
         sta zCurU

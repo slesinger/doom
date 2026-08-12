@@ -51,6 +51,26 @@ ALLOWED = [
     (0x9B60, 0x9D5F, "math code (self-mod mul8)"),
 ]
 
+# texCol's tile pointer (the operand of txColBase, src/render/tex.asm), added
+# to ALLOWED at import from the symbol file rather than written here as an
+# address. Written once per textured seg by texFetch, which is what replaced
+# Stage A's per-seg tile DMA when the tiles went resident at 16x16.
+#
+# Two bytes and not the whole TX_COL block: they are the only bytes in it that
+# may legitimately change, and anything else moving there is code being
+# overwritten -- which is precisely what this diff exists to catch. Derived
+# from the symbol because TX_COL's address moves whenever the bin-packing does,
+# and a stale constant here would silently stop covering the block.
+def _selfmod_from_syms():
+    try:
+        sym = open(SYMFILE).read()
+    except OSError:
+        return
+    m = re.search(r"^\.label txColBase=\$([0-9a-fA-F]+)$", sym, re.M)
+    if m:
+        a = int(m.group(1), 16) + 1             # skip the opcode: the operand
+        ALLOWED.append((a, a + 1, "texCol tile pointer (self-mod)"))
+
 
 def region(addr):
     for lo, hi, name in ALLOWED:
@@ -148,6 +168,7 @@ REU_IMAGE = "build/assets.reu"
 # The .pseudopc source addresses come out of the symbol file; only the run
 # addresses are named here, and they are TX_SEED/TX_FETCH/TX_VSET in defs.asm.
 SYMFILE = "src/build/main.sym"
+_selfmod_from_syms()            # ALLOWED's one symbol-derived entry, above
 TEXBLOCKS = [("Seed", 0x0770), ("Fetch", 0x03A0), ("VSet", 0x02B0)]
 # `.const LINECODE/LINECODE2/LINECODE3`, and the labels lines.asm gives their
 # .pseudopc images. All three are under the I/O space.

@@ -108,7 +108,7 @@ same map, and it has already been out of date once (`IMPLEMENTATION_PLAN.md` §9
 | 3 | `SSECDATA` | no — streamed | — | 30336 B |
 | 4 | `NODESPH` | no — streamed | — | 1920 B |
 | 5 | `MUSIC` | no — streamed | — | 405136 B |
-| 6 | `WALLTEX` | no — streamed | — | 512 B |
+| 6 | `WALLTEX` | no — streamed, read once at boot | `$7600` | 2048 B |
 | 7 | `LINEDEFS` | no — streamed, read once at boot | `$DB40` | 80 B |
 | 8 | `HUDBG` | no — streamed, read once at boot | — | 3840 B |
 | 9 | `HUDFONT` | no — streamed, read once at boot | — | 1280 B |
@@ -386,25 +386,41 @@ right because the CIA runs at 1 MHz whatever the CPU's turbo setting is.
 
 ### 4.7 `WALLTEX` — the wall texture tiles
 
-Block 6, never resident, at `texReuBase` (MAPINFO +28). Sixteen families of 32
-bytes; family `f` is at `texReuBase + (f << 5)`. Zero in `texReuBase` means the
-image carries none, which is not an error — the engine then draws walls flat,
-exactly as M1 did.
+Block 6, at `texReuBase` (MAPINFO +28). Sixteen families of 128 bytes; family
+`f` is at `texReuBase + (f << 7)`. Zero in `texReuBase` means the image carries
+none, which is not an error — the engine then draws walls flat, exactly as M1
+did.
 
-A family is one **8×8 grid of intensity nibbles**, nibble-packed **column-major**:
-four bytes per `u` column, `v = 0` in the first byte's high nibble, `v = 1` in
-its low one, and so on down the column.
+**Format 6 took the tile from 8×8 to 16×16 and the block from 512 B to 2048 B**
+(`IMPLEMENTATION_PLAN.md` §10.6). The descriptor still says *streamed*, but the
+engine reads the whole block **once, at boot**, into `WALLTILE` — `texLoad` in
+`src/mapload.asm`, the same treatment `LINEDEFS` gets and for the same reason:
+a resident descriptor carries a load *page* and is checked against tables that
+are `MAPNBLK` wide, which is not worth changing for a block read once.
+
+Residency is what makes the size possible. Stage A re-fetched a family's tile
+per seg; at 128 B a tile that is ~1 KB … 8.7 KB of REU traffic per frame, i.e.
+whole milliseconds at the REU's flat 1 byte/µs. Resident, the per-frame cost is
+zero and Stage A's own ~1 KB/frame goes away with it.
+
+A family is one **16×16 grid of intensity nibbles**, nibble-packed
+**column-major**: eight bytes per `u` column, `v = 0` in the first byte's high
+nibble, `v = 1` in its low one, and so on down the column.
 
 | Byte in family | Holds |
 |---|---|
-| `u*4 + 0` | `v0 << 4 \| v1` |
-| `u*4 + 1` | `v2 << 4 \| v3` |
-| `u*4 + 2` | `v4 << 4 \| v5` |
-| `u*4 + 3` | `v6 << 4 \| v7` |
+| `u*8 + 0` | `v0 << 4 \| v1` |
+| `u*8 + 1` | `v2 << 4 \| v3` |
+| … | … |
+| `u*8 + 7` | `v14 << 4 \| v15` |
 
-Column-major because the engine unpacks **one `u` column at a time** into an
-eight-byte strip and then walks `v` down the screen inside it: `u` is constant
+Column-major because the engine unpacks **one `u` column at a time** into a
+sixteen-byte strip and then walks `v` down the screen inside it: `u` is constant
 for a screen column, so the strip is selected once and indexed per pixel.
+
+The engine's `u` is `accU & $78` — the column's *byte offset* in the tile, with
+no shift at either end, which is only true because a texel is 8 world units and
+the tile is 16 wide.
 
 **The tile modulates intensity and never touches the ramp.** The chunky byte is
 `ramp << 4 | intensity` and a 4×8 multicolor cell holds three colours plus
@@ -419,7 +435,13 @@ so a texel of 8 leaves M1's shading byte exactly as it was. Keeping the depth
 term as the base rather than the texture's own brightness is what stops a dark
 texture from going black at distance.
 
-Tiles are the 8×8 box downsample of a real WAD texture's luminance, quantised to
+One texel is **8 world units** on both axes (`TEX_UNITS_SHIFT`), so a tile
+repeats every 128 units — the same world scale Stage A had at 16 units over 8
+texels. The tile got finer; the mapping did not move, and `u` stays a plain
+world coordinate so it is continuous across a BSP seg split with no offset in
+the seg record.
+
+Tiles are the 16×16 box downsample of a real WAD texture's luminance, quantised to
 ±4 around 8 with a gain that saturates at ±25 luma units — so a flat texture
 modulates less than a high-contrast one instead of every tile being normalised
 to full swing. `wad2reu.py`'s `FAMILY_TEXTURE` names the texture each family is

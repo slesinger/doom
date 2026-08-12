@@ -19,23 +19,24 @@ deliberately differs from the target architecture in the design documents, the
 difference is called out in a *Deviation* note. Sections marked **(planned)**
 describe stages that do not exist yet.
 
-> **Status caveat — read this before §5, §7, §11 or §12.1.** This document was
-> written against the *portal* renderer and the hand-built three-sector test
-> map. Milestone 1 replaced both with a BSP walk over real E1M1 geometry, and
-> four sections have not followed it: **§7 describes a traversal that no longer
-> exists**, §11 traces a frame through a map that was deleted, and §12.1's
-> budget is that map's. §5 was reconciled on 2026-08-12 along with §12.2 and
-> §12.3, which are current. **§8, §9 and §10 — per-wall geometry, the column
-> loop, the converter — the BSP change did not touch, and they remain the
-> reason to read this.** `IMPLEMENTATION_PLAN.md` §9.4 has the section-by-
+> **Status caveat — read this before §11.** This document was written against
+> the *portal* renderer and the hand-built three-sector test map, and against
+> flat-shaded walls. Milestone 1 replaced the portal traversal with a BSP walk
+> over real E1M1 geometry; Milestone 2's Stage A (2026-08-12) replaced flat
+> walls with intensity-textured ones. **§5, §7, §8.7, §9 and §12.1-§12.3 were
+> reconciled on 2026-08-12 and are current.** Only **§11** still traces a frame
+> through the deleted test map at flat shading — retracing it against real
+> E1M1 geometry needs a live capture (the tooling `debug-notes/` used), which
+> is out of scope for a documentation-only pass; the numbers there are kept as
+> a worked example of the *method*, not as current state. `IMPLEMENTATION_PLAN.md` §9.4 has the section-by-
 > section accounting.
 >
 > [§13](#13-known-defects-and-unenforced-invariants) lists the defects that were
 > fixed to get to a visible frame and the invariants that are still unenforced;
 > its zero-page appendix is also portal-era. The cycle counts in §12.1 are
 > static instruction counts, but the frame rate is measured: the engine now
-> runs on a real C64 Ultimate at **16.63 fps with compute at 37.6-38.6 ms
-> against a 59.85 ms deadline** (§12.3), every frame on the three-raster-frame
+> runs on a real C64 Ultimate at **16.63 fps with compute at 46.7 ms against
+> a 59.85 ms deadline** (§12.1, §12.3), every frame on the three-raster-frame
 > crossing.
 
 ---
@@ -48,7 +49,7 @@ describe stages that do not exist yet.
 4. [Stage 2 — Intent to world motion](#4-stage-2--intent-to-world-motion)
 5. [Stage 3 — Sector resolution and collision](#5-stage-3--sector-resolution-and-collision)
 6. [Stage 4 — Frame setup and camera basis](#6-stage-4--frame-setup-and-camera-basis)
-7. [Stage 5 — Portal traversal: scene resolution](#7-stage-5--portal-traversal-scene-resolution)
+7. [Stage 5 — BSP traversal: scene resolution](#7-stage-5--bsp-traversal-scene-resolution)
 8. [Stage 6 — Per-wall geometry: transform, clip, project](#8-stage-6--per-wall-geometry-transform-clip-project)
 9. [Stage 7 — Column loop: lifting 2D lines into vertical spans](#9-stage-7--column-loop-lifting-2d-lines-into-vertical-spans)
 10. [Stage 8 — Chunky to multicolor conversion](#10-stage-8--chunky-to-multicolor-conversion)
@@ -70,32 +71,34 @@ describe stages that do not exist yet.
    [2] movePlayer           input.asm      intent -> camX/camY/camA
                |            ~900 cy        dx = cos*speed >> 14   (2 x smulTrig)
                v
-   [3] checkSector          input.asm      convex containment test, per wall:
-               |            ~1.3k cy/wall  cross = (x1-x0)(py-y0) - (y1-y0)(px-x0)
-               |                           -> stay | follow portal | undo move
+   [3] checkMove             input.asm      convex containment test, per seg of
+               |            ~1.3k cy/seg   the destination subsector:
+               |                           cross = (x1-x0)(py-y0) - (y1-y0)(px-x0)
+               |                           -> stay | slide | descend to new subsector
                v
   ============ camera state is final for this frame ============
                |
-   [4] renderFrame          walls.asm      reset colTop[160]/colBot[160],
-               |            ~2.5k cy       fetch camSin/camCos, seed portal stack
+   [4] renderFrame          bsp.asm        reset colTop[160]/colBot[160],
+               |            ~2.5k cy       fetch camSin/camCos, seed BSP stack
                v
-   [5] portal traversal     walls.asm      stack of (sector, xL, xR) windows
-               |  <---------------+        visitedSec[] = once per sector per frame
+   [5] BSP descent          bsp.asm        stack of node/subsector indices,
+               |  <---------------+        bounding-sphere + backface rejection
                v                  |
-   [6] doWall (per wall)          |        world -> camera -> screen
+   [6] doWall (per seg)           |        world -> camera -> screen
         transformPoint            |          ry = (tx*cos + ty*sin) >> 14
         near-plane clip           |          rx = (tx*sin - ty*cos) >> 14
         projSX / projRow          |          sx  = 80 + rx*80/ry
-        backface + window clamp   |          row = 88 - dz*160/ry
-        lineSetup x2 or x4        |        4 screen-space lines, 24-bit accumulators
-               |                  |        14k cy (solid) / 22k cy (portal)
-               v                  |
+        backface + screen clamp   |          row = 88 - dz*160/ry
+        lineSetup x2, x4 or x5    |        4 screen-space lines + u (textured),
+               |                  |        24-bit accumulators
+               v                  |        14k cy (solid) / 22k cy (two-sided)
    [7] per-column loop            |        for x in [c0..c1]:
         clampAcc x2 or x4         |          clamp lines into open window
-        spanFill x3 or x4         |          ceiling / wall / floor runs
-        window update ------------+          portal: narrow window, push sector
-               |                             solid:  close column
-               |                           ~11 cy per pixel written
+        spanFill x2 (flat)        |          ceiling / floor: flat
+        spanFillTex x1 or x2      |          wall: textured, ~1.8x a flat pixel
+        window update ------------+          two-sided: narrow window
+               |                             solid: close column, openCols--
+               |                           ~11 cy/pixel flat, ~18-20 cy/pixel wall
                v
    +-------------------------------------------+
    |  MATRIX  $1000-$7DFF  160x176 chunky      |   1 byte/pixel: %rrrriiii
@@ -118,9 +121,10 @@ describe stages that do not exist yet.
 
 The organising principle is **monotonic work reduction**: every stage must hand
 the next stage strictly less, and more regular, work than it received.
-A 16-wall map becomes ~3 visible walls, which become ~160 column jobs, which
-become ~28k byte writes, which become one linear 880-cell packing pass. No
-stage is allowed to hand the next stage an unbounded problem.
+E1M1's 725 segs become ~15-19 visible ones per frame after sphere and backface
+rejection, which become ~160 column jobs, which become ~28k byte writes, which
+become one linear 880-cell packing pass. No stage is allowed to hand the next
+stage an unbounded problem.
 
 ---
 
@@ -558,55 +562,90 @@ frame will show through.
 
 ---
 
-## 7. Stage 5 — Portal traversal: scene resolution
+## 7. Stage 5 — BSP traversal: scene resolution
 
-**Source:** `src/render/walls.asm:76` (`popLoop`), `:91` (`renderSector`)
+**Source:** `src/render/bsp.asm` (`bspLoop`, `sideOf`, `nodeStep`,
+`renderSsec`, `ssecHdr`/`ssecSegs`), `src/render/walls.asm:126` (`segFacing`)
+**Reconciled 2026-08-12** — replaces the portal-stack description this
+section carried through M1; see `IMPLEMENTATION_PLAN.md` §2 for the
+architecture summary this expands on.
 
-The visible set is discovered by walking portals, depth-first, carrying a
-**screen-space column window** with each step:
+> **Deviation from the design documents and from M1's own hand-built map.**
+> `algorithm.md` and the early sessions of this engine assumed a **portal
+> graph**: sectors linked by two-sided walls, walked depth-first with a
+> narrowing screen-space window (`pStkSec`/`pStkXL`/`pStkXR`, `visitedSec[]`).
+> That graph does not exist for real WAD geometry — E1M1's 85 sectors are not
+> convex, so there is no sector-level polygon to test a point against or to
+> carry a portal window through. What *is* convex, by construction, is a BSP
+> **subsector** (237 of them in E1M1), and the traversal is the BSP descent
+> Doom itself uses to visit them front-to-back, not a portal walk.
+
+The visible set is discovered by descending `NODES`, front child first, with
+an explicit stack — no recursion, no portal window, no per-sector visited
+flag:
 
 ```
-while stackN > 0:
-    (sector, xL, xR) = pop()
-    renderSector(sector)          # draws every wall, clipped to [xL, xR]
-                                  # portals encountered push (back, c0, c1)
+push(root)
+while stack not empty:
+    node = pop()
+    if node is a leaf (subsector):
+        if !sphereVisible(ssecSphere[node]): continue      # frustum reject
+        DMA in SSECDATA[node]                              # segs + sector id
+        renderSsec(node)                                    # every seg, in seg order
+        if openCols == 0: return                            # frame done early
+        continue
+    if !sphereVisible(nodeSphere[node]): continue            # whole subtree reject
+    side = sideOf(camX, camY, node)                          # which child is "near"
+    push(far child)
+    push(near child)                                         # popped first
 ```
 
-Each stack entry is `(sector id, left column, right column)` in three parallel
-arrays (`pStkSec`, `pStkXL`, `pStkXR`) — structure-of-arrays even for a
-12-entry stack, so each field is a flat `lda table,x`.
+`renderSsec` calls `doWall` once per seg of the subsector, in the order the
+seg record streams from the REU — there is no window to clip against and no
+column range to narrow, because occlusion is carried entirely by
+`colTop`/`colBot` (§9), not by a screen-space interval handed down the stack.
 
-### 7.1 Why the window narrows monotonically
+### 7.1 Why front-to-back, and where the column window went
 
-When a portal wall is drawn across columns `[c0, c1]`, the back sector is
-pushed with exactly that range. Since `[c0, c1] ⊆ [xL, xR]` by construction
-(§8.5), each level of traversal sees a **strictly narrower or equal** window.
-Combined with `visitedSec[]`, this bounds traversal in two independent ways:
+The BSP invariant — near child first, then far child, per node — puts the
+frame's geometry in front-to-back order automatically; §8.5's "no sort"
+argument still holds, but the thing it is no longer sorting is *subsectors*
+as well as *walls within a subsector*. There is no `[xL, xR]` window carried
+between stack entries, because there is no portal geometry to intersect it
+against — every seg is projected and clamped against the *screen's* `[0,159]`
+directly (§8.5), and `colTop`/`colBot` do the only narrowing this renderer
+needs.
 
-- **Breadth** — a sector is entered at most once per frame.
-- **Depth** — `PSTKMAX = 12`; deeper portals are silently dropped.
+`openCols` (a live count of columns with `colTop[x] < colBot[x]`, at `$5f`)
+replaces `visitedSec[]`'s job of bounding traversal: once every column is
+closed, the frame is visually complete and the descent returns immediately,
+however much of the BSP remains unvisited. This is a **stronger** guarantee
+than the portal renderer's — it does not merely cap depth or breadth, it
+detects true completion — but it costs a decrement and a compare per solid
+column instead of nothing.
 
-Both are hard caps with deterministic overflow, satisfying rules R1/R2 of
-`algorithm.md`. Dropping a too-deep portal costs a small hole in the far
-distance, never a frame-time spike.
+### 7.2 Two rejection tests ahead of `doWall`
 
-### 7.2 Where occlusion actually happens
+The BSP descent adds two whole-subtree/whole-subsector rejections that the
+portal renderer had no equivalent of, because a portal graph has no bounding
+volume to test before committing to a sector's walls:
 
-Note what the traversal does **not** do: it does not sort, and it does not test
-whether the back sector is visible. Occlusion is entirely delegated to
-`colTop`/`colBot`. A sector reached through a portal that has since been
-overdrawn will still be traversed, but every one of its columns will find
-`colTop[x] >= colBot[x]` and exit immediately at ~20 cycles per column.
+| Test | Where | What it removes |
+|---|---|---|
+| Bounding sphere vs. frustum | `bspLoop`, before descending a node; `renderSsec`, after the 8-byte subsector header | whole subtrees and whole subsectors — E1M1 averages 71.7 node descents and 39.3 subsectors visited out of 234/235 |
+| World-space backface | `segFacing`, before any `transformPoint`/`projSX` call | ~53.6 segs/frame that would otherwise cost two projections each |
 
-**This is the central trade in the design**: the engine accepts some wasted
-traversal in exchange for never having to sort or test visibility at the
-sector level. It is the right trade at this scale (3 sectors, 16 walls) and it
-is the thing to revisit first when real WAD geometry arrives — at which point
-`design.md`'s PVS-in-REU and supersector proposals become the answer.
+Both are described in full in `IMPLEMENTATION_PLAN.md` §2 and §4 (the sphere
+test is deliberately conservative — `k = r + (r>>1)` rather than an exact
+`sqrt(2)·r` — because a coarse *transform* that needed 128 units of slop cost
+more than the exact frustum test saved).
 
-### 7.3 Per-sector setup
+### 7.3 Per-subsector setup
 
-`renderSector` hoists everything constant across the sector's walls:
+`renderSsec` hoists everything constant across the subsector's segs, exactly
+as `renderSector` did per sector in the portal renderer — the sector a
+subsector belongs to still supplies one ceiling, one floor and two shading
+bytes:
 
 ```
 zDzC = secCeil[s]  - camZ         ; height of ceiling above the eye
@@ -615,9 +654,10 @@ zCeilByte  = secCByte[s]          ; flat shading byte for the ceiling
 zFloorByte = secFByte[s]          ; flat shading byte for the floor
 ```
 
-Computing `dz` **relative to the eye, once per sector** is what allows the row
-projection in §8.4 to be a single divide with no subtraction in the inner
-loop.
+Computing `dz` **relative to the eye, once per subsector** is what allows the
+row projection in §8.4 to be a single divide with no subtraction in the inner
+loop — unchanged from the portal renderer, because nothing about the vertical
+projection depends on how the visible set was discovered.
 
 ---
 
@@ -777,16 +817,34 @@ midpoint depth. Per-column shading would need the depth interpolated across the
 wall — cheap in principle (another accumulator), and the natural next step once
 textures make banding visible.
 
-### 8.7 The four screen-space lines
+### 8.7 The screen-space lines
 
-The projection produces, per wall, the endpoint rows of up to four lines:
+The projection produces, per wall, the endpoint rows of up to four *vertical*
+interpolators, plus one *horizontal* one that Stage A textures added
+(2026-08-12):
 
 | Line | Index | Meaning | Present when |
 |---|---|---|---|
 | `top` | 0 | ceiling / wall top edge | always |
 | `bot` | 1 | floor / wall bottom edge | always |
-| `btop` | 2 | back sector's ceiling | portal only |
-| `bbot` | 3 | back sector's floor | portal only |
+| `btop` | 2 | back sector's ceiling | two-sided seg only |
+| `bbot` | 3 | back sector's floor | two-sided seg only |
+| `u` | — | texel column, along the wall | textured seg only |
+
+> **Textured walls (§9, `IMPLEMENTATION_PLAN.md` §10) reuse `lineSetup`
+> itself for `u` rather than adding a fifth line to the `zTop0`/`accTop`
+> layout below.** `u` is monotonic along a seg — it is the seg's dominant
+> world axis, scaled `>>4`, with no per-seg texture offset — so `lineSetup`'s
+> existing `((y1-y0)<<8)/dx` machinery seeds it exactly like `top`/`bot`,
+> stepped once per column. There is no per-seg 64-byte strip table: a column
+> unpacks its texel only when `u`'s integer part changes, which for a
+> perspective-correct `u` is at most once, so the lazy unpack costs nothing
+> extra on the common case and avoids the ~2048-cycle/seg table build a strip
+> table would have cost. `v` needs no new interpolator at all — it is the
+> wall-span row accumulator (`accTop`/`accBot`) already being stepped, masked
+> to the 8×8 tile height; its vertical scale is affine per seg (taken at
+> mid-`ry`) rather than a true perspective divide, which is where the
+> approximation actually lives.**
 
 **The key geometric fact that makes this renderer cheap:** in a perspective
 projection with a level camera, the top and bottom edges of a vertical-sided
@@ -825,12 +883,15 @@ renderer silently.
 
 ## 9. Stage 7 — Column loop: lifting 2D lines into vertical spans
 
-**Source:** `src/render/walls.asm:475` (`!colloop`)
-**Cost:** ~270 cy/column (solid) or ~400 cy/column (portal), plus ~11 cy per
-pixel written
+**Source:** `src/render/walls.asm:475` (`!colloop`), `src/render/tex.asm`
+(texture sampling, landed 2026-08-12)
+**Cost:** ~270 cy/column (solid) or ~400 cy/column (two-sided), plus ~11 cy per
+flat-shaded pixel written, **~18-20 cy per textured wall pixel** (§9.1a)
 
 This is the "lifting" step: four 2D lines and two clip arrays become vertical
-runs of bytes in the chunky buffer.
+runs of bytes in the chunky buffer. Floors and ceilings stay flat-shaded
+(`IMPLEMENTATION_PLAN.md` §8 keeps flats out of M2's scope); only the wall
+span samples a texture.
 
 ### 9.1 The per-column sequence
 
@@ -842,22 +903,22 @@ for x = c0 .. c1:
     tw = clamp(accTop, wt, wb)                    # wall top,    clipped
     bw = clamp(accBot, tw, wb)                    # wall bottom, clipped
 
-    spanFill(x, colTop[x], tw,  ceilByte)         # ceiling
-    spanFill(x, bw,        wb,  floorByte)        # floor
+    spanFill(x, colTop[x], tw,  ceilByte)         # ceiling, flat
+    spanFill(x, bw,        wb,  floorByte)        # floor, flat
 
     if solid:
-        spanFill(x, tw, bw, wallByte)             # full wall
+        spanFillTex(x, tw, bw, ramp, texel(u, v))  # full wall, textured
         colTop[x] = 176 ; colBot[x] = 0           # column permanently closed
-    else:                                          # portal
+    else:                                          # two-sided
         bt = clamp(accBT, tw, bw)                 # opening top
         bb = clamp(accBB, bt, bw)                 # opening bottom
-        spanFill(x, tw, bt, wallByte)             # upper wall (step down)
-        spanFill(x, bb, bw, wallByte)             # lower wall (step up)
+        spanFillTex(x, tw, bt, ramp, texel(u, v))  # upper wall (step down)
+        spanFillTex(x, bb, bw, ramp, texel(u, v))  # lower wall (step up)
         colTop[x] = bt ; colBot[x] = bb           # window narrowed to opening
 
 advance:
-    accTop += stepTop ; accBot += stepBot
-    if portal: accBT += stepBT ; accBB += stepBB
+    accTop += stepTop ; accBot += stepBot ; u += stepU
+    if two-sided: accBT += stepBT ; accBB += stepBB
 ```
 
 Three properties make this loop cheap:
@@ -877,8 +938,53 @@ the step from drifting. ~26 cycles.
 
 **3. Occlusion is a two-byte write.** A solid wall closes its column with
 `colTop[x] = 176, colBot[x] = 0`, which makes every later `wb <= wt` test fail
-in ~20 cycles. A portal narrows the window to the opening. There is no depth
-comparison anywhere.
+in ~20 cycles. A two-sided seg narrows the window to the opening instead of
+closing it. There is no depth comparison anywhere.
+
+### 9.1a Texture sampling (Stage A, landed 2026-08-12)
+
+**Source:** `src/render/tex.asm`; design rationale in
+`IMPLEMENTATION_PLAN.md` §10.
+
+`spanFillTex` replaces `spanFill` only for the wall span — floors and
+ceilings still call the flat `spanFill` above. The insight the matrix format
+hands this stage (`IMPLEMENTATION_PLAN.md` §10.1) is that a texture must
+modulate the **intensity nibble only** and leave the ramp alone, because a
+4×8 multicolor cell can only hold the colours of one ramp: every wall in a
+family shares its ramp byte exactly as a flat wall did, so the attribute
+constraint that made M1's frames clean survives texturing for free.
+
+```
+texel = tile[(u & 7), (v & 7)]            ; 8x8 nibble-packed tile, resident
+byte  = ramp | clamp(texel + depthBias, 1, 15)
+sta MATRIX,y : ora #byte
+```
+
+Depth falloff, which used to set the whole intensity nibble (§8.6), becomes a
+**bias** added to the texel's own intensity and clamped back into `1..15` —
+the wall stays readable as silhouette at range exactly as it did flat-shaded.
+
+Three things keep this close to a flat `spanFill` in cost:
+
+- **`v` is nearly free.** It is the wall-span row accumulator already being
+  stepped for `clampAcc` (§9.1), masked to the tile's 8-row height — no new
+  interpolator, no extra divide.
+- **`u` reuses `lineSetup`**, seeded and stepped exactly like `top`/`bot`
+  (§8.7) rather than needing a per-column perspective divide. A texel is
+  re-fetched only when `u`'s integer part changes, which along a monotonic
+  seg happens at most once per column.
+- **One `ora` per pixel**, same as the flat case, once the texel nibble is in
+  a register — the tile lookup and the depth-bias clamp are the only new
+  work.
+
+Measured cost (`IMPLEMENTATION_PLAN.md` §10.4, §10 landing note): a flat pixel
+is ~11 cy in `spanFill` (~22 cy/pixel once `spanFill`'s own overhead is
+counted against the whole frame); a textured pixel is **~1.8× that, ~18-20
+cy**, for the fixed-point `v` accumulate, the tile-nibble fetch/unpack and the
+`ora`. Walls are ~40% of E1M1's pixels, so the whole-frame effect measured on
+hardware was **+8.7 ms** (37.6 → 46.7 ms compute, §12.1) — the top of the
+6-9 ms estimate that section had predicted, and the reason Stage B (real
+64×64 streamed texels, §10.2) did not land in M2.
 
 ### 9.2 `AddStep`: 24-bit accumulate with a 16-bit signed step
 
@@ -1260,52 +1366,52 @@ through its own. That clamp is `clampAcc` doing exactly the job §9.1 describes.
 
 ### 12.1 Where the cycles go
 
-Static instruction counts for the frame traced in §11 (three sectors, six walls
-drawn or tested, full-screen coverage). These are **estimates from counted
-instruction timings, not measurements** — treat them as ±30%.
+**Reconciled 2026-08-12.** The table this section carried through M1 was a
+static per-instruction count for the frame traced in §11 — three hand-built
+sectors, six walls, full-screen coverage — a map that no longer loads
+(`IMPLEMENTATION_PLAN.md` §9.4). Rather than re-derive a static count for
+E1M1 (which needs the live-capture retrace §11 is still waiting on), what
+follows is the **measured** breakdown that exists today, from
+`IMPLEMENTATION_PLAN.md` §1, §8.1 and §10's landing notes — real hardware
+numbers, not instruction-counted estimates, which is a strictly better source
+where it is available.
 
-| Stage | Cycles | Share |
-|---|---:|---:|
-| `readInput` | 120 | <0.1% |
-| `movePlayer` (2 × `smulTrig`) | 900 | 0.1% |
-| `checkSector` (6 walls × ~1.3k) | 7,800 | 0.8% |
-| `renderFrame` setup | 2,500 | 0.3% |
-| Wall geometry — rejected walls (3 × ~6k) | 18,000 | 1.8% |
-| Wall geometry — drawn walls (~6 × ~18k) | 108,000 | 10.9% |
-| **`spanFill` — ~35k pixels × ~11 cy** | **385,000** | **38.7%** |
-| Column-loop overhead (~300 columns × ~330) | 99,000 | 10.0% |
-| **`convert` — 880 cells × ~411 cy** | **362,000** | **36.4%** |
-| `flip` + COLBUF → `$D800` burst | 11,000 | 1.1% |
-| **Total** | **~994,000** | **100%** |
+| Stage | Cost | Source |
+|---|---:|---|
+| `checkMove` (per seg tested) | ~1.3k cy/seg; E1M1 averages 3.09 segs/subsector | §5 |
+| BSP descent + sphere rejection | prunes 234→71.7 node descents, 235→39.3 subsectors visited | §7.2 |
+| World-space backface (`segFacing`) | removes ~53.6 segs/frame before any projection | §7.2 |
+| **`spanFill` — flat pixels** | ~2593 calls / 28.4k pixels / **~22 cy/pixel** ≈ **~27% of the pre-texture 37.6 ms frame** | `IMPLEMENTATION_PLAN.md` §10.4 |
+| **`spanFill` — textured wall pixels (Stage A)** | ~18-20 cy/pixel, **~1.8×** the flat cost; walls are ~40% of a typical E1M1 view | §9.1a, `IMPLEMENTATION_PLAN.md` §10.4 |
+| **`convert` — 880 cells** | ~362k cycles, fixed — independent of scene geometry | §10 (unchanged since M1) |
+| `flip` + COLBUF → `$D800` burst | ~11k cycles | §10.5 (unchanged) |
+| **Total compute, measured on hardware** | **37.6 ms (pre-texture) → 46.7 ms (post Stage A)** | `IMPLEMENTATION_PLAN.md` §1, §10 landing note |
 
-At a 25 fps target the frame budget is 40 ms:
+**Frame rate is measured, not estimated**, and the deadline itself changed
+during M2 (`IMPLEMENTATION_PLAN.md` §8.1): M1 closed on a **two-raster-frame**
+budget (39.90 ms), M2 deliberately moved to **three** (59.85 ms) to make room
+for textures, doors, sprites and a HUD without judder. Current state:
 
-| CPU clock | Cycles/frame @ 25 fps | Frame cost | Headroom |
-|---|---:|---:|---:|
-| 1 MHz (stock C64) | 39,410 | **2,500%** | hopeless, as expected |
-| 48 MHz (U64 official max) | 1,920,000 | **52%** | 19 ms spare |
-| 64 MHz | 2,560,000 | **39%** | 24 ms spare |
+| Build | Compute (measured) | Deadline | Raster frames | fps |
+|---|---:|---:|---|---:|
+| M1 final (flat-shaded, BSP) | 37.6-38.6 ms | 39.90 ms (2×) | 100% at 2 | 25.05 |
+| M2, cap moved to 3, pre-texture | 37.6-38.6 ms | 59.85 ms (3×) | 100% at 3 | 16.71 |
+| M2, Stage A textures landed | **46.7 ms** | 59.85 ms (3×) | 100% at 3 | 16.63 |
 
-**The two hot spots are the two byte-per-pixel passes**, together 75% of the
-frame: the rasterizer writes 28160+ bytes into MATRIX, and the converter reads
-all 28160 back out. Everything geometric — transform, clip, projection, the
-divides — is 13% combined. This is the expected shape for a low-resolution
-software renderer and it says clearly where optimization effort belongs:
+**13.1 ms of budget remains** for doors (<0.5 ms, measured effectively free —
+§11.1/§11.4), sprites (6-8 ms estimated, not yet built) and the HUD (0 ms
+measured — §13.1). That leaves little slack, which is why Stage B's real
+64×64 streamed textures did not land in M2 (`IMPLEMENTATION_PLAN.md` §10
+landing note): Stage A measured at the top of its 6-9 ms estimate, and the
+gate for Stage B was measuring *well inside* it.
 
-1. **`spanFill` (39%)** — spans are constant-coloured, so the 8 individual
-   stores per cell could become a 4-byte pattern write, or an REU DMA fill if
-   U64 DMA throughput scales with the turbo clock (unverified — see
-   `3d-renderer-design.md`).
-2. **`convert` (36%)** — already near-optimal at 8 cycles/pixel. The real win
-   is *not converting unchanged cells*: `design.md`'s per-tile dirty masks. A
-   stationary player changes almost nothing between frames.
-3. **`transformPoint` (part of the 11%)** — every vertex in the test map is
-   shared by two walls, so per-vertex transform caching halves it.
-
-Note that 35k span pixels exceed the screen's 28160: portal sectors overdraw
-the parent's floor and ceiling inside the opening. Deferring floor/ceiling
-spans until the column is finally closed — `algorithm.md`'s
-`raster.draw_deferred_floors_and_ceilings` — would remove that ~20% overdraw.
+**The two hot spots are still the two byte-per-pixel passes** — the
+rasterizer writes into MATRIX and the converter reads it all back out — but
+`spanFill` is no longer the single constant-cost pass it was in M1: it is
+now two costs, flat and textured, and which one dominates a given frame
+depends on how much of the view is wall versus flat. `convert`'s ~362k
+cycles are unchanged and worth revisiting first for M3, per the dirty-mask
+idea already on record in `design.md`.
 
 ### 12.2 Memory map (authoritative — from `src/defs.asm`)
 
@@ -1671,18 +1777,25 @@ they are choices rather than omissions:
 The next milestones, in dependency order:
 
 1. ✅ Done: §13's defects are fixed, `make check` is green.
-2. **Milestone 1** (`IMPLEMENTATION_PLAN.md`): `tools/u64push.py` and an REU
-   throughput measurement on real hardware → `src/reu.asm` → `tools/wad2reu.py`
-   → a **BSP walk over real E1M1 geometry** replacing both `testmap.asm` and the
-   portal traversal of §7.
-3. Textured walls: adds a `u` coordinate through the near-plane clip (§8.2),
-   per-column `u/v` steps, and turns `spanFill` into a texture-sampling loop.
-   `IMPLEMENTATION_PLAN.md` §10 is the design — intensity-only texturing, so
-   the ramp nibble and therefore the multicolor attribute constraint survive.
+2. ✅ Done: **Milestone 1** (`IMPLEMENTATION_PLAN.md`): `tools/u64push.py` and an
+   REU throughput measurement on real hardware → `src/reu.asm` →
+   `tools/wad2reu.py` → the **BSP walk over real E1M1 geometry** (§7) that
+   replaced both `testmap.asm` and the portal traversal.
+3. ✅ Done (Stage A): **Textured walls** — a `u` coordinate reusing `lineSetup`
+   (§8.7, §9.1a) and an intensity-modulating texture sampler in place of flat
+   `spanFill` for the wall span. `IMPLEMENTATION_PLAN.md` §10 is the design —
+   intensity-only texturing, so the ramp nibble and therefore the multicolor
+   attribute constraint survive. **Stage B (real 64×64 streamed texels) did
+   not land in M2** — Stage A measured at the top of its cycle budget, so the
+   milestone stopped there (§9.1a, §12.1).
 4. Deferred floor/ceiling spans — removes the overdraw measured in §12.1.
 5. Sprites as column-clipped billboards, reusing `colTop`/`colBot` unchanged.
-6. Music, and the audio-versus-render budget split of `design.md`.
+6. ✅ Done: Music, and the audio-versus-render budget split of `design.md`.
+7. ✅ Done: Doors and moving sectors (`IMPLEMENTATION_PLAN.md` §11) — the
+   renderer needed no change at all, confirming §7.3's claim that per-frame
+   sector heights are the only thing a moving sector touches.
 
-Steps 3-6 are the point at which the target architecture in `design.md` and
-`algorithm.md` stops being aspirational and starts being load-bearing. Until
-then, this document describes the whole machine.
+Steps 3-7 are the point at which the target architecture in `design.md` and
+`algorithm.md` stops being aspirational and starts being load-bearing for the
+parts that have landed; sprites (5) and deferred floor/ceiling spans (4) are
+what remain aspirational.

@@ -43,6 +43,7 @@
 // The streamed blocks this file reads at boot itself -- see lineLoad and
 // hudBgLoad/hudFontLoad.
 .const BLK_LINEDEFS = 7
+.const BLK_WALLTEX  = 6
 .const BLK_HUDBG    = 8
 .const BLK_HUDFONT  = 9
 
@@ -137,6 +138,11 @@ mapBlockLoop:
         jsr hudBgLoad
         jmp mapNextBlock
 !notHudBg:
+        cmp #BLK_WALLTEX
+        bne !notTex+
+        jsr texLoad
+        jmp mapNextBlock
+!notTex:
         cmp #BLK_HUDFONT
         bne mapNextBlock
         jsr hudFontLoad
@@ -351,6 +357,55 @@ hudBgLoad:
         lda #<HUD_BG_BYTES
         sta REU_LENGTH
         lda #>HUD_BG_BYTES
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+
+// texLoad — block 6 (the wall tiles) into WALLTILE, once, at boot.
+//
+// Stage A left this block streamed and texFetch DMA'd 32 bytes of it per seg.
+// At 16x16 the tile is 128 bytes and that per-seg fetch would be 8.7 KB a
+// frame; resident, it is one 2 KB transfer at boot and nothing per frame at
+// all (defs.asm's WALLTILE, IMPLEMENTATION_PLAN.md §10.6).
+//
+// No staging step, unlike lineLoad: WALLTILE is ordinary RAM in MATRIX, not
+// under I/O, so the REU can write it directly -- the same reason hudBgLoad
+// fetches straight into its staging address.
+//
+// The block stays *streamed* in the descriptor rather than becoming resident
+// number 4, because a resident descriptor carries a load page and is checked
+// against mapLoadHi/mapMaxLen tables that are MAPNBLK wide; adding a fourth
+// entry changes the format, the tables and probe.py for a block that is read
+// exactly once. The length check below is what a resident block's table entry
+// would have bought.
+texLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #<WALLTILE_LEN
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        cmp #>WALLTILE_LEN
+        bne !bad+
+        lda #<WALLTILE
+        sta REU_C64ADDR
+        lda #>WALLTILE
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #<WALLTILE_LEN
+        sta REU_LENGTH
+        lda #>WALLTILE_LEN
         sta REU_LENGTH+1
         lda #REU_FETCH
         sta REU_COMMAND

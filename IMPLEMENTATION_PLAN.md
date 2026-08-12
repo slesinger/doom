@@ -559,21 +559,24 @@ That replacement happened, and these sections did not follow it:
 | Section | What it describes | What is there now |
 |---|---|---|
 | §5 | `checkSector` over a sector's walls | `checkMove` over a subsector's segs. **Header, cost line and §5.1-5.3 reconciled 2026-08-12**; the rest of the section's math is unchanged and still correct |
-| §7 | portal traversal — `renderSector`, `popLoop`, the `pStkSec`/`pStkXL`/`pStkXR` window stack | `bsp.asm`: a BSP descent with bounding-sphere rejection and `openCols` as the termination condition. **Nothing in §7 exists in `src/`** |
-| §11 | a frame traced through the three-sector test map, checked against the live machine | `src/testmap.asm` was deleted in Phase 4. The trace is arithmetically sound and describes geometry the engine can no longer load |
-| §12.1 | the cycle budget, itemised, from that same test map | E1M1 at three raster frames. §12.2 and §12.3 **were reconciled 2026-08-12** and are current |
+| §7 | portal traversal — `renderSector`, `popLoop`, the `pStkSec`/`pStkXL`/`pStkXR` window stack | `bsp.asm`: a BSP descent with bounding-sphere rejection and `openCols` as the termination condition. **Reconciled 2026-08-12** — §7 now describes `bspLoop`/`sideOf`/`renderSsec` directly |
+| §8.7 | four screen-space lines (`top`/`bot`/`btop`/`bbot`), no texture coordinate | Stage A's `u` reuses `lineSetup` rather than adding a fifth line to the layout. **Reconciled 2026-08-12** |
+| §9 | flat `spanFill` only, ~11 cy/pixel | `spanFillTex` for the wall span, ~18-20 cy/pixel textured, flats unchanged. **Reconciled 2026-08-12** (new §9.1a) |
+| §11 | a frame traced through the three-sector test map, checked against the live machine | `src/testmap.asm` was deleted in Phase 4. The trace is arithmetically sound and describes geometry the engine can no longer load. **Still not reconciled** — a retrace against E1M1 needs the same live-capture tooling `debug-notes/` used, which is a hardware/emulator session, not a documentation-only pass |
+| §12.1 | the cycle budget, itemised, from that same test map | Replaced with the measured hardware breakdown (37.6 ms pre-texture → 46.7 ms post Stage A, against the current 59.85 ms three-frame deadline) in place of a static per-instruction count for a map that no longer exists. **Reconciled 2026-08-12**, along with §12.2 and §12.3 which were already current |
 | §13's appendix | zero page and low RAM, including `pStkSec` at `$03A0` | that block is the BSP descent stack at `$0F00` |
 
-§8, §9 and §10 — per-wall geometry, the column loop, the converter — are
-untouched by the BSP change and are still accurate, which is why the document
-is still worth having.
+§10 — the converter — was untouched by both the BSP change and Stage A
+textures (it reads MATRIX bytes regardless of how they were painted) and was
+already accurate.
 
-**This is the same debt §9.3 just closed, one document over**, and it is larger:
-`data_structures.md` described a format nobody built, whereas these sections
-describe code that was built, shipped, measured and then deleted, which is a
-more convincing kind of wrong. It is not scheduled — §10 is worth more than it
-— but §11's worked frame is the natural thing to re-trace against E1M1 once
-textures change what a wall costs anyway, and doing it then is close to free.
+**§11 is the one section left**, and it stays open for the reason the note
+below originally gave: a worked-frame retrace needs real per-instruction state
+captured from a live E1M1 frame, the way `debug-notes/wallwalk2.py` etc.
+captured the deleted test map's — an emulator/hardware session, not something
+derivable from this document alone.
+
+
 
 ## 10. Phase 8 — Textured walls
 
@@ -715,6 +718,93 @@ must be replaced deliberately:
   (which would be a silently untextured wall).
 - **A known-good reference frame** at the spawn, committed as a PNG, compared by
   eye at each step. The frame is still the only oracle this engine has.
+
+### 10.6 16×16 tiles, resident *(landed 2026-08-12)*
+
+> **Decided by the user after §14a.1a's measurement**: 16×16 keeping the
+> existing sampler, rather than 32×32 with the sampler redesigned. The only
+> compromise authorised to pay for it is a fourth raster frame (§14a.6), and it
+> has not been needed.
+
+`make check`, `make walktest` and `make doortest` are green. `make framehash`
+is a **new** digest — the picture genuinely changes — at
+`2f25c6e2350d98db2fb7b7f74845f7c1c5ae663194c1bb65924b08b2798d673d`.
+
+**The tiles are resident, and that is the phase.** Stage A DMA'd a family's
+32-byte tile per seg. A 16×16 tile is 128 bytes, and re-fetching one per seg
+would be whole milliseconds of REU time at 1 byte/µs. So block 6 is read once
+at boot into `WALLTILE` (`$7600`, 2 KB) by `texLoad`, and `texFetch` — which
+kept its name and its callers — now writes a 16-bit address into `texCol`'s
+self-modified operand instead of programming a transfer.
+
+**The 2 KB is exactly what §14a.1 freed** and nothing had claimed: MATRIX is
+28160 B and the 160-row viewport writes only the first 25600. Boot staging
+reaches `MATRIX+$64ff`, so `$7600` is under neither the staging nor the live
+buffer. **32 bytes of zero page came back too** — `TEXBUF` is gone, `texStrip`
+is 16 bytes at `$c4`, and `$d4-$e3` is now the only free zero page in the
+machine.
+
+**Cost, measured with `make phaseprof`** (VICE, same idle spawn view):
+
+| | Stage A 8×8 | **16×16 resident** |
+|---|---:|---:|
+| `renderFrame` | 2503.5 k cycles | **2658.6 k** |
+| `convert` | 391.2 k | 391.6 k (untouched, as it must be) |
+| compute | 2894.9 k | **3050.6 k** (+5.4%) |
+
++155.1 k cycles is **+2.4 ms of CPU** at 64 MHz, against which the per-seg tile
+DMA that no longer happens is worth **~1.0 ms** on hardware and almost nothing
+in VICE (≤33 textured segs a frame × 32 B, at 1 byte/µs — the asymmetry §4
+warns about, in the direction that flatters the emulator). **Net ≈ +1.4 ms on
+hardware, projected, not yet measured there**: ~46.6 ms of compute against the
+59.85 ms deadline, leaving ~11 ms for §12's sprites. `make u64-fps` is the
+outstanding confirmation, and §13.1's warning applies — space the runs out.
+
+Where it differs from what §10.2-§10.3 would have predicted:
+
+| Expected | What is there |
+|---|---|
+| a finer tile costs about the square of the ratio | It cost **+5.4% of compute**, because residency paid ~1 ms of it back. The strip machinery is unchanged: `texCol` unpacks 16 texels instead of 8, `texUpd` fires about twice as often |
+| the sampler needs a redesign for anything past 8×8 | Not at 16×16. §14a.1a sized `texCol`/`texPix` at under 2% of compute, and quadrupling a 2% is affordable in a way quadrupling a 20% would not have been — which is the whole reason that measurement came first |
+| `u` needs a shift to become a tile column | **`accU & $78` is the column's byte offset already**: a texel is 8 world units and the tile is 16 wide, so bits 3-6 left in place are `((u>>3)&15)*8`. Three bytes saved at each end, and TX_COL's hole is 27 bytes, which is what forced the question |
+
+**The open question is the texel scale, and it is a look judgement.** The build
+above is **8 world units per texel** — a 128-unit repeat, i.e. a Doom wall
+texture at its native world scale, and half Stage A's texel size. An earlier
+session recorded exactly that density as reading like *noise*, on the grounds
+that `chunky2mc`'s 4×4 Bayer dither is the detail floor and a finer texel only
+beats against it. That finding was made at 32×32 and is not automatically true
+here, but it is the reason to look at this on hardware before believing the
+picture.
+
+The coarser alternative is **16 units per texel** — a 256-unit repeat, the
+texture at 2× world scale, which buys *variety along a long wall* rather than
+detail and cannot beat against the dither. It is three constants in
+`src/render/tex.asm` and nothing else:
+
+| | 8 units (built) | 16 units |
+|---|---|---|
+| `texUpd` | `and #$78` | `and #$f0` + `lsr` |
+| `texVSet` shift | `ldx #5` | `ldx #4` |
+| `texVSet` step | `13107` (ry/5) | `6554` (ry/10) |
+
+Both were built and screenshotted this session; neither is obviously wrong on
+an emulator screenshot, which is precisely why §10.5 says the frame is the only
+oracle this engine has.
+
+Two traps, both the same shape as §11.4's and §13.1's:
+
+1. **`TX_COL` is a 27-byte hole between two other blocks**, not the 46 bytes
+   `defs.asm`'s table implies — `lines: the use fetch` starts at `$cdf5`. The
+   first version overflowed by two bytes and the assembler named the collision,
+   which is the mechanism working.
+2. **`texCol`'s self-modified operand lives inside the PRG image**, so
+   `make debug` reports it as a runtime write into code — one unexplained byte
+   at `$cddf`, which is exactly the signature of the corruption this check
+   exists to find. It is declared in `probe.py`'s `ALLOWED` now, **derived from
+   `txColBase` in the symbol file** rather than written as a constant, because
+   TX_COL moves whenever the bin-packing does and a stale address there would
+   silently stop covering the block.
 
 ## 11. Phase 9 — Doors and moving sectors
 
@@ -1262,6 +1352,56 @@ at once.
 > 25600-byte live buffer, inside the old boot-staging region up to
 > `MATRIX+$6e00`) is free for code once the first frame has run, but nothing
 > has claimed it yet.
+
+#### 14a.1a `chunky2mc` priced, and the height cut measured *(2026-08-12)*
+
+> The measurement this section called "the cheapest one in this section" —
+> and it says the height cut returned **a quarter of what the row percentage
+> predicted**.
+
+The instrument is new: **`make phaseprof`** (`tools/vicedbg/phaseprof.py`).
+A *stopping* exec checkpoint on each of `mainLoop`'s eight `jsr` targets, and
+the engine's own CIA millisecond clock read at every stop. A monitor stop costs
+no emulated time, so the phase boundaries are exact rather than sampled, and at
+VICE's 1 MHz one tick is exactly 1000 cycles — the reading is a cycle count in
+disguise. `profile.py` answers *how many times*; this answers *for how long*.
+
+**It carries its own positive control**: the phases it calls compute sum to
+2894.9 ticks against the engine's own `ftComp` of 2895, which is arithmetic the
+tool and the engine do independently, from the same clock, at different points.
+
+| Phase | 176 rows (`f9f7cb5`) | **160 rows (`0df949a`)** | Δ |
+|---|---:|---:|---:|
+| `renderFrame` | 2535.5 k cycles | **2503.5 k** | −1.3% |
+| **`convert`** (chunky2mc) | 430.4 k | **391.2 k** | **−9.1%** |
+| `flip` | 18.0 k | 10.6 k | (mostly raster wait) |
+| input + `playerFrame` + `lineFrame` | 0.5 k | 0.1 k | — |
+| **compute** | **2966.4 k** | **2894.9 k** | **−2.4%** |
+
+**So `chunky2mc` is 391.2 k cycles = 13.5% of compute = 6.1 ms of a hardware
+frame**, and the cycle count travels: it touches no REU and no I/O, so its
+share is the same share at 64 MHz. The cost model that falls out of the two
+readings — hardware ms ≈ cycles/64e6 + one µs per DMA byte — predicts 46.4 ms
+of CPU at 176 rows against §10's **46.7 ms measured on the machine**, i.e.
+emulator cycles and hardware agree to a few percent, which is what makes the
+table above usable as hardware numbers without another trip to the Ultimate.
+
+**The height cut is worth ~1.1 ms on hardware, not the ~4 ms −9% implied.**
+`convert` returned its row percentage exactly, as it must — it is a fixed
+number of cycles per cell over 800 cells instead of 880. `renderFrame` did
+not, and that is the finding: the renderer's cost is dominated by per-seg and
+per-column work (the multiply chain is 7485 `mul8` calls a frame, the divides
+434) rather than by the spans the rows remove. **A further cut to 144 rows
+would buy roughly another 1.1 ms, not 4** — which changes §14a.7's arithmetic
+materially, because that combination was priced at the pixel percentage.
+
+Two smaller things the run recorded, both wanted by §10's Stage B question:
+`convert` costs **489 cycles/cell**, not the ~415 the file header claims (the
+`ldy MATRIX+s*4+j,x` reads cross a page about half the time); and the Stage A
+strip rebuild is **156 `texCol` / 1248 `texPix` calls a frame**, ~56 k cycles,
+under 2% of compute. That last number is the one that sizes a finer tile:
+`texPix` runs once per *texel* of every rebuilt strip, so tile height
+multiplies the rebuild and tile width multiplies how often it happens.
 
 `176` is 22 cell-rows and appears in **four places**: `math.asm`'s `rowCell`
 bound, `bsp.asm`, `walls.asm`'s column close, and `chunky2mc.asm`'s header. A

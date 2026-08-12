@@ -14,6 +14,27 @@
 .const BITMAP1 = $e000
 .const COLBUF  = $0400
 
+// Wall texture tiles, resident, in the tail the 160-row viewport freed.
+//
+// MATRIX is 28160 B ($1000-$7dff) and the renderer now writes only the first
+// 25600 ($1000-$73ff) -- IMPLEMENTATION_PLAN.md §14a.1 cut 176 rows to 160 and
+// nothing had claimed what that freed. This is the claim: sixteen families of
+// 128 bytes, loaded once by texLoad (src/mapload.asm) and never moved.
+//
+// **Residency is not an optimisation here, it is the phase.** A 16x16 tile is
+// 128 B against Stage A's 32, and Stage A re-fetched the tile *per seg*: at
+// ~68 walls a frame that would be 8.7 KB of REU DMA per frame, i.e. 8.7 ms on
+// hardware at the REU's flat 1 byte/us (§5 risk 1), against a 13 ms budget.
+// Resident, the per-frame DMA is zero -- which also deletes Stage A's own
+// 2.2 KB/frame and is worth ~2.2 ms before the finer tile costs anything.
+//
+// It is safe under the first frame for the same reason BOOTCODE is not: boot
+// staging reaches MATRIX+$64ff (HUDFONT_STAGE) and the live buffer ends at
+// $73ff, so $7600 is under neither.
+.const WALLTILE     = MATRIX + $6600        // $7600-$7dff, 16 x 128 B
+.const WALLTILE_LEN = 16 * 128
+.errorif WALLTILE + WALLTILE_LEN > MATRIX + 28160, "wall tiles run past MATRIX"
+
 .const CONVERTER_CODE = $9900
 
 // Free RAM at the tail of the TABLES segment: 448 B, $9740-$98FF. 352 of them
@@ -545,7 +566,7 @@
 // with their tags and target heights resolved by wad2reu.py rather than
 // searched for here -- the engine has neither a tag array nor sector
 // adjacency (IMPLEMENTATION_PLAN.md §11.2a).
-.const MAPFMT_VERSION = 5
+.const MAPFMT_VERSION = 6
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5
@@ -887,7 +908,7 @@
 .const camJZ   = $c2        // eye height above the sector floor, 0 on foot
 .const camJT   = $c3        // index into jumpTab, 1-based; 0 = not jumping
 
-// The wall texture working set, $c4-$eb. In zero page and not in colTop's
+// The wall texture working set, $c4-$d3. In zero page and not in colTop's
 // tail, which is where it was first put, for two reasons: `lda texStrip,x` in
 // spanTex's inner loop is 3 cycles here against 4 there, over every wall pixel
 // on the screen; and moving it out of $02b0 is what left an 80-byte hole big
@@ -895,14 +916,16 @@
 // above $a5 was ever claimed, so this is the last of the free zero page rather
 // than a byte taken from anything.
 //
-// TEXBUF is one family's 32-byte tile, DMA'd per seg (docs/reu-format.md §4.7).
-// texStrip is one u column of it, unpacked to a byte per texel with the depth
-// bias applied and the ramp already or'd in -- so the per-pixel cost inside
-// spanTex is one indexed load and nothing else. Eight bytes, not the whole
-// 64-byte tile, because u is monotonic across a seg: the column loop unpacks
-// the column it needs when u changes and never comes back to it.
-.const TEXBUF   = $c4               // 32 B, nibble-packed, column-major
-.const texStrip = $e4               // 8 B, one u column, finished chunky bytes
+// texStrip is one u column of the family's tile, unpacked to a byte per texel
+// with the depth bias applied and the ramp already or'd in -- so the per-pixel
+// cost inside spanTex is one indexed load and nothing else. Sixteen bytes, not
+// the whole 256-byte tile, because u is monotonic across a seg: the column
+// loop unpacks the column it needs when u changes and never comes back to it.
+//
+// **$d4-$e3 is free zero page**, and it is the only free zero page in the
+// machine. It was TEXBUF, the 32-byte tile Stage A re-DMA'd per seg; the tiles
+// are resident at WALLTILE now and nothing is copied per seg at all.
+.const texStrip = $c4               // 16 B, one u column, finished chunky bytes
 
 //------------------------------------------------------------
 // zero page — doors and moving sectors ($ec-$f0), src/lines.asm

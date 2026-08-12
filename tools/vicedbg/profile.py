@@ -36,6 +36,10 @@ ROUTINES = [
     "doWall", "segFacing", "transformPoint", "smulTrig",
     "projSX", "projRow", "lineSetup", "clampAcc",
     "colLoopHead", "spanFill", "spanCells", "spanNextCell",
+    # Stage A texturing (§10). texCol/texPix are the strip rebuild, and they
+    # are what a finer tile multiplies: a taller tile makes each rebuild
+    # longer, a wider one makes rebuilds more frequent.
+    "texSetup", "texUpd", "texCol", "texPix", "spanTex", "uAdvance",
     "umul16", "mul8", "udiv", "sdiv", "ssmul32",
 ]
 

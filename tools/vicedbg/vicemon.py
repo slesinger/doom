@@ -129,6 +129,32 @@ class Mon:
             raise RuntimeError(f"advance_instructions failed, err={err}")
         return self.regs(memspace)
 
+    def wait_stopped(self, timeout=60):
+        """Block until VICE reports MON_RESPONSE_STOPPED (0x62) -> PC.
+
+        A stopping checkpoint makes VICE send two asynchronous responses when
+        it fires: checkpoint-info (0x11) and then stopped (0x62). cmd() drops
+        both, because it only ever returns the response matching its own
+        request id. Reading the socket directly is what turns a stopping
+        checkpoint into a synchronous rendezvous -- and it has to be a blocking
+        read for that, not a poll: while the machine runs, a query answers with
+        whatever the CPU happens to be doing, which is the notification-vs-query
+        race advance_instructions() was written to avoid.
+        """
+        old = self.s.gettimeout()
+        self.s.settimeout(timeout)
+        try:
+            while True:
+                stx, _api, blen, rtype, _err, _rid = struct.unpack(
+                    "<BBIBBI", self._recvn(12))
+                if stx != STX:
+                    raise ValueError(f"bad STX {stx:#x}")
+                payload = self._recvn(blen)
+                if rtype == 0x62:               # MON_RESPONSE_STOPPED
+                    return struct.unpack("<H", payload[:2])[0]
+        finally:
+            self.s.settimeout(old)
+
     def autostart(self, path, run=True, index=0):
         name = path.encode()
         body = struct.pack("<BHB", int(run), index, len(name)) + name

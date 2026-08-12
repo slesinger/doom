@@ -13,6 +13,7 @@
 #   make bobtest    walk, and judge the eye against the walk-bob wave
 #   make stats      emulated ms/frame + renderer workload counters
 #   make profile    per-frame call counts for the hot routines
+#   make phaseprof  ms/frame per mainLoop phase -- where the frame goes
 #   make assets     DOOM1.WAD -> build/assets.reu, plus build/testmap.reu
 #   make music      assets/DooM_Medley.sid -> build/music.bin (block 5)
 #   make u64-config apply the required turbo settings to the Ultimate
@@ -84,7 +85,7 @@ REUOPTS    = -reu -reusize 512 +reuimagerw -reuimage $(REUIMG)
 # must be hermetic against whatever else has run x64sc on this machine.
 VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
-.PHONY: all run shot check debug stats profile framehash walktest doortest jumptest bobtest assets reubench run-u64 u64-config \
+.PHONY: all run shot check debug stats profile phaseprof framehash walktest doortest jumptest bobtest assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest music setup clean \
         intro run-intro shot-intro run-intro-u64 intro-config
 
@@ -474,6 +475,23 @@ profile: $(PRG) $(REUIMG)
 	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
 	vpid=$$!; \
 	$(PYTHON) tools/vicedbg/profile.py $(MONPORT) $(PROFSECS); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# Where the frame goes *by phase*, in time rather than in call counts. Stopping
+# checkpoints on mainLoop's own jsr targets, with the engine's CIA millisecond
+# clock read at each one -- a stop costs no emulated time, so the boundaries are
+# exact. This is the measurement IMPLEMENTATION_PLAN.md §14a.1 asks for before
+# any further viewport-height or texture decision: chunky2mc's share of the
+# frame has never been recorded. See tools/vicedbg/phaseprof.py.
+PHASEFRAMES ?= 8
+phaseprof: $(PRG) $(REUIMG)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(REUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(PRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/phaseprof.py $(MONPORT) $(PHASEFRAMES); rc=$$?; \
 	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
 	exit $$rc
 

@@ -44,7 +44,7 @@ from collections import Counter, defaultdict
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 5                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+VERSION = 6                     # 2 added the bounding spheres (SSEC_HDR, block 4)
                                 # 3 added the music stream (block 5) and the
                                 #   page-unit length flag it needs
                                 # 4 added the wall texture tiles (block 6) and
@@ -53,6 +53,11 @@ VERSION = 5                     # 2 added the bounding spheres (SSEC_HDR, block 
                                 #   lifts and walkover triggers, with tags and
                                 #   target heights resolved here rather than
                                 #   searched for at runtime
+                                # 6 took the wall tiles from 8x8 to 16x16
+                                #   (block 6, 512 -> 2048 B). The engine loads
+                                #   them resident now, so an image of the old
+                                #   size is not merely finer or coarser, it is
+                                #   the wrong length for texLoad's one transfer
 
 HEADER_SIZE = 128               # 15 descriptors. 64 through version 4, which
                                 # held 7 and the eighth block outgrew; the
@@ -86,9 +91,13 @@ BLK_LINEDEFS = 7
 
 # Wall texture tiles -- IMPLEMENTATION_PLAN.md §10.2 Stage A.
 #
-# Sixteen families, one 8x8 intensity tile each, nibble-packed column-major:
-# 4 bytes per u column (v = 0,1 in byte 0, v = 2,3 in byte 1, ...), 32 bytes per
-# family, 512 bytes for the block. Family i is at texReuBase + (i << 5).
+# Sixteen families, one 16x16 intensity tile each, nibble-packed column-major:
+# 8 bytes per u column (v = 0,1 in byte 0, v = 2,3 in byte 1, ...), 128 bytes per
+# family, 2048 bytes for the block. Family i is at texReuBase + (i << 7).
+#
+# 8x8 through format 5 (IMPLEMENTATION_PLAN.md §10.2 Stage A). 16x16 is §10.6,
+# and it is a resident block in the engine now rather than a per-seg DMA: at
+# 128 B a tile, re-fetching one per seg would be 8.7 KB/frame.
 #
 # Sixteen and not more because the family id rides in the low nibble of the seg
 # record's rampByte, which was reserved and zero (docs/reu-format.md §5.1). That
@@ -96,10 +105,11 @@ BLK_LINEDEFS = 7
 # 6-byte seg experiment in IMPLEMENTATION_PLAN.md §4 is the standing warning
 # against growing the hottest record in the engine for a feature this size.
 TEX_FAMILIES = 16
-TEX_TILE_W = 8
-TEX_TILE_H = 8
-TEX_TILE_BYTES = TEX_TILE_W * TEX_TILE_H // 2    # 32, nibble-packed
-TEX_BLOCK_BYTES = TEX_FAMILIES * TEX_TILE_BYTES  # 512
+TEX_TILE_W = 16
+TEX_TILE_H = 16
+TEX_TILE_TEXELS = TEX_TILE_W * TEX_TILE_H         # 256
+TEX_TILE_BYTES = TEX_TILE_TEXELS // 2            # 128, nibble-packed
+TEX_BLOCK_BYTES = TEX_FAMILIES * TEX_TILE_BYTES  # 2048
 
 # The intensity a texel of mean brightness gets. The engine adds the tile's
 # texel to the wall's depth-shaded intensity and subtracts this, so a mean texel
@@ -122,12 +132,15 @@ TEX_SWING = 4
 TEX_GAIN = TEX_SWING / 25.0
 
 # World units per texel, both axes. The engine maps u and v from *world*
-# coordinates rather than from a per-seg texture offset -- u = axisCoord >> 4,
-# v = z >> 4 -- so the mapping is continuous across a BSP seg split and no
-# offset has to ride in the seg record. 16 units is a 128-unit repeat, which is
-# what a 128x128 Doom texture spans at 1 pixel per unit; it is the size most of
-# E1M1's wall textures actually are.
-TEX_UNITS_SHIFT = 4
+# coordinates rather than from a per-seg texture offset -- u = axisCoord >> 3,
+# v = z >> 3 -- so the mapping is continuous across a BSP seg split and no
+# offset has to ride in the seg record. 8 units per texel over a 16-texel tile
+# is the same 128-unit repeat Stage A's 16 units over 8 texels gave, which is
+# what a 128x128 Doom texture spans at 1 pixel per unit and the size most of
+# E1M1's wall textures actually are: the tile got finer, the world scale did
+# not move. The engine's constants are texUpd's mask and texVSet's shift and
+# ry/5 (src/render/tex.asm); this is documentation of them, not their source.
+TEX_UNITS_SHIFT = 3
 
 # ----------------------------------------------------------------------------
 # Special linedefs -- IMPLEMENTATION_PLAN.md §11, docs/reu-format.md §4.8.
@@ -695,12 +708,12 @@ def decode_picture(data: bytes) -> tuple:
 
 def texture_luma_tile(wad: Wad, name: str, tex1: dict, pnames: list,
                       luma: list) -> list:
-    """A wall texture -> 64 mean luminances, column-major (u major, v minor)."""
+    """A wall texture -> TEX_TILE_TEXELS mean luminances, column-major."""
     if name not in tex1:
         raise ValueError(f"texture {name!r} is not in TEXTURE1")
     w, h, patches = tex1[name]
-    acc = [0.0] * 64
-    cnt = [0] * 64
+    acc = [0.0] * TEX_TILE_TEXELS
+    cnt = [0] * TEX_TILE_TEXELS
     for ox, oy, pid in patches:
         _pw, _ph, px = decode_picture(wad.lump(pnames[pid]))
         for (x, y), c in px.items():
@@ -712,11 +725,11 @@ def texture_luma_tile(wad: Wad, name: str, tex1: dict, pnames: list,
     if not any(cnt):
         raise ValueError(f"texture {name!r} has no opaque pixels")
     mean = sum(acc) / sum(cnt)
-    return [acc[k] / cnt[k] if cnt[k] else mean for k in range(64)]
+    return [acc[k] / cnt[k] if cnt[k] else mean for k in range(TEX_TILE_TEXELS)]
 
 
 def quantise_tile(lum: list) -> list:
-    """64 luminances -> 64 intensity nibbles centred on TEX_MID.
+    """TEX_TILE_TEXELS luminances -> as many intensity nibbles centred on TEX_MID.
 
     The centre is the tile's own mid-range rather than its mean: a texture that
     is mostly one shade with a bright stripe (LITE3) should have the stripe read
@@ -733,10 +746,10 @@ def quantise_tile(lum: list) -> list:
 
 
 def pack_tile(nibbles: list) -> bytes:
-    """64 nibbles, column-major, -> 32 bytes: v even in the high nibble.
+    """TEX_TILE_TEXELS nibbles, column-major, -> TEX_TILE_BYTES: v even high.
 
     Column-major because the engine unpacks one *u column* at a time into an
-    8-byte strip and then walks v down the screen inside it — see
+    16-byte strip and then walks v down the screen inside it — see
     IMPLEMENTATION_PLAN.md §10.3. Even v in the high nibble so that a hex dump
     of the block reads top-to-bottom in the order the wall is drawn.
     """
@@ -799,7 +812,7 @@ def build_walltex(wad: Wad = None) -> bytes:
         tex1 = read_texture1(wad)
     for fam, name in enumerate(FAMILY_TEXTURE):
         if fam == TEX_PLAIN:
-            tiles.append(pack_tile([TEX_MID] * 64))
+            tiles.append(pack_tile([TEX_MID] * TEX_TILE_TEXELS))
         elif wad is None:
             tiles.append(pack_tile(
                 _pattern_tile(TEST_PATTERNS[(fam - 1) % len(TEST_PATTERNS)])))
