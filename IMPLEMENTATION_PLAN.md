@@ -353,7 +353,7 @@ that was uncomfortably tight.
 | Wall textures | ~~6-9 ms~~ **8.7 ms spent** | §10.4; measured on hardware 2026-08-12, §10's landing note |
 | Doors and moving sectors | < 0.5 ms | §11; the renderer needs no change |
 | Sprites | 6-8 ms | §12.4, dominated by REU streaming |
-| HUD | **0 ms spent** | §13.1; painted once at boot, nothing runs per frame |
+| HUD | **0 ms spent** | §13.1; measured, painted once at boot, nothing runs per frame |
 | Margin | 2 ms | |
 | **Total** | **15-20 ms** | against 22 |
 
@@ -1167,17 +1167,31 @@ must **not** be ordered-dithered — intensities are snapped to the four values
 that are fixed points of `chunky2mc.asm`'s `dcode()`, or the bar comes out a
 speckle with the digits a shade lost in it.
 
-**Frame cost: not credibly measured, and not measurable this way.** Three
-`make u64-fps` runs on hardware gave 90%, 92% and (below) on-deadline rates
-against §11.4's 100%, with `compute` climbing run to run and the tool's own
-post-reset-housekeeping warning firing every time — the same degrading shape
-§11.4 already recorded for repeated `run_prg` calls in one session, and it did
-not clear with `WARMUP_SECONDS` raised to 60. Nothing here *can* cost
-per-frame time: `hudBoot` is called once from `bootMain`, the per-frame path
-is untouched, and the framehash is bit-identical. Re-measure on a genuinely
-idle machine, well spaced, before reading anything into these numbers.
-(`WARMUP_SECONDS` is now an environment override in `u64push.py`, because the
-tool's own warning tells you to raise it and there was no way to.)
+**Frame cost, measured idle 2026-08-12** (20 s window):
+`compute 49.7 ms last, 28.4 min, 49.7 max (deadline 59.85 ms)`,
+`raster frames 3x335 4+x0 -- 100%` on deadline, with the tool's own
+`every frame's compute fits in 3 raster frames` verdict and **no outlier
+warning at all** — the first §12-era reading with a completely empty `4+`
+bucket. **The HUD costs nothing measurable**, which it cannot: `hudBoot` runs
+once from `bootMain`, the per-frame path is untouched, and the framehash is
+bit-identical. ~10 ms of budget remains for §12 sprites.
+
+§11.4's warning about back-to-back readings earned its keep again, and the
+shape is worth pinning down because it wasted a pass here: the first three
+runs of the session gave 90% and 92% on deadline with `compute` climbing run
+to run (76 ms, then 96 ms), and **raising `WARMUP_SECONDS` to 60 did not help
+— it made it worse**, because the problem is not post-reset housekeeping, it
+is how recently the previous `run_prg` was. Four minutes of quiet between
+runs is what produced the clean number above. Treat any reading taken within
+a minute or two of a previous upload as noise, and do not try to warm your way
+out of it. (`WARMUP_SECONDS` is an environment override in `u64push.py` now,
+because the tool's own warning tells you to raise it and there was no way to —
+useful, just not the lever this needed.)
+
+One more `u64-fps` trap, which cost the first attempt entirely: **the target
+does not push the REU** (`--reu` is commented out in the Makefile, on
+purpose). After changing `assets.reu`, `make u64-map` first, or the engine
+halts on a stale image and the tool reports `frame counter never advanced`.
 
 ## 14. M2 risk register
 
