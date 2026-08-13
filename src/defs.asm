@@ -120,20 +120,127 @@
 .const WPNCODE      = SPRFREE + $100        // $6b00-$6cff
 .const WPNCODE_END  = SPRFREE + $300
 
-// §12's sprite art: 24 distinct things, tight aspect-correct boxes, 4-bit
-// packed, resident. Everything left between the weapon code and MOVECODE --
-// *not* up to WALLTILE: MOVECODE already holds the last page below the tiles
-// (the substepped move, below), which is why SPRFREE_END is not the bound.
+// §12's sprites: static props (barrels, lamps, corpses -- "drawn, not animated
+// and not intelligent"), 7 distinct E1M1 THINGS types, 33 instances. Resident
+// art, not streamed (§14a.2's recommendation, adopted): a 33-instance level
+// has only 7 *distinct* pictures, so residency is a fixed ~1 KB charge against
+// SPRART's 2048 B rather than a per-frame REU cost that scales with what is on
+// screen. wad2reu.py's WPN_* comment applies here too: every constant below
+// with a matching name in that file must move with its Python twin.
 //
-// 2048 B, and the art was priced at 2278 for 24 sprites in 16x28 boxes, so
-// something has to give when §12 lands: either the box cap (16x24 costs 2158,
-// 14x28 costs 1945) or this block, by moving wpnFrame's ~200 bytes of unrolled
-// blit out to $7eeb-$7fff, the 277 B behind BODYCODE. Deliberately left as a
-// choice for the phase that has the real numbers rather than guessed at here.
+// wpnFrame moved out to WPNBLIT (below, the 277 B behind BODYCODE) to free
+// room in WPNCODE for sprite code -- SPRCODE2 is that freed tail. wpnBoot and
+// wpnPrep together measure well under the 128 B WPNCODE keeps for them; the
+// rest is sprite code, split the same bin-packed way tex.asm's eleven pieces
+// are, because SPRCODE2 and SPRCODE are what the machine has, not what a
+// single contiguous routine would want.
+.const WPNPREP_END  = WPNCODE + $50         // $6b50: wpnBoot(27B)+wpnPrep(46B)
+                                            // measure 73 B; $50=80 leaves 7 B
+                                            // margin, handing the rest to
+                                            // SPRCODE2 below (Opus-advised,
+                                            // §12 sizing pass)
+.const SPRCODE2     = WPNPREP_END           // $6b50-$6cff, 432 B
+.errorif SPRCODE2 >= WPNCODE_END, "wpnBoot/wpnPrep budget overruns WPNCODE"
+
 .const SPRART       = SPRFREE + $300        // $6d00-$74ff, 2048 B
 .const SPRART_END   = MATRIX + $6500        // = MOVECODE
 .errorif WPNCODE_END > SPRART, "the weapon code overruns the sprite art"
 .errorif SPRART_END > SPRFREE_END, "the sprite art runs past the free block"
+
+// ---- Block 11, THINGS: resident, docs/reu-format.md §4.10 ----
+//
+// MAXSSEC = 237, E1M1's own subsector count (mapinfo carries the real count
+// too; this is a compile-time buffer bound, not read at runtime). Things are
+// emitted by wad2reu.py sorted by subsector, so sprSsecFirst is a pure prefix
+// index: subsector i's things are thingType[sprSsecFirst[i] .. sprSsecFirst[i+1]).
+.const MAXSSEC       = 237
+.const MAXTHINGS     = 36                   // 33 in-scope E1M1 things + slack
+.const NUM_SPRTYPES  = 7
+
+.const SPRDATA       = SPRART                       // $6d00
+.const sprSsecFirst  = SPRDATA                       // MAXSSEC+1 bytes
+.const thingXlo      = sprSsecFirst + MAXSSEC + 1
+.const thingXhi      = thingXlo + MAXTHINGS
+.const thingYlo      = thingXhi + MAXTHINGS
+.const thingYhi      = thingYlo + MAXTHINGS
+.const thingType     = thingYhi + MAXTHINGS         // index into the type table
+// No thingZ: every §12 prop stands on its own subsector's floor, which
+// sprPick already has in zDzF (secFront runs before it, bsp.asm) -- storing a
+// z here would just be that same value, baked stale, for 72 bytes.
+// "Typ" prefix throughout, not "spr": the zero-page draw scratch below (spr*)
+// is a different namespace and one pair (sprH/sprW) would otherwise collide.
+.const sprTypArtLo   = thingType + MAXTHINGS        // type table, SoA, 7 each
+.const sprTypArtHi   = sprTypArtLo + NUM_SPRTYPES
+.const sprTypW       = sprTypArtHi + NUM_SPRTYPES   // art box width, columns
+.const sprTypH       = sprTypW + NUM_SPRTYPES       // art box height, rows
+// No precomputed 8.8 u/v-step-per-world-ry coefficients: sprDraw computes
+// uStep/vStep at draw time from sprTypHW/sprTypWH instead (two extra divides
+// a frame per visible thing, accepted for the simpler, less bug-prone code
+// over shaving a worst-case ~0.24 ms -- IMPLEMENTATION_PLAN.md §12 notes).
+.const sprTypHW      = sprTypH + NUM_SPRTYPES       // world half-width
+.const sprTypWH      = sprTypHW + NUM_SPRTYPES      // world height
+.const SPRDATA_END   = sprTypWH + NUM_SPRTYPES
+.const THINGS_LEN    = SPRDATA_END - SPRDATA        // fixed: every field above
+                                                    // is a compile-time bound,
+                                                    // not sized to the WAD's
+                                                    // actual thing count -- so
+                                                    // thingsLoad (mapload.asm)
+                                                    // can length-check it like
+                                                    // texLoad does WALLTILE_LEN
+.errorif SPRDATA_END - SPRDATA > 588, "block 11 (THINGS) overruns its budget"
+
+// ---- Runtime: the visible-thing list, rebuilt every frame in renderSsec's
+// wake (bsp.asm), sorted back-to-front, then walked once by sprFrame. ----
+.const MAXVIS        = 10
+.const sprVisRXlo    = SPRDATA_END
+.const sprVisRXhi    = sprVisRXlo + MAXVIS
+.const sprVisRYlo    = sprVisRXhi + MAXVIS
+.const sprVisRYhi    = sprVisRYlo + MAXVIS
+.const sprVisIdx     = sprVisRYhi + MAXVIS          // thing index, 0..MAXTHINGS-1
+.const sprVisDZlo    = sprVisIdx + MAXVIS           // eye-relative floor Z, captured
+.const sprVisDZhi    = sprVisDZlo + MAXVIS          // from zDzF at pick time (secFront
+                                                     // runs per-subsector; sprDraw runs
+                                                     // after the whole BSP walk is done)
+.const sprVisPerm    = sprVisDZhi + MAXVIS          // sort permutation
+.const sprVisN       = sprVisPerm + MAXVIS          // 1 B: entries used this frame
+.const SPRVIS_END    = sprVisN + 1
+
+// A third sprite-code slot: the unclaimed gap between SPRVIS_END and SPRIMG
+// (page-aligned at SPRART+$300). block 11's fields are all compile-time
+// bounds (comment above), so this shrinks if MAXSSEC/MAXTHINGS/MAXVIS ever
+// do -- the errorif below (after SPRIMG is defined) is load-bearing, not
+// decorative (Opus-advised, §12 sizing pass).
+.const SPRCODE3      = SPRVIS_END
+
+// ---- Block 12, SPRIMG: resident, docs/reu-format.md §4.11 ----
+//
+// Column-major, one byte per pixel, %rrrriiii with the type's ramp baked in at
+// build time, $00 = transparent (SPR_CLEAR, same convention as WPN_CLEAR).
+// Byte-per-pixel and not 4-bit packed, unlike WPNART: the blit is a straight
+// `lda (src),y / beq skip / sta (dst),y` with no nibble unpack, which the
+// pixel count here (a scaled blit, not a 1:1 one like the gun) needs more than
+// it needs the extra ~500 B back. Page-aligned so a type's ArtLo/ArtHi can
+// point straight at a column without a per-type base-plus-offset add.
+.const SPRIMG        = SPRART + $300                // $7000, page-aligned
+.const SPRIMG_CAP    = $400                          // 1024 B
+.errorif SPRCODE3 >= SPRIMG, "the visible list overruns the sprite code hole"
+
+.const SPR_CLEAR     = 0                    // intensity 0 = transparent
+.const SPR_NEAR      = 160                  // world units; nearer is not culled
+                                            // further but a frame at SPR_NEAR is
+                                            // the priced worst case (§12.4)
+.const SPR_BIAS      = 1                    // subtracted from a sprite's own
+                                            // quantised depth before the wall
+                                            // compare -- ties favour the sprite
+
+// ---- Sprite code, in two pieces the way tex.asm's are ----
+.const SPRCODE       = SPRIMG + SPRIMG_CAP  // $7400-$74ff, 256 B
+.errorif SPRCODE + 256 != SPRART_END, "SPRCODE sizing does not tile SPRART"
+
+// wpnFrame, moved out of WPNCODE to make room for SPRCODE2 above. 277 B behind
+// BODYCODE ($7e00-$7eea, src/input.asm's §11d) and the end of MATRIX -- the
+// .errorif against BODYCODE lives with BODYCODE's own definition, below.
+.const WPNBLIT       = $7eeb
 
 // The weapon's geometry. Every one of these is also a constant in
 // tools/wad2reu.py under the same name, and the pair must move together --
@@ -187,6 +294,7 @@
 // `make check`'s live-RAM diff is what keeps that honest.
 .const BODYCODE     = $7e00
 .const BODYCODE_END = SCREEN0
+.errorif WPNBLIT + 277 > BODYCODE_END, "WPNBLIT overruns the end of MATRIX"
 
 .const CONVERTER_CODE = $9900
 
@@ -1171,9 +1279,16 @@
 // product is linear in the test point, so the most-outside corner is the exact
 // value plus that one term. See segBody (src/input.asm).
 //
-// $e2-$e3 is what is left of zero page in the machine.
+// $e2-$e3 is what is left of zero page in the machine, and §12 (below) takes
+// one of the two remaining bytes.
 .const zCrs    = $db        // 32-bit: the seg's cross product, whole
 .const zPad    = $df        // 24-bit: PLRAD * (|dx| + |dy|)
+
+// zero page — §12's one permanent byte, the last claimed in the machine.
+// zSegQ is the current seg's quantised depth (segShade, src/render/sprite.asm)
+// and must survive across doWall's whole column loop, so unlike everything
+// else §12 touches it cannot be post-renderFrame scratch. $e3 is what is left.
+.const zSegQ   = $e2
 
 //------------------------------------------------------------
 // zero page — doors and moving sectors ($ec-$f0), src/lines.asm
@@ -1299,6 +1414,42 @@
                             // hudBlitCell clobbers X for its scrTab/colTab
                             // sample lookup, so a caller's loop counter may
                             // not live there across a jsr to it
+
+// sprite draw scratch (IMPLEMENTATION_PLAN.md §12), src/render/sprite.asm.
+// Same reuse argument as weapon.asm's own zA/zB/zD/zT (which sprFrame's setup
+// math -- transformPoint, projSX, projRow, umul16, udiv -- also uses): the
+// sprite pass runs after renderFrame and before wpnFrame/convert, so every
+// renderer accumulator and every $80-$8f byte is dead. mapLoad/hudBoot already
+// alias $68-$76 at a different point in the frame; this is the same block,
+// reused a third time, plus $80-$8a which nothing else claims after render.
+.const sprQ      = $68      // this sprite's quantised depth, minus SPR_BIAS
+.const sprC0     = $69      // clipped column range
+.const sprC1     = $6a
+.const sprR0     = $6b      // clipped top row
+.const sprRows   = $6c      // rows to draw, clipped
+.const sprH      = $6d      // this type's art height (src column stride)
+.const sprUAcc   = $6e      // 8.8 fixed point, integer part = art column
+.const sprUStep  = $70
+.const sprVAcc   = $72      // 8.8 fixed point, integer part = art row
+.const sprVStep  = $74
+.const sprN      = $76      // visible things this frame
+.const sprSrc    = $80      // SPRIMG column pointer
+.const sprDst    = $82      // MATRIX destination pointer
+.const sprI      = $84      // cursor into the sorted visible list
+.const sprIdx    = $85      // current thing's index into the THINGS arrays
+.const sprX      = $86      // current screen column
+.const sprType   = $87      // current thing's type, 0..NUM_SPRTYPES-1
+.const sprSortI  = $88      // insertion sort scratch
+.const sprSortJ  = $89
+.const sprSortT  = $8a
+
+// sprPick's own scratch: it runs *inside* renderFrame (bsp.asm's renderSsec,
+// once per subsector), while sprFrame/sprDraw only run after renderFrame has
+// returned -- so this is a fourth reuse of the same two bytes, not a third.
+// Nothing sprPick stores here needs to survive past its own rts.
+.const sprPickI   = sprQ    // $68 -- cursor into thingXlo/Xhi/Ylo/Yhi/Type,
+                            // this subsector's [sprSsecFirst[ssec], ...end)
+.const sprPickEnd = sprC0   // $69 -- end of that range, exclusive
 
 // The player spawn is no longer a constant: it comes from MAPINFO, which
 // wad2reu.py fills from the map's THINGS type 1 (docs/reu-format.md §4.1, §7).

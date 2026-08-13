@@ -295,7 +295,8 @@ wallNearDone:
         // ---- wall shading byte from mid distance: light = (ry0+ry1)>>7.
         // Out of line at TX_SHADE since M2's texturing: it runs once per seg,
         // and this segment ran out of room for the texture hooks (tex.asm).
-        jsr wallShade
+        jsr segShade                // wallShade + this seg's quantised depth
+                                    // for sprite z-clipping (§12.1, sprite.asm)
         // ---- rows at both ends: top (ceil) and bot (floor) lines
         lda zDzC
         sta zA
@@ -443,11 +444,8 @@ colLoopHead:
         sta zSCol
         jsr wallSpan
         ldx zSX
-        lda #160                    // close the column for good (176 -> 160 rows)
-        sta colTop,x
-        lda #0
-        sta colBot,x
-        dec openCols                // it was open on entry, so this is exact
+        jsr colClose                // closes for good; colTop[x] <- this seg's
+                                    // quantised depth, not a sentinel (§12.1)
         jmp !advance+
 !portal:
         lda zTW                     // clamp portal lines into [zTW, zBW]
@@ -485,7 +483,9 @@ colLoopHead:
         sta colBot,x
         cmp zBT                     // an empty opening closes the column
         bne !advance+
-        dec openCols
+        jsr colClose                // empty opening: closes for good, and
+                                    // colTop[x] <- depth overwrites the zBT
+                                    // just stored above (§12.1)
 !advance:
 colAdvance:
         :AddStep(accTop, stepTop)

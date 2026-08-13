@@ -229,6 +229,8 @@ LK_NONE, LK_DOOR, LK_LIFT, LK_FLOOR, LK_EXIT = 0, 1, 2, 3, 4
 # *of*, since nothing reads this data again after boot.
 BLK_HUDBG, BLK_HUDFONT = 8, 9
 BLK_WEAPON = 10                 # IMPLEMENTATION_PLAN.md §12a, streamed per frame
+BLK_THINGS = 11                 # §12: subsector-sorted static props, read once
+BLK_SPRIMG = 12                 # §12: resident sprite pictures, read once
 
 HUD_CELL_BYTES = 10                 # 8 bitmap bytes + 1 screen byte + 1 colour byte
 
@@ -564,6 +566,132 @@ def build_weapon(wad: Wad = None) -> bytes:
     return bytes(out)
 
 
+# ----------------------------------------------------------------------------
+# §12 -- static props (barrels, lamps, corpses). Blocks 11 (THINGS) and 12
+# (SPRIMG). "Drawn, not animated and not intelligent" -- monsters, pickups and
+# every player/deathmatch start are out of scope; a survey of E1M1's own
+# THINGS lump (138 records) leaves exactly 7 distinct pictures over 33
+# instances, which is what makes resident art (§14a.2) affordable at all: a
+# 33-instance level has 7 things to draw twice or more, not 33 unique ones.
+#
+# Native box size is Doom picture pixels halved in x (MATRIX's aspect: HFOCAL
+# 80 vs VFOCAL 160, i.e. one column covers 2 Doom pixels to one row's 1),
+# fitted into SPR_WMAX x SPR_HMAX preserving aspect -- the same "tight box,
+# not a fixed grid" call §10's wall tiles made. HW/WH are the *world* half-
+# width/height a thing's screen size is computed from, and per Doom's own
+# convention that is just the picture's raw pixel size in world units, not
+# the downsampled art box: coarse art at the true on-screen size beats sharp
+# art at the wrong one.
+SPR_WMAX, SPR_HMAX = 14, 24
+
+# Ramp indices, defined here (ahead of the RAMP_NAMES table further down,
+# which SPRTYPES below needs before that table exists in file order).
+STONE, WOOD, FLESH, SKY, MOSS, VIOLET, METAL, FIRE = range(8)
+TAN, SLIME, TECH, DOOR, LITE = range(9, 14)
+
+# (doomednums, sprite lump, ramp) -- ramp reuses an existing thematic ramp
+# (see RAMP_NAMES below); §12 does not claim ramp 15, the only one still free.
+SPRTYPES = [
+    ((2035,), "BAR1A0", MOSS),     # barrel -- brown/green, Doom's own palette
+    ((2028,), "COLUA0", LITE),     # floor lamp -- lit, orange/yellow/white
+    ((35,),   "CBRAA0", FIRE),     # candelabra
+    ((48,),   "ELECA0", TECH),     # tall techno column
+    ((10, 12), "PLAYW0", FLESH),   # bloody mess (two doomednums, one sprite)
+    ((15,),   "PLAYN0", FLESH),    # dead player
+    ((24,),   "POL5A0", FLESH),    # pool of blood and bones
+]
+NUM_SPRTYPES = len(SPRTYPES)
+assert NUM_SPRTYPES == 7        # src/defs.asm's NUM_SPRTYPES must match
+
+MAXSSEC = 237                   # src/defs.asm -- E1M1's own subsector count
+MAXTHINGS = 36                  # src/defs.asm -- 33 in-scope + slack
+SPRIMG_CAP = 0x400               # src/defs.asm -- SPRIMG's 1024-byte budget
+
+THING_TYPE_OF = {doom: i for i, (nums, *_r) in enumerate(SPRTYPES) for doom in nums}
+
+
+def _sprite_box(wad: Wad, lump: str) -> tuple:
+    """Doom picture size -> (art_w, art_h, world_hw, world_wh), aspect-correct
+    within SPR_WMAX x SPR_HMAX. See the SPRTYPES comment above."""
+    w, h, _px = decode_picture(wad.lump(lump))
+    nat_w = max(1, round(w / 2))
+    scale = min(1.0, SPR_WMAX / nat_w, SPR_HMAX / h)
+    art_w = max(1, round(nat_w * scale))
+    art_h = max(1, round(h * scale))
+    return art_w, art_h, max(1, round(w / 2)), min(255, h)
+
+
+def build_sprimg(wad: Wad) -> tuple:
+    """Block 12: the 7 resident sprite pictures, column-major, one byte per
+    pixel (%rrrriiii, ramp baked in, SPR_CLEAR = transparent) -- see
+    defs.asm's SPRIMG comment for why byte-per-pixel and not 4-bit packed.
+
+    Returns (bytes, layout) where layout is a list of
+    (offset, art_w, art_h, world_hw, world_wh) parallel to SPRTYPES, offset
+    relative to the start of the block -- what the type table in block 11
+    needs to find each picture.
+    """
+    out = bytearray()
+    layout = []
+    for nums, lump, ramp in SPRTYPES:
+        art_w, art_h, hw, wh = _sprite_box(wad, lump)
+        grid = _picture_intensity_grid(wad, lump, art_w, art_h)  # u-major
+        layout.append((len(out), art_w, art_h, hw, wh))
+        for x in range(art_w):
+            for y in range(art_h):
+                v = grid[x * art_h + y]
+                out.append(0 if v == SPR_CLEAR else v | (ramp << 4))
+    return bytes(out), layout
+
+
+def build_things(m: MapData, layout: list) -> bytes:
+    """Block 11: sprSsecFirst[MAXSSEC+1], then five MAXTHINGS-long SoA arrays
+    (Xlo/Xhi/Ylo/Yhi/type), then the NUM_SPRTYPES type table (ArtLo/ArtHi/W/H/
+    HW/WH) -- src/defs.asm's THINGS layout, byte for byte. A fixed-size
+    table, not one sized to the map's actual thing count: MAXSSEC/MAXTHINGS
+    are compile-time buffer bounds on the 6502 side (the same shape as
+    MAXNODES/MAXSEC), and sprSsecFirst's exact prefix counts are what a
+    reader trusts, not the padding after them.
+    """
+    if len(m.things) > MAXTHINGS:
+        raise ValueError(f"{m.name}: {len(m.things)} in-scope things, "
+                         f"MAXTHINGS is {MAXTHINGS}")
+    by_ssec = [0] * (MAXSSEC + 1)
+    for _x, _y, ssec, _t in m.things:
+        if ssec >= MAXSSEC:
+            raise ValueError(f"{m.name}: thing in subsector {ssec}, "
+                             f"MAXSSEC is {MAXSSEC}")
+        by_ssec[ssec] += 1
+    first = bytearray(MAXSSEC + 1)
+    acc = 0
+    for i in range(MAXSSEC):
+        first[i] = acc
+        acc += by_ssec[i]
+    first[MAXSSEC] = acc
+    assert acc == len(m.things)
+
+    xlo = bytearray(MAXTHINGS); xhi = bytearray(MAXTHINGS)
+    ylo = bytearray(MAXTHINGS); yhi = bytearray(MAXTHINGS)
+    typ = bytearray(MAXTHINGS)
+    # m.things is already sorted by subsector (load_wad_map), so a running
+    # cursor is enough -- no second sort here.
+    for i, (x, y, _ssec, t) in enumerate(m.things):
+        xlo[i], xhi[i] = x & 0xFF, (x >> 8) & 0xFF
+        ylo[i], yhi[i] = y & 0xFF, (y >> 8) & 0xFF
+        typ[i] = t
+
+    out = bytearray(first) + xlo + xhi + ylo + yhi + typ
+    artlo = bytearray(NUM_SPRTYPES); arthi = bytearray(NUM_SPRTYPES)
+    tw = bytearray(NUM_SPRTYPES); th = bytearray(NUM_SPRTYPES)
+    thw = bytearray(NUM_SPRTYPES); twh = bytearray(NUM_SPRTYPES)
+    for i, (ofs, w, h, hw, wh) in enumerate(layout):
+        artlo[i], arthi[i] = ofs & 0xFF, (ofs >> 8) & 0xFF
+        tw[i], th[i] = w, h
+        thw[i], twh[i] = hw, wh
+    out += artlo + arthi + tw + th + thw + twh
+    return bytes(out)
+
+
 LF_WALKOVER = 0x10              # crossing the line fires it; else the use key
 LF_REPEAT = 0x20                # fires again after it has run; else once only
 
@@ -662,12 +790,11 @@ MAPID_TEST, MAPID_E1M1 = 0, 1
 # that quietly landed on the default can be spotted.
 # ----------------------------------------------------------------------------
 
-STONE, WOOD, FLESH, SKY, MOSS, VIOLET, METAL, FIRE = range(8)
-# 8 is HUD_RAMP. 9-13 were claimed 2026-08-13 -- see chunky2mc.asm's table and
-# IMPLEMENTATION_PLAN.md §10.7: a tile modulates intensity only, so material
-# colour has to come from the ramp, and six ramps across 32 wall textures is
-# what made distinct materials read alike.
-TAN, SLIME, TECH, DOOR, LITE = range(9, 14)
+# STONE..FIRE (0-7) and TAN..LITE (9-13) are defined above, ahead of
+# SPRTYPES. 8 is HUD_RAMP. 9-13 were claimed 2026-08-13 -- see chunky2mc.asm's
+# table and IMPLEMENTATION_PLAN.md §10.7: a tile modulates intensity only, so
+# material colour has to come from the ramp, and six ramps across 32 wall
+# textures is what made distinct materials read alike.
 
 RAMP_NAMES = ["stone", "wood", "flesh", "sky", "moss",
               "violet", "metal", "fire", "hud",
@@ -1112,6 +1239,8 @@ class MapData:
         self.tex_used = Counter()       # segs per family, for --report
         self.lines: list[Line] = []     # special linedefs only (block 7)
         self.line_drops = Counter()     # Doom specials M2 does not implement
+        self.things: list = []          # (x, y, ssec, type_idx), sorted by
+                                         # ssec -- block 11, §12's THINGS
 
     @property
     def numsegs(self):
@@ -1348,6 +1477,23 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
         raise ValueError(f"{mapname}: no player-1 start in THINGS")
     sx, sy, sdeg = start[0], start[1], start[2]
     m.spawn = (sx, sy, int(round(sdeg * 256.0 / 360.0)) & 0xFF)
+
+    # §12's static props: THING_TYPE_OF filters to the 7 in-scope doomednums
+    # (build_sprimg's SPRTYPES), everything else (monsters, pickups, other
+    # decorations) is out of M2's scope and dropped here, at the source.
+    # ssec is the engine's own subsector index -- descend() runs the same BSP
+    # walk bspLoop does at runtime, so sprSsecFirst (block 11) indexes exactly
+    # the subsectors renderSsec visits, in the same order.
+    for tx, ty, _tangle, ttype, _tflags in things:
+        idx = THING_TYPE_OF.get(ttype)
+        if idx is None:
+            continue
+        ssec = descend(m, tx, ty)
+        m.things.append((tx, ty, ssec, idx))
+    m.things.sort(key=lambda t: t[2])       # sprSsecFirst needs ssec order
+    if len(m.things) > MAXTHINGS:
+        raise ValueError(f"{mapname}: {len(m.things)} in-scope things exceed "
+                          f"MAXTHINGS={MAXTHINGS}")
     return m
 
 
@@ -1755,7 +1901,8 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
 
 def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
                 hudbg: bytes = b"", hudfont: bytes = b"",
-                weapon: bytes = b"") -> bytes:
+                weapon: bytes = b"", things: bytes = b"",
+                sprimg: bytes = b"") -> bytes:
     """Assemble the whole .reu image. Blocks follow the header in id order,
     each padded up to a 256-byte boundary (docs/reu-format.md §3).
 
@@ -1787,6 +1934,8 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
     ofs_hudfont = ofs_hudbg + align(len(hudbg))
     ofs_lines = ofs_hudfont + align(len(hudfont))
     ofs_weapon = ofs_lines + align(len(linedefs))
+    ofs_things = ofs_weapon + align(len(weapon))
+    ofs_sprimg = ofs_things + align(len(things))
 
     ofs_music = MUSIC_OFFSET if music else 0
 
@@ -1823,6 +1972,13 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
     # its contents (docs/reu-format.md §4.9).
     if weapon:
         blocks.append((BLK_WEAPON, 0, ofs_weapon, weapon, 0))
+    # Streamed, read once at boot, like WALLTEX: thingsLoad/sprImgLoad
+    # (mapload.asm) DMA them straight into SPRDATA/SPRIMG and nothing reads
+    # either block's REU offset again (docs/reu-format.md §4.10/§4.11).
+    if things:
+        blocks.append((BLK_THINGS, 0, ofs_things, things, 0))
+    if sprimg:
+        blocks.append((BLK_SPRIMG, 0, ofs_sprimg, sprimg, 0))
     if music:
         blocks.append((BLK_MUSIC, BF_PAGES, ofs_music, music, 0))
 
@@ -1833,7 +1989,7 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
             "src/defs.asm together -- mapload.asm derives MAXDESCS from it and "
             "rejects the image with mapErr=4 (bad block count).")
 
-    used = align(ofs_weapon + len(weapon))
+    used = align(ofs_sprimg + len(sprimg))
     if used > REU_PROBE_OFFSET:
         raise ValueError(
             f"image is {used} B and would reach REU ${REU_PROBE_OFFSET:06X}, "
@@ -2192,6 +2348,39 @@ def validate(m: MapData, img: bytes) -> list[str]:
                                    f"{sil[x]} but row {y} is transparent")
                         break
 
+    # §12's static props (THINGS/SPRIMG, blocks 11/12). Optional -- the
+    # built-in TEST map (--map TEST) has no WAD to draw doomednums from, so
+    # main() leaves both blocks out rather than ship an empty one.
+    th = p["blocks"].get(BLK_THINGS)
+    si = p["blocks"].get(BLK_SPRIMG)
+    if m.things:
+        check(th is not None, "map has things but image has no THINGS block")
+        check(si is not None, "map has things but image has no SPRIMG block")
+    if th is not None:
+        check(th["flags"] & BF_RESIDENT == 0, "THINGS must not be resident")
+        data = th["data"]
+        first = data[:MAXSSEC + 1]
+        check(list(first) == sorted(first), "sprSsecFirst is not monotonic")
+        check(first[MAXSSEC] == len(m.things),
+              f"sprSsecFirst's total {first[MAXSSEC]} does not match "
+              f"{len(m.things)} things")
+        # by_ssec cross-checks the prefix-sum table against the things it was
+        # built from -- the failure this catches is sprPick (bsp.asm) walking
+        # the wrong slice of thingX/thingY for a subsector at runtime.
+        by_ssec = Counter(t[2] for t in m.things)
+        for s in range(MAXSSEC):
+            check(first[s + 1] - first[s] == by_ssec.get(s, 0),
+                  f"sprSsecFirst[{s}] disagrees with the things actually in "
+                  "that subsector")
+        typ = data[MAXSSEC + 1 + 4 * MAXTHINGS:MAXSSEC + 1 + 5 * MAXTHINGS]
+        check(all(t < NUM_SPRTYPES for t in typ[:len(m.things)]),
+              "a thing's type index is past NUM_SPRTYPES")
+    if si is not None:
+        check(si["flags"] & BF_RESIDENT == 0, "SPRIMG must not be resident")
+        check(si["length"] <= SPRIMG_CAP,
+              f"SPRIMG is {si['length']} B, past SPRIMG_CAP {SPRIMG_CAP}")
+        check(any(b != 0 for b in si["data"]), "the sprite art is entirely clear")
+
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
         for name, child in (("right", nd.right), ("left", nd.left)):
@@ -2392,11 +2581,18 @@ def report(m: MapData, img: bytes) -> None:
     sph = p["node_sph"]
     print(f"  node spheres   max radius {max((r for _, _, r in sph), default=0)}"
           f"  mean {sum(r for _, _, r in sph) / max(1, len(sph)):.0f}")
+    if m.things:
+        by_type = Counter(t for _x, _y, _s, t in m.things)
+        names = [lump for _nums, lump, _ramp in SPRTYPES]
+        print(f"  sprites        {len(m.things)} / {MAXTHINGS}   " + "  ".join(
+            f"{names[i]}:{by_type[i]}" for i in range(NUM_SPRTYPES)
+            if by_type.get(i)))
     for bid, name in ((BLK_MAPINFO, "MAPINFO"), (BLK_NODES, "NODES"),
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
                       (BLK_NODESPH, "NODESPH"), (BLK_WALLTEX, "WALLTEX"),
                       (BLK_HUDBG, "HUDBG"), (BLK_HUDFONT, "HUDFONT"),
                       (BLK_LINEDEFS, "LINEDEFS"), (BLK_WEAPON, "WEAPON"),
+                      (BLK_THINGS, "THINGS"), (BLK_SPRIMG, "SPRIMG"),
                       (BLK_MUSIC, "MUSIC")):
         if bid not in p["blocks"]:
             continue
@@ -2464,6 +2660,7 @@ def main(argv=None) -> int:
             walltex = build_walltex(None)
             hudbg, hudfont = build_hudbg(kla), build_hudfont(kla)
             weapon = build_weapon(None)
+            things, sprimg = b"", b""     # no WAD, so no things to place
         else:
             if not a.wad:
                 ap.error("a WAD path is required unless --map TEST")
@@ -2472,8 +2669,11 @@ def main(argv=None) -> int:
             walltex = build_walltex(wad)
             hudbg, hudfont = build_hudbg(kla), build_hudfont(kla)
             weapon = build_weapon(wad)
+            sprimg, layout = build_sprimg(wad)
+            things = build_things(m, layout)
         music = load_music(a.music) if a.music else b""
-        img = build_image(m, music, walltex, hudbg, hudfont, weapon)
+        img = build_image(m, music, walltex, hudbg, hudfont, weapon,
+                          things, sprimg)
     except (ValueError, OSError) as e:
         print(f"wad2reu: {e}", file=sys.stderr)
         return 2

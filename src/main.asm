@@ -61,8 +61,11 @@ mainLoop:
         jsr lineFrame               // doors and moving sectors -- lines.asm
         jsr wpnPrep                 // bob the gun and seal its columns before
                                     // renderFrame reads the seed -- §12a
-        jsr renderFrame             // 3D -> MATRIX
-        jsr wpnFrame                // the gun, over the world it just sealed
+        jsr renderFrame             // 3D -> MATRIX, then falls through (bspDone
+                                    // jmp-chains into sprFrame, which jmp-chains
+                                    // into wpnFrame) -- mainLoop had one spare
+                                    // byte here (see the SPHCODE errorif below)
+                                    // and a jsr each would have cost six
         jsr convert                 // MATRIX -> back buffer
         jsr framePace               // hold the rate at 25 fps -- clock.asm
         jsr flip                    // show it
@@ -206,6 +209,10 @@ bootMain:
         // the boot sequence. Seeded up there, frame 1 reports reuProbe and
         // mapLoad as compute and poisons ftCMax for the whole run.
         jsr ftInit                  // clock.asm
+        lda #0
+        sta sprVisN                  // §12: seed for the first frame's
+                                     // sprPick -- every frame after this one,
+                                     // sprFrame resets it at its own end
         // The `sei` at the top of main has held for the whole boot. From here
         // the BSP walk's $34/$35 windows are interruptible, which is safe only
         // because musIrq saves and restores $01 and the REU's transfer
@@ -328,6 +335,7 @@ clearHudRows:
 #import "render/walls.asm"
 #import "render/bsp.asm"
 #import "render/weapon.asm"
+#import "render/sprite.asm"
 #import "render/tex.asm"
 #import "lines.asm"
 #import "clock.asm"

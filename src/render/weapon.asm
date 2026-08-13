@@ -91,6 +91,8 @@ wpnPrep:
         bpl !col-
 !rts:   rts
 
+.errorif * > WPNPREP_END, "wpnBoot/wpnPrep overrun the budget §12 left them"
+
 //------------------------------------------------------------
 // wpnFrame — stream and blit, one row at a time.
 //
@@ -100,7 +102,13 @@ wpnPrep:
 // costs nothing to split it -- the REU moves a byte a microsecond
 // whatever the transfer length, so the 1.12 ms is the same either
 // way, and 56 register setups are ~2k cycles = 0.03 ms on top.
+//
+// Moved out to WPNBLIT (§12's defs.asm note) to free WPNCODE's tail
+// as SPRCODE2 -- wpnBoot+wpnPrep alone fit the 128 B left for them
+// with room to spare, and this routine is entered by jsr and
+// returns, so relocating it costs nothing but the .pc line below.
 //------------------------------------------------------------
+.pc = WPNBLIT "weapon blit"
 wpnFrame:
         lda wpnOK
         bne !+
@@ -222,4 +230,4 @@ wpnCell:
         jmp wpnRow                  // out of branch range: the row body is
 !rts:   rts                         // ~180 bytes of unrolled cell blit
 
-.errorif * > WPNCODE_END, "the weapon view overflows into the sprite art"
+.errorif * > BODYCODE_END, "the weapon blit overflows the end of MATRIX"

@@ -45,13 +45,19 @@ FT_COMP = 0x02A2                    # the engine's own compute figure, in ticks
 # mainLoop's phases, in call order (src/main.asm). The cost attributed to a
 # phase is the time from its entry to the entry of the next one, so the list
 # must be complete and in order or the arithmetic silently reassigns work.
-PHASES = ["readInput", "playerFrame", "lineFrame", "renderFrame",
-          "convert", "framePace", "flip", "frameMark"]
+PHASES = ["readInput", "playerFrame", "lineFrame", "wpnPrep", "renderFrame",
+          "sprFrame", "wpnFrame", "convert", "framePace", "flip", "frameMark"]
 
 # Phases that are the engine working, as opposed to waiting for the raster or
 # for the frame cap. flip does both (its colour-RAM burst is real work behind
 # the raster wait), so it is excluded here and reported separately.
-COMPUTE = {"readInput", "playerFrame", "lineFrame", "renderFrame", "convert"}
+#
+# wpnPrep/sprFrame/wpnFrame split out here (IMPLEMENTATION_PLAN.md §12) --
+# before this, wpnPrep's cost was buried in lineFrame's bucket and wpnFrame's
+# in renderFrame's, which is exactly the kind of mismeasurement §4 warns
+# against for a phase whose estimate has a history of being wrong by 3-7x.
+COMPUTE = {"readInput", "playerFrame", "lineFrame", "wpnPrep", "renderFrame",
+           "sprFrame", "wpnFrame", "convert"}
 
 
 def load_syms(path):

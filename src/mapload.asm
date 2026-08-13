@@ -47,6 +47,8 @@
 .const BLK_HUDBG    = 8
 .const BLK_HUDFONT  = 9
 .const BLK_WEAPON   = 10
+.const BLK_THINGS   = 11
+.const BLK_SPRIMG   = 12
 
 .const MAPINFOSZ = 32
 .const NODETABSZ = NODETAB_END - NODETAB
@@ -150,8 +152,18 @@ mapBlockLoop:
         jmp mapNextBlock
 !notWeapon:
         cmp #BLK_HUDFONT
-        bne mapNextBlock
+        bne !notHudFont+
         jsr hudFontLoad
+        jmp mapNextBlock
+!notHudFont:
+        cmp #BLK_THINGS
+        bne !notThings+
+        jsr thingsLoad
+        jmp mapNextBlock
+!notThings:
+        cmp #BLK_SPRIMG
+        bne mapNextBlock
+        jsr sprImgLoad
         jmp mapNextBlock
 !resident:
 
@@ -512,6 +524,85 @@ weaponLoad:
         rts
 !bad:   lda #MERR_SIZE
         jmp mapFail
+
+//------------------------------------------------------------
+// thingsLoad — block 11. Every field in THINGS_LEN is a compile-time bound
+// (MAXSSEC/MAXTHINGS/NUM_SPRTYPES), not sized to the WAD's actual thing
+// count, so this is a fixed-length check like texLoad's, straight into
+// SPRDATA (src/defs.asm, docs/reu-format.md §4.10).
+//------------------------------------------------------------
+thingsLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #<THINGS_LEN
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        cmp #>THINGS_LEN
+        bne !bad+
+        lda #<SPRDATA
+        sta REU_C64ADDR
+        lda #>SPRDATA
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #<THINGS_LEN
+        sta REU_LENGTH
+        lda #>THINGS_LEN
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+
+//------------------------------------------------------------
+// sprImgLoad — block 12. Unlike every other streamed loader, the length is
+// not a fixed compile-time constant: SPRIMG's byte count depends on how the
+// 7 pictures downsample, which wad2reu.py decides from the WAD's own art.
+// So this trusts the descriptor's own length instead of asserting it equals
+// one baked into defs.asm, and only bounds it against SPRIMG_CAP -- the one
+// thing that *is* fixed, because it is what SPRART's layout reserved
+// (src/defs.asm, docs/reu-format.md §4.11).
+//------------------------------------------------------------
+sprImgLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        sta REU_LENGTH
+        iny
+        lda (zMLDesc),y
+        sta REU_LENGTH+1
+        cmp #>SPRIMG_CAP
+        bcc !ok+
+        bne !bad+
+        ldy #bdLen                  // hi byte ties SPRIMG_CAP: lo must be 0
+        lda (zMLDesc),y
+        beq !ok+
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+!ok:    lda #<SPRIMG
+        sta REU_C64ADDR
+        lda #>SPRIMG
+        sta REU_C64ADDR+1
+        ldy #bdReuOfs
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #REU_FETCH
+        sta REU_COMMAND
+        rts
 
 //------------------------------------------------------------
 // hudBlitCell -- one raw cell (zHudSrc, 10 bytes: 8 bitmap bytes, 1 screen

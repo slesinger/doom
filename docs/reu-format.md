@@ -571,6 +571,102 @@ a single byte value, which would render as a blank digit.
 
 ---
 
+### 4.10 `THINGS` — static props, sorted by subsector
+
+Block 11, `IMPLEMENTATION_PLAN.md` §12. Streamed and read exactly once at
+boot, like `LINEDEFS`/`HUDBG` — `thingsLoad` (`src/mapload.asm`) DMAs it
+straight into `SPRDATA` (`$6d00`) and nothing reads the block's own REU
+offset again after that; unlike `WEAPON`, a prop's picture never moves once
+placed, so there is no per-frame re-fetch to point at.
+
+`wad2reu.py`'s `THING_TYPE_OF` filters Doom's THINGS lump down to the 7
+doomednums `SPRTYPES` lists (a barrel, a lit floor lamp, a candelabra, a tall
+techno column, two flavours of bloody remains, and a pool of blood and
+bones) — every monster, pickup, and other decoration is out of M2's scope
+(props are "drawn, not animated and not intelligent") and dropped at the
+tool, not on the 6502. Each survivor is placed by `descend()`, the same
+BSP-descent helper the runtime's own `bspLoop`/`sideOf` walk performs, so a
+thing's recorded subsector always agrees with which subsector `renderSsec`
+will actually be drawing it from.
+
+There is no per-thing world Z. Every in-scope prop stands on its own
+subsector's floor, which `secFront` (`src/render/bsp.asm`) already leaves in
+`zDzF` by the time `sprPick` runs — storing a Z here would only be that same
+value, baked stale, for `MAXTHINGS` bytes.
+
+Layout, `SPRDATA` (`$6d00`) to `SPRDATA_END`, byte for byte (`src/defs.asm`):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | `MAXSSEC+1` = 238 | `sprSsecFirst` — prefix-sum index. Subsector `i`'s things are `[sprSsecFirst[i], sprSsecFirst[i+1])` into the five arrays below |
+| 238 | `MAXTHINGS` = 36 | `thingXlo` |
+| 274 | `MAXTHINGS` | `thingXhi` |
+| 310 | `MAXTHINGS` | `thingYlo` |
+| 346 | `MAXTHINGS` | `thingYhi` |
+| 382 | `MAXTHINGS` | `thingType` — index into the type table below, `0..NUM_SPRTYPES-1` |
+| 418 | `NUM_SPRTYPES` = 7 | `sprTypArtLo` — art offset into `SPRIMG`, low byte |
+| 425 | 7 | `sprTypArtHi` |
+| 432 | 7 | `sprTypW` — art box width, columns |
+| 439 | 7 | `sprTypH` — art box height, rows |
+| 446 | 7 | `sprTypHW` — world half-width, the on-screen size a thing's projection is computed from |
+| 453 | 7 | `sprTypWH` — world height |
+
+Total 460 bytes, budgeted to 588 (`SPRART`'s `$300`-byte block 11 slot
+leaves room for `SPRIMG` to start on the next page at `SPRART+$300`). `MAXSSEC`
+= 237 (E1M1's own subsector count) and `MAXTHINGS` = 36 (33 in-scope E1M1
+things + slack) are compile-time buffer bounds, not read at runtime — the
+same shape as `MAXNODES`/`MAXSEC`.
+
+`sprTypW`/`sprTypH` are the *downsampled art* box (`SPR_WMAX x SPR_HMAX`,
+aspect-corrected from the Doom picture, the same "tight box, not a fixed
+grid" call `WALLTEX`'s tiles make); `sprTypHW`/`sprTypWH` are the *world*
+half-width/height a thing's on-screen size is computed from, which per
+Doom's own convention is just the source picture's raw pixel size in world
+units, not the downsampled box — coarse art at the true on-screen size beats
+sharp art at the wrong one. There are no precomputed 8.8 fixed-point
+u-step/v-step-per-`ry` coefficients: `sprDraw` (`src/render/sprite.asm`)
+computes them at draw time from `sprTypHW`/`sprTypWH` instead, trading two
+extra divides a frame per visible thing for simpler, less bug-prone code.
+
+`--validate` checks `sprSsecFirst` is monotonic and its prefix sums agree
+with which subsector each thing actually landed in, that its total matches
+the thing count, and that every `thingType` entry is a valid type index.
+
+### 4.11 `SPRIMG` — the resident sprite pictures
+
+Block 12, `IMPLEMENTATION_PLAN.md` §12, §14a.2. Streamed and read exactly
+once at boot — `sprImgLoad` (`src/mapload.asm`) DMAs it straight into
+`SPRIMG` (`$7000`, page-aligned) — but unlike `THINGS`, the art it lands
+lives on afterward: `sprDraw` samples it directly out of that fixed address
+every frame a prop is visible, the same "resident, not streamed" trade
+`NODES`/`SECTORS`/`MAPINFO` make and `WEAPON`'s art deliberately does not
+(§4a's per-row DMA exists because there was nowhere to put 1120 bytes
+resident; `SPRIMG`'s 7 pictures together fit in `SPRIMG_CAP` = 1024 bytes).
+
+Column-major, one byte per pixel — `%rrrriiii`, ramp in the high nibble,
+4-bit intensity in the low, `SPR_CLEAR` (0) transparent — not 4-bit packed
+like `WALLTEX`'s tiles or `WEAPON`'s art, because a masked scaled blit reads
+one source pixel per destination pixel at an arbitrary (non-integer) step
+and byte-per-pixel needs no nibble-parity bookkeeping at the read cursor the
+way a packed format would.
+
+The 7 pictures are packed back to back in `SPRTYPES` order, no padding
+between them; `sprTypArtLo`/`sprTypArtHi` (block 11) give each one's byte
+offset into this block, `sprTypW`/`sprTypH` its `art_w * art_h` extent.
+Each picture is `art_w` columns of `art_h` bytes, `_picture_intensity_grid`'s
+same box-average + rank-spread downsample the HUD font and weapon art use,
+with the type's ramp (one of the existing thematic ramps — moss for the
+barrel, lite for the lamp, fire for the candelabra, tech for the column,
+flesh for the corpses/blood — §12 claims no new ramp, reusing `chunky2mc.asm`
+slots 9-13) baked into every opaque byte at build time so `sprDraw` never
+has to OR one in at blit time.
+
+`--validate` checks the block is present whenever the map has things, that
+its length does not exceed `SPRIMG_CAP`, and that it is not entirely clear
+(which would mean every prop renders invisible).
+
+---
+
 ## 5. `SSECDATA` — the streamed subsector slots
 
 Subsector `i` lives at REU offset `ssecReuBase + (i << 7)`. **One shift, no

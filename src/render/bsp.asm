@@ -128,7 +128,8 @@ bspPop:
         sta zChild+1
         jmp bspLoop
 bspDone:
-        rts
+        jmp sprFrame                 // §12: draw order, zero-byte-cost -- see
+                                     // mainLoop's jsr renderFrame (main.asm)
 
 //------------------------------------------------------------
 // renderSsec — draw the subsector whose index is in zChild.
@@ -146,6 +147,8 @@ renderSsec:
         :Count(CNT_SSEC)
         ldy zSecId
         jsr secFront
+        jsr sprPick                  // §12: this subsector's static props,
+                                     // while zDzF/zDzC are still this sector's
         lda #0
         sta zWIdx                   // seg cursor: a byte offset, not an index
         lda zSegCnt
