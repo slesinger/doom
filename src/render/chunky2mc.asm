@@ -35,7 +35,22 @@
                                         // the spare slots below, claimed by
                                         // wad2reu.py's HUD_RAMP for STBAR and
                                         // STTNUM's own warm palette
-.for (var r=9; r<16; r++) .eval ramps.add(List().add($b,$c,$f)) // spare
+// 9-13 claimed 2026-08-13 (IMPLEMENTATION_PLAN.md §10.7). A tile modulates the
+// intensity nibble only — the ramp is one per 4x8 cell, fixed by the VIC — so
+// the material's *colour* can only come from the ramp the seg carries. Seven of
+// these sixteen slots were duplicates of stone while E1M1's 32 wall textures
+// shared six ramps, which is the mush of M1 risk #5. Splitting the overloaded
+// ones costs nothing at runtime: the table is assembled, not computed.
+.eval ramps.add(List().add($9,$c,$f))   //  9 tan     brown grey lgrey  STARTAN
+.eval ramps.add(List().add($5,$7,$d))   // 10 slime   green yellow lgreen
+.eval ramps.add(List().add($6,$c,$1))   // 11 tech    blue grey white -- $e
+                                        // (VIC "light blue") is violet in
+                                        // Pepto and read as such on screen;
+                                        // dgrey/grey/white would have been
+                                        // METAL exactly
+.eval ramps.add(List().add($b,$8,$f))   // 12 door    dgrey orange lgrey
+.eval ramps.add(List().add($8,$7,$1))   // 13 lite    orange yellow white
+.for (var r=14; r<16; r++) .eval ramps.add(List().add($b,$c,$f)) // spare
 
 // intensity(0-15) + Bayer threshold -> 2-bit code 0..3
 .function dcode(v, px, row) {

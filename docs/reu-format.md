@@ -425,7 +425,9 @@ the tile is 16 wide.
 **The tile modulates intensity and never touches the ramp.** The chunky byte is
 `ramp << 4 | intensity` and a 4×8 multicolor cell holds three colours plus
 background, so a surface's cell stays legal only while the whole surface shares
-one ramp (`IMPLEMENTATION_PLAN.md` §10.1). The engine's combination is
+one ramp (`IMPLEMENTATION_PLAN.md` §10.1). Material *colour* therefore rides on
+the seg's ramp nibble, not on the tile — see §10.7 for the five ramps that were
+claimed to give it somewhere to ride. The engine's combination is
 
 ```
 final = clamp(depthIntensity + texel - 8, 2, 15)
@@ -556,10 +558,10 @@ rather than taste:
   screenshot. Ordered dither is right for a shaded wall and wrong for a
   status bar.
 
-Both blocks share **ramp 8**, one of `chunky2mc.asm`'s eight spare ramp slots
-(8-15 are reserved, unused duplicates of ramp 0, kept for exactly this kind
-of future use) redefined with the WAD's own status-bar palette. No table
-growth, no RAM impact — the slot was already resident.
+Both blocks share **ramp 8**, the first of `chunky2mc.asm`'s spare ramp slots,
+redefined with the WAD's own status-bar palette. No table growth, no RAM
+impact — the slot was already resident. Slots 9-13 were claimed the same way
+for wall materials (`IMPLEMENTATION_PLAN.md` §10.7); 14-15 remain free.
 
 `--validate` checks both blocks are present, exactly the expected length, and
 — echoing the `WALLTEX` uniform-tile check — that no digit glyph quantises to

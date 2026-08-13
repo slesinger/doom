@@ -755,10 +755,23 @@ machine.
 +155.1 k cycles is **+2.4 ms of CPU** at 64 MHz, against which the per-seg tile
 DMA that no longer happens is worth **~1.0 ms** on hardware and almost nothing
 in VICE (≤33 textured segs a frame × 32 B, at 1 byte/µs — the asymmetry §4
-warns about, in the direction that flatters the emulator). **Net ≈ +1.4 ms on
-hardware, projected, not yet measured there**: ~46.6 ms of compute against the
-59.85 ms deadline, leaving ~11 ms for §12's sprites. `make u64-fps` is the
-outstanding confirmation, and §13.1's warning applies — space the runs out.
+warns about, in the direction that flatters the emulator). Net ≈ +1.4 ms on
+hardware, projected at ~46.6 ms of compute against the 59.85 ms deadline.
+
+**Measured on the Ultimate 2026-08-13, and the projection held**: `make u64-map`
+(image v6 delivered intact, `mapOK=1`) then `make u64-fps` —
+
+```
+fps: 167 frames in 10.04 s = 16.63 fps (60.1 ms/frame)
+frame: compute 47.7 ms last, 46.7 min, 47.7 max (deadline 59.85 ms)
+frame: raster frames 1x0 2x0 3x168 4+x0 -- 100% made the 16.7 fps deadline
+```
+
+46.7-47.7 ms against a 46.6 ms projection — the cost model of §14a.1a
+(`ms ≈ cycles/64e6 + 1 µs per DMA byte`) predicted this phase to within a
+millisecond. **The fourth raster frame was not needed and stays in reserve**,
+and ~12 ms of the deadline is free for §12's sprites. This run also confirms
+§14a.1's 160-row cut on hardware for the first time.
 
 Where it differs from what §10.2-§10.3 would have predicted:
 
@@ -788,9 +801,19 @@ detail and cannot beat against the dither. It is three constants in
 | `texVSet` shift | `ldx #5` | `ldx #4` |
 | `texVSet` step | `13107` (ry/5) | `6554` (ry/10) |
 
-Both were built and screenshotted this session; neither is obviously wrong on
-an emulator screenshot, which is precisely why §10.5 says the frame is the only
-oracle this engine has.
+**Settled 2026-08-13: keep 8 units, and the oracle question was the real
+mistake.** The earlier "reads as noise" finding was made against `u64shot.py`
+and `shot.py`-style *chunky* dumps, which render the `%rrrriiii` buffer at full
+16-shade precision — a view in which a fine texel really does look like
+per-pixel hash, because nothing has quantised it yet. The picture that matters
+is the VIC's, and `make shot` (`-exitscreenshot`) is exactly that: post-dither,
+post-attribute, and deterministic, so the emulator's PNG is the hardware
+picture. Compared that way the 8-unit and 16-unit builds differ only slightly —
+8 units gives finer vertical banding on E1M1's yellow panels, 16 units a
+broader roll — and neither disintegrates into noise. The dither does not beat
+against the texture, because both tile axes are powers of two on a 4×4 Bayer
+grid: they phase-lock rather than moiré. 8 units also keeps the texture at the
+scale the artist drew it, so it stays.
 
 Two traps, both the same shape as §11.4's and §13.1's:
 
@@ -805,6 +828,69 @@ Two traps, both the same shape as §11.4's and §13.1's:
    `txColBase` in the symbol file** rather than written as a constant, because
    TX_COL moves whenever the bin-packing does and a stale address there would
    silently stop covering the block.
+
+### 10.7 Colour: five ramps claimed, and §10 closed *(2026-08-13)*
+
+**A tile modulates the intensity nibble and never the ramp**, because a VIC
+multicolor cell has one three-colour palette and `chunky2mc`'s converter picks
+it from a single sample pixel per cell (`MATRIX + 13` — row 3, px 1). That is
+not a limitation of the sampler and cannot be bought off with cycles: a
+per-texel ramp would put four palettes in a 4-pixel-wide cell and lose three of
+them, which is attribute clash, not detail.
+
+So the material's *colour* can only come from the ramp the seg already carries
+— and that is where the slack was. Ramps 9-15 were duplicates of stone, while
+E1M1's 32 wall texture names shared six ramps: STARTAN sat on WOOD with the
+browns, every door on METAL with its own jamb, the computer banks on SKY with
+the flat blue screens. Five of the spares are now real materials:
+
+| | ramp | colours | takes |
+|---|---|---|---|
+| 9 | tan | brown grey lgrey | STARTAN1/3 |
+| 10 | slime | green yellow lgreen | NUKE24, SLADWALL, NUKAGE3 |
+| 11 | tech | blue grey white | COMPTALL, COMPUTE2, COMPSPAN |
+| 12 | door | dgrey orange lgrey | BIGDOOR, DOOR3, EXITDOOR, SW1STRTN |
+| 13 | lite | orange yellow white | LITE3, EXITSIGN, TLITE6 |
+
+Wall segs now spread over ten ramps — `stone:220 tan:112 wood:112 moss:105
+metal:58 sky:52 lite:25 tech:21 slime:15 door:12` — where they spread over six.
+**This costs nothing at runtime**: `ramps` is a KickAss table built at assembly
+time, `scrTab`/`colTab` are already 256-byte lookups, and the seg record's ramp
+nibble was always there. No cycles, no bytes, no new code path. It is the whole
+answer to "textures modulate intensity only", and it is the one that fits the
+hardware rather than fighting it.
+
+Two things learned while picking the colours, both cheap to get wrong:
+
+- **VIC "light blue" (`$e`) is violet in Pepto** (120,105,196). The first tech
+  ramp used it and the computer banks came out purple. `make shot` showed it
+  immediately; a chunky dump could not have.
+- **A ramp that duplicates another is worse than a spare**, because it spends a
+  material slot to say nothing: dgrey/grey/white for tech would have been METAL
+  exactly. Ramps 14-15 stay stone duplicates, unclaimed and honest.
+
+Also closed here:
+
+- **Unknown wall textures now land on a family, not on nothing.** `TEX_PLAIN`
+  meant two different things — "the WAD put no texture on this sidedef" (177 of
+  E1M1's 732 segs, a fact about the map) and "our table does not know this
+  name" (our gap). The first stays untextured; the second falls back to
+  `TEX_FALLBACK` = family 2, STARTAN3, the nearest thing E1M1 has to a generic
+  panel, and `--report` still counts it as a miss. E1M1 itself has no misses;
+  this is what makes a second map degrade gracefully instead of flat.
+- **Per-seg texture offsets stay out** by decision — at 160×160 with a 4×4
+  dither, alignment at a wall's own seam is below what the display resolves,
+  and carrying an offset means widening the hottest record in the engine (§4).
+- **Floors and ceilings stay flat**, and the reason is structural rather than
+  budgetary. There are no horizontal spans in this renderer: `doWall`'s column
+  loop fills ceiling and floor as *vertical* runs of one constant byte
+  (`zCeilByte`/`zFloorByte`, `spanFill` in `math.asm`). A textured flat needs
+  the opposite rasterizer — horizontal spans, one division per screen row for
+  depth, and a 2D u/v walk per pixel — i.e. visplanes, which §8 put out of M2.
+  Confirmed by reading the code, not inherited from the §8 table.
+
+**§10 is closed.** Walls are textured, measured on hardware at 46.7-47.7 ms of
+a 59.85 ms frame, and the picture is `c1dd1bb3…`. Next is §12, sprites.
 
 ## 11. Phase 9 — Doors and moving sectors
 

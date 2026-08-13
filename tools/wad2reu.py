@@ -448,9 +448,10 @@ MAPID_TEST, MAPID_E1M1 = 0, 1
 # ----------------------------------------------------------------------------
 # Ramp assignment — the M1 art-direction knob.
 #
-# chunky2mc.asm defines 16 ramps of 3 colours each; ramps 8-15 are currently
-# duplicates of stone, so only 0-7 carry information. Filling the spares is an
-# asm change and is out of scope for Milestone 1.
+# chunky2mc.asm defines 16 ramps of 3 colours each. 0-7 came from M1, 8 is the
+# HUD's, and 9-13 were filled in M2 (IMPLEMENTATION_PLAN.md §10.7) because a
+# texture tile can only modulate intensity -- colour has to come from here.
+# 14-15 are still stone duplicates and are free.
 #
 # Matching is by prefix, longest first, so STARTAN3 beats STAR*. Anything
 # unmatched falls back to DEFAULT_RAMP and is reported by --report so a texture
@@ -458,9 +459,15 @@ MAPID_TEST, MAPID_E1M1 = 0, 1
 # ----------------------------------------------------------------------------
 
 STONE, WOOD, FLESH, SKY, MOSS, VIOLET, METAL, FIRE = range(8)
+# 8 is HUD_RAMP. 9-13 were claimed 2026-08-13 -- see chunky2mc.asm's table and
+# IMPLEMENTATION_PLAN.md §10.7: a tile modulates intensity only, so material
+# colour has to come from the ramp, and six ramps across 32 wall textures is
+# what made distinct materials read alike.
+TAN, SLIME, TECH, DOOR, LITE = range(9, 14)
 
 RAMP_NAMES = ["stone", "wood", "flesh", "sky", "moss",
-              "violet", "metal", "fire"] + [f"spare{i}" for i in range(8, 16)]
+              "violet", "metal", "fire", "hud",
+              "tan", "slime", "tech", "door", "lite", "spare14", "spare15"]
 
 DEFAULT_RAMP = STONE
 
@@ -469,20 +476,24 @@ WALL_RAMPS = {
     # brown/tan structural — the bulk of E1M1's corridors
     "BROWN1": WOOD, "BROWN144": WOOD, "BROWN96": WOOD,
     "BRNBIGL": WOOD, "BRNBIGR": WOOD, "BRNBIGC": WOOD,
-    "STARTAN": WOOD,                     # STARTAN1, STARTAN3
+    "STARTAN": TAN,                      # STARTAN1, STARTAN3 — tan over grey,
+                                         # not the brown BROWN* is
     # brown-green: split off from plain brown so the two read apart
     "BROWNGRN": MOSS,
-    "SLADWALL": MOSS, "NUKE24": MOSS,    # slime and nukage surrounds
+    "SLADWALL": SLIME, "NUKE24": SLIME,  # slime and nukage surrounds
     # grey structural
     "STARG": STONE, "STARGR": STONE,
     "SUPPORT2": METAL, "DOORSTOP": METAL, "DOORTRAK": METAL,
     "STEP1": METAL, "STEP6": METAL,
-    "BIGDOOR": METAL, "DOOR3": METAL, "EXITDOOR": METAL, "SW1STRTN": METAL,
-    # computers and tech panels — blue, and the strongest landmark in E1M1
-    "TEKWALL": SKY, "COMPTILE": SKY, "COMPUTE2": SKY, "COMPTALL": SKY,
-    "COMPSPAN": SKY, "PLANET1": SKY,
+    # doors read as their own material, and the jambs stay METAL so the door
+    # is visibly a different surface from the frame it sits in
+    "BIGDOOR": DOOR, "DOOR3": DOOR, "EXITDOOR": DOOR, "SW1STRTN": DOOR,
+    # computers and tech panels — the strongest landmark in E1M1. The flat
+    # blue screens stay SKY; the banks with white readouts get TECH
+    "TEKWALL": SKY, "COMPTILE": SKY, "PLANET1": SKY,
+    "COMPUTE2": TECH, "COMPTALL": TECH, "COMPSPAN": TECH,
     # lit things
-    "LITE3": FIRE, "EXITSIGN": FIRE,
+    "LITE3": LITE, "EXITSIGN": LITE,
 }
 
 # Flats (floors and ceilings).
@@ -493,9 +504,9 @@ FLAT_RAMPS = {
     "FLAT18": STONE, "FLAT23": STONE,
     "FLAT14": WOOD, "FLAT5_5": WOOD,
     "FLAT20": METAL, "STEP2": METAL,
-    "NUKAGE3": MOSS,
+    "NUKAGE3": SLIME,
     "F_SKY1": SKY,
-    "TLITE6": FIRE,                      # TLITE6_1/4/5/6
+    "TLITE6": LITE,                      # TLITE6_1/4/5/6
 }
 
 
@@ -516,6 +527,14 @@ FLAT_RAMPS = {
 # ----------------------------------------------------------------------------
 
 TEX_PLAIN = 0                   # no texture on the sidedef; uniform tile
+
+# A sidedef that *does* name a texture the table below does not know falls back
+# to this family rather than to TEX_PLAIN. The two cases are different and only
+# one is a miss: "the WAD put no texture here" is a fact about the map and must
+# stay untextured, while "this name is not in our table" is our gap, and a
+# generic panel tile is a better answer than a flat wall. STARTAN3 is the
+# nearest thing E1M1 has to a default surface. --report still counts the miss.
+TEX_FALLBACK = 2                # STARTAN3
 
 # family id -> the WAD texture whose 8x8 downsample becomes the tile.
 # None means "synthesise a uniform tile" and is only legal for TEX_PLAIN.
@@ -1080,7 +1099,9 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
 
         A sidedef with no texture at all is TEX_PLAIN, not a miss: 177 of E1M1's
         732 segs are two-sided lines the WAD itself leaves untextured, and
-        counting those as unmatched would bury a genuine miss in the noise.
+        counting those as unmatched would bury a genuine miss in the noise. A
+        sidedef that names an unknown texture *is* a miss, and gets
+        TEX_FALLBACK — see there.
         """
         if idx == 0xFFFF:
             return TEX_PLAIN
@@ -1088,7 +1109,8 @@ def load_wad_map(wad: Wad, mapname: str) -> MapData:
         for tex in (middle, upper, lower):
             name = txt(tex)
             if name and name != "-":
-                return pick_ramp(name, WALL_TEX_FAMILY, m.tex_misses, TEX_PLAIN)
+                return pick_ramp(name, WALL_TEX_FAMILY, m.tex_misses,
+                                 TEX_FALLBACK)
         return TEX_PLAIN
 
     segs = []
@@ -2048,7 +2070,10 @@ C64 = [(0, 0, 0), (255, 255, 255), (136, 57, 50), (103, 182, 189),
        (139, 63, 150), (85, 160, 73), (64, 49, 141), (191, 206, 114),
        (139, 84, 41), (87, 66, 0), (184, 105, 98), (80, 80, 80),
        (120, 120, 120), (148, 224, 137), (120, 105, 196), (159, 159, 159)]
-RAMP_MID = [0xc, 0x8, 0xa, 0xe, 0x5, 0x4, 0xc, 0x8] + [0xc] * 8
+RAMP_MID = [0xc, 0x8, 0xa, 0xe, 0x5, 0x4, 0xc, 0x8,   # 0-7
+            0x8,                                     # 8  hud
+            0xc, 0x7, 0xc, 0x8, 0x7,                 # 9-13 tan slime tech
+            0xc, 0xc]                                # door lite, then 14-15
 
 
 def render_png(img: bytes, path: str, size: int = 1000) -> None:
@@ -2166,7 +2191,8 @@ def report(m: MapData, img: bytes) -> None:
               f"{RAMP_NAMES[DEFAULT_RAMP]}): "
               + ", ".join(f"{k}x{v}" for k, v in m.ramp_misses.most_common()))
     if m.tex_misses:
-        print("  UNMAPPED texture families (fell back to plain): "
+        print("  UNMAPPED texture families (fell back to "
+              f"{FAMILY_TEXTURE[TEX_FALLBACK]}): "
               + ", ".join(f"{k}x{v}" for k, v in m.tex_misses.most_common()))
 
 
