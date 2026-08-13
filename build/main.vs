@@ -6,7 +6,7 @@ al C:9d42 .spanPrep
 al C:de96 .lnMove
 al C:5178 .mapBlockLoop
 al C:593d .lnThinkSrc
-al C:5fe3 .mapMagicStr
+al C:5fef .mapMagicStr
 al C:ffe3 .musNmi
 al C:5de5 .hudBlitCell
 al C:ca28 .doWall
@@ -23,7 +23,7 @@ al C:c30 .sphereVisible
 al C:9cf6 .spanCells
 al C:97fe .sideBack
 al C:57b1 .txFetchSrc
-al C:5fbb .mapCopyTail
+al C:5fc7 .mapCopyTail
 al C:cd48 .colAdvance
 al C:ff40 .musIrq
 al C:de8 .texUpd
@@ -36,7 +36,7 @@ al C:9b85 .umul16
 al C:c3e8 .lineFrame
 al C:6b82 .colClose
 al C:ab7 .moveBlocked
-al C:5fef .mapMaxLenHi
+al C:5ffb .mapMaxLenHi
 al C:ce7a .bspPop
 al C:5d63 .thingsLoad
 al C:9b7b .m8b
@@ -79,7 +79,7 @@ al C:dfb1 .lnEnter
 al C:9eb4 .clipT
 al C:770 .vSeed
 al C:df20 .lnFire
-al C:6f48 .sprSetupUV
+al C:6f4a .sprSetupUV
 al C:9db3 .lineSetup
 al C:9f49 .projRow
 al C:5c40 .hudBgLoad
@@ -94,12 +94,12 @@ al C:9b60 .mul8
 al C:9500 .colTab
 al C:ce8f .bspDone
 al C:57b1 .txSeedEnd
-al C:5feb .mapMaxLenLo
+al C:5ff7 .mapMaxLenLo
 al C:7500 .moveSteps
 al C:cb3 .wallShade
 al C:6f3d .sprStep
 al C:6b1b .wpnPrep
-al C:5fd2 .mapCopyDone
+al C:5fde .mapCopyDone
 al C:ffe4 .jumpStep
 al C:5700 .texBoot
 al C:eef .playerFrame
@@ -133,7 +133,7 @@ al C:9ed0 .mulT
 al C:bda .slideAbs
 al C:9d3f .spanEnd
 al C:9d9a .clampAcc
-al C:5fe7 .mapLoadHi
+al C:5ff3 .mapLoadHi
 al C:ce47 .bspLoop
 al C:541e .miFail
 al C:ffd8 .miExit
@@ -150,7 +150,7 @@ al C:96a0 .xOfsHi
 al C:9a5 .moveDone
 al C:7ed3 .segPushNo
 al C:bf40 .texUEnds
-al C:5fc1 .mapCopyByte
+al C:5fcd .mapCopyByte
 al C:6b50 .segShade
 al C:cf30 .ssecSegs
 al C:9fca .framePace
@@ -181,7 +181,7 @@ al C:cf99 .secBack
 al C:6b8f .sprPick
 al C:9a41 .pageDone
 al C:cfc0 .setEyeZ
-al C:6f9e .sprDrawX
+al C:6fa0 .sprDrawX
 al C:bfb .slideNorm
 al C:810 .main
 al C:e70 .segNear
@@ -231,11 +231,11 @@ al C:5900 .lineBoot
 al C:9a4b .patchMatrixPage
 al C:8400 .ditherTabs
 al C:cfdd .uAdvance
-al C:5f8c .mapCopyStaged
+al C:5f98 .mapCopyStaged
 al C:7f67 .wpnCell
 al C:de40 .lnStep
 al C:dfdb .lineInit
 al C:9ab1 .bumpBmpPage
 al C:de81 .lnBack
-al C:5fa4 .mapCopyPage
+al C:5fb0 .mapCopyPage
 al C:9400 .scrTab

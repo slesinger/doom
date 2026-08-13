@@ -843,11 +843,21 @@ hudBgLoop:
         cmp #HUD_BG_CELLS_W*HUD_BG_CELLS_H
         bne hudBgLoop
 
+        // AMMO's and HEALTH's boxes are only 4 cells wide in the art (see
+        // defs.asm) -- clamp to 99 so the hundreds digit hudDrawField always
+        // draws stays "0" and the two fields pack without either spilling
+        // into ARMOR/ARMS territory. ARMOR's box is the full 6 cells, unclamped.
         lda hudAmmo
-        ldx #HUD_AMMO_COL
+        cmp #100
+        bcc !+
+        lda #99
+!:      ldx #HUD_AMMO_COL
         jsr hudDrawField
         lda hudHealth
-        ldx #HUD_HEALTH_COL
+        cmp #100
+        bcc !+
+        lda #99
+!:      ldx #HUD_HEALTH_COL
         jsr hudDrawField
         lda hudArmor
         ldx #HUD_ARMOR_COL

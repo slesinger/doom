@@ -725,6 +725,57 @@ REU cache keyed on the fact that consecutive frames draw the same things — but
 §4's revert says model it with a hit count first, because "trade CPU for REU
 bytes" has been close to exhausted in this engine at this frame size.
 
+### 12.5 Landing note *(2026-08-13)*
+
+Built to plan: `THINGS`/`SPRIMG` resident blocks (`wad2reu.py`), `sprPick`
+hooked into `bsp.asm`'s `renderSsec`, `sprSort`/`sprFrame`/`sprDraw`/`sprBlit`
+across three code segments (SPRCODE2/SPRCODE3/SPRCODE, packed like `tex.asm`'s
+eleven pieces because that is what the machine had room for). Confirmed on
+hardware: barrels, dead bodies, and candelabra all render.
+
+**Bug found only by hardware play, not by `make check`/`framehash`: only
+barrels (type 0) ever drew.** `sprStep` (the routine that turns an art
+dimension into the 8.8 fixed-point `uStep`/`vStep` used to walk the sprite's
+source pixels) built its dividend in `zA`, but `udiv` reads its dividend from
+`zD` — so every call divided whatever `zD` happened to hold left over from the
+*previous* division (`sprScale`'s box-size math), not `art_dim*256`. Garbage
+steps pinned the source pointer near art column/row 0 for the frame, which for
+most types sampled straight into `SPR_CLEAR` (transparent) the whole way
+through — nothing blitted. Barrels apparently sampled real pixels often enough
+by luck of the stale value to be visible at all, which is also the likely
+explanation for the flicker noted below. Three-line fix, `zD`/`zD+1`/`zD+2`
+instead of `zA`/`zA+1` (+2 B; SPRCODE3 219/227 → 221/227 of true budget).
+Found and confirmed via a synchronized live capture over the VICE binary
+monitor: an exec checkpoint at `wpnFrame`'s entry (`$7eeb`) — the instant
+after `sprFrame` finishes and before its zero-page scratch is reused by the
+weapon-view code — reading `sprUStep`/`sprVStep` and scanning the MATRIX
+buffer for the sprite's ramp nibble. Before: `uStep=0`, `vStep=3`, 0 pixels of
+that ramp anywhere on screen. After: `uStep=1.07`, `vStep=1.0`, 150 pixels
+landed in the sprite's projected box.
+
+**Left over, not yet exercised:**
+
+- **Whole-box reject flicker.** §12.1's simplification — a sprite whose
+  projected box pokes off any screen edge is dropped entirely for that frame,
+  no partial clip — makes a barrel visibly disappear/reappear as its box
+  crosses an edge while the player moves. Confirmed on hardware and explicitly
+  accepted as-is: "strange, yet acceptable." Revisit only if it stops reading
+  as a rendering quirk and starts reading as a bug, per §12.1's own M3 note.
+- **§12's other five types** (floor lamp, tech column, and the two remaining
+  gore/corpse variants beyond the ones confirmed) haven't each been individually
+  eyeballed on hardware — only barrels, one corpse type, and the candelabra are
+  confirmed so far by the user's report. Worth a level walk-through to see
+  every `SPRTYPES` entry at least once.
+- **`SPR_NEAR`/`MAXVIS`/`SPR_BIAS`** caps (defs.asm) haven't been stress-tested
+  against a spot with more than a couple of things visible at once, or a thing
+  pressed close against the camera (§12.3's "a barrel pressed against the
+  camera costs a frame" case).
+- **Full regression** (`make walktest`/`doortest`, `make phaseprof`, hardware
+  `make u64-map`/`make u64-fps`) not yet re-run since sprites landed — §12a's
+  landing note put compute at ~48.5 ms of the 49.7 ms cap *before* sprites; a
+  fresh `phaseprof`/hardware fps pass is the way to find out where that stands
+  now.
+
 ## 12a. A weapon view *(proposed 2026-08-13, not built)*
 
 A first-person weapon overlay — screen-fixed, not a world Thing, so it needs

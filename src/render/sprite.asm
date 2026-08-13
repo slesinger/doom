@@ -368,11 +368,12 @@ sprScale:
 // Shared by sprSetupUV's two divides.
 //------------------------------------------------------------
 sprStep:
-        sta zA+1
-        lda #0
-        sta zA
-        sta zV+1
-        jmp udiv
+        sta zD+1                     // dividend = A*256, in zD (udiv's own
+        lda #0                       // input), not zA -- zA is not what
+        sta zD                       // udiv reads; leaving it there made
+        sta zD+2                     // both steps divide whatever zD
+        sta zV+1                     // sprScale's last call happened to
+        jmp udiv                     // leave behind instead
 
 //------------------------------------------------------------
 // sprSetupUV — the screen box is entirely on screen (sprDraw's inline
