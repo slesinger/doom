@@ -35,6 +35,41 @@
 .const WALLTILE_LEN = 16 * 128
 .errorif WALLTILE + WALLTILE_LEN > MATRIX + 28160, "wall tiles run past MATRIX"
 
+// The substepped move (moveSteps, src/input.asm), in the 256 bytes between
+// what the HUD stages at boot and what the wall tiles hold for good.
+//
+// This is *runtime* code inside MATRIX, which nothing else here is, and the
+// two things that makes it depend on both hold with a margin:
+//
+//   - the renderer stops at $73ff (the 160-row viewport, §14a.1), so no span
+//     ever reaches this page;
+//   - boot staging stops at $74ff (HUDFONT_STAGE + HUD_FONT_BYTES), so the
+//     loader does not overwrite it between the PRG landing and the first
+//     frame. That is why it is $7500 and not $7400: the page below is free at
+//     runtime but is the HUD font's staging area at boot.
+//
+// It is in the PRG image like ordinary code -- the image already spans this
+// address (BOOTCODE6 ends at $6049) -- so unlike LINECODE and MUSCODE there is
+// no relocator and no `make check` entry.
+//
+// It exists at all because the main segment has one byte free (main.asm's
+// .errorif against SPHCODE) and below MATRIX the largest unclaimed run is
+// five bytes. §11d's substepping is ~110 bytes.
+.const MOVECODE     = MATRIX + $6500        // $7500-$75ff, 256 B
+.const MOVECODE_END = WALLTILE
+
+// The radius test (segBody, segPush -- src/input.asm), in the 512 bytes
+// between the end of MATRIX and the video matrix.
+//
+// MATRIX is 28160 B because that is 176 rows of 160, and the wall tiles end
+// exactly on its last byte; $7e00-$7fff is what the map has always had left
+// over there. Nothing reads or writes it: the renderer's row bases stop at
+// $73ff (math.asm's rowCellLo/Hi), the VIC is looking at bank 2 ($8000-$bfff)
+// and cannot see this page at all, and boot staging never comes near it.
+// `make check`'s live-RAM diff is what keeps that honest.
+.const BODYCODE     = $7e00
+.const BODYCODE_END = SCREEN0
+
 .const CONVERTER_CODE = $9900
 
 // Free RAM at the tail of the TABLES segment: 448 B, $9740-$98FF. 352 of them
@@ -46,7 +81,10 @@
 .const TABLES_FREE_END = $98ff
 .const MATHCODE       = $9b60      // follows converter code
 .const MATHTAB        = $c400
-.const WALLSCODE      = $ca30
+// $ca28 and not $ca30: the math tables end at $ca27 and the eight bytes to the
+// next round address were slack. doWall's near-plane fail-safe needed two of
+// them (walls.asm, !reject) and the block was already flush against TX_COL.
+.const WALLSCODE      = $ca28
 
 // per-column clip windows (page aligned). colTop/colBot each own a full
 // dedicated page: with spanFill's zSX bounds check in place a stray write
@@ -628,13 +666,55 @@
 .const TURN_SPEED = 4               // angle units (of 256) per frame
 .const MAXSTEP = 24                 // tallest step the player can climb
 .const MINHEAD = 56                 // headroom needed to fit through an opening
-.const PLRAD   = 16                 // player radius, Doom's own value
+// The player is a disc, not a point. Two things use the radius: segNear's
+// bounding box (it always did), and the padded cross product that keeps the
+// body itself out of a wall (segBody, src/input.asm).
+//
+// It is 24 and not Doom's 16 because the renderer's near plane is NEAR = 16:
+// a seg closer than that to the eye is dropped from the frame, and dropping it
+// is what lets the room behind a thin wall show through when the player stands
+// against it. Keeping the body 24 units away means no wall of the subsector
+// the player is standing in can ever get inside the near plane, so the case
+// the renderer cannot draw is a case the player cannot reach.
+//
+// The padded test is conservative on a diagonal seg by up to R*(sqrt(2)-1),
+// i.e. 6.6 units at 45 degrees -- it blocks early, never late. E1M1's tightest
+// legitimate gap is a 64-unit door opening, which leaves 16 units of lane at
+// R = 24 with the diagonal allowance not applying (door jambs are axis
+// aligned), so nothing that was passable stops being passable.
+.const PLRAD   = 24
+.errorif PLRAD != 24, "segBody multiplies by 24 with two shifts and an add"
 
 // How many times checkMove may project the remaining motion onto a blocking
 // seg and try again before it gives up and undoes the move. Three is what an
 // inside corner needs: one attempt to find the first wall, one to find the
 // second after sliding along the first, and one to commit what is left.
 .const SLIDETRY = 3
+
+// How many pieces a frame's motion is broken into before it is tested. The
+// collision test is a *point* test against the segs of one subsector, so the
+// distance a step may cover unchecked is the distance to the far side of the
+// subsector it starts in -- cross a thin one whole and the seg that should
+// have stopped the player was never in SEGBUF at all.
+//
+// E1M1's doors are the case that made this necessary: sector 76's track is
+// 16 units deep and sector 75 in front of it is another 16, against a 21-unit
+// step. Walking south into that door from subsector 216 crossed 216's own
+// (passable) seg, jumped clean over subsector 217 and landed *inside* the
+// closed door, and the door's seg was never tested because it belongs to a
+// subsector the player was never in. Four parts put the longest substep at
+// 7.4 units (21/4 straight, 29.7/4 on the diagonal), comfortably under the
+// 16-unit floor of E1M1's geometry.
+//
+// The cost is four checkMoves a frame instead of one, on frames where the
+// player is moving: ~22k cycles at 1 MHz where the frame's compute is ~3.1M,
+// and four ~80-byte seg DMAs instead of one, which is ~0.24 ms of the REU's
+// flat 1 byte/us on hardware (§5 risk 1). Both are noise; the point test that
+// silently misses a wall is not.
+.const MOVESUBS = 4                 // must be a power of two: the split is a
+                                    // shift and the remainder is an `and`
+.const MOVESHIFT = 2                // log2(MOVESUBS)
+.errorif MOVESUBS != 1 << MOVESHIFT, "MOVESUBS and MOVESHIFT disagree"
 
 // Jumping (SPACE, the same key that opens a door -- see IN_USE below).
 //
@@ -922,10 +1002,48 @@
 // the whole 256-byte tile, because u is monotonic across a seg: the column
 // loop unpacks the column it needs when u changes and never comes back to it.
 //
-// **$d4-$e3 is free zero page**, and it is the only free zero page in the
-// machine. It was TEXBUF, the 32-byte tile Stage A re-DMA'd per seg; the tiles
-// are resident at WALLTILE now and nothing is copied per seg at all.
+// $d4-$e3 was free zero page -- the last of it in the machine. It was TEXBUF,
+// the 32-byte tile Stage A re-DMA'd per seg; the tiles are resident at WALLTILE
+// now and nothing is copied per seg at all. §11d's substepping takes seven of
+// those sixteen bytes (below); $db-$e3 is what is left.
 .const texStrip = $c4               // 16 B, one u column, finished chunky bytes
+
+//------------------------------------------------------------
+// zero page — the substepped move ($d4-$da), src/input.asm
+//
+// The frame's displacement is split into MOVESUBS equal parts, each tested by
+// its own checkMove, because collision only ever looks at the segs of the
+// subsector the player starts the step in: a step longer than a sector is
+// thick walks through it without the seg between them ever being read. E1M1's
+// door tracks are 16 units deep against a 21-unit step, which is exactly that
+// (IMPLEMENTATION_PLAN.md §11d).
+//
+// zSubX/zSubY is the quarter step, floor(d/4). zRemX/zRemY is d - 4*floor(d/4),
+// i.e. d & 3, one unit of which is handed to each of the first substeps -- so
+// the four parts sum to the frame's motion *exactly*, in both directions.
+// Truncating instead would make walking west up to 20% faster than walking
+// east, which is the kind of asymmetry no screenshot shows and every player
+// feels.
+.const zSubX   = $d4        // one substep's x, floor(dx/MOVESUBS)
+.const zSubY   = $d6
+.const zRemX   = $d8        // units of dx the quartering lost, 0-3
+.const zRemY   = $d9
+.const zSubN   = $da        // substeps left this frame
+
+//------------------------------------------------------------
+// zero page — the player's radius ($db-$e1), src/input.asm
+//
+// The cross product checkMove computes per seg used to be thrown away except
+// for its sign, because a point is either inside a subsector or it is not.
+// With a radius there are two questions and the whole 32-bit value answers
+// both: `cross < 0` is still "the point is inside", and `cross + PLRAD*(|dx| +
+// |dy|) < 0` is "and so is every corner of the player's box" -- the cross
+// product is linear in the test point, so the most-outside corner is the exact
+// value plus that one term. See segBody (src/input.asm).
+//
+// $e2-$e3 is what is left of zero page in the machine.
+.const zCrs    = $db        // 32-bit: the seg's cross product, whole
+.const zPad    = $df        // 24-bit: PLRAD * (|dx| + |dy|)
 
 //------------------------------------------------------------
 // zero page — doors and moving sectors ($ec-$f0), src/lines.asm

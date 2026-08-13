@@ -121,7 +121,7 @@ doWall:
         cmp #NEAR
         bcc !toClip1+
 !toDone:
-        jmp !nearDone+
+        jmp wallNearDone
 !toClip1:
         jmp !clip1+
 !r0behind:                          // ry0 behind: if ry1 too -> reject
@@ -132,8 +132,9 @@ doWall:
         cmp #NEAR
         bcs !clip0+
 !reject:
-        :Count(CNT_SEGNEAR)
-        rts
+        jmp nearFix                 // both ends are nearer than the near plane
+                                    // -- which is only safe to drop if they
+                                    // are also *behind* the eye. src/input.asm
 !clip0:                             // clip endpoint 0 against ry=NEAR
         lda #NEAR                   // num = NEAR - ry0
         sec
@@ -169,7 +170,7 @@ doWall:
         sta zRY0
         lda #0
         sta zRY0+1
-        jmp !nearDone+
+        jmp wallNearDone
 !clip1:                             // clip endpoint 1 against ry=NEAR
         lda #NEAR                   // num = NEAR - ry1
         sec
@@ -205,7 +206,7 @@ doWall:
         sta zRY1
         lda #0
         sta zRY1+1
-!nearDone:
+wallNearDone:
         // ---- project screen x at both ends
         lda zRX0
         sta zA

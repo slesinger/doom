@@ -118,14 +118,6 @@ readInput:
 // same two bits.
 //------------------------------------------------------------
 movePlayer:
-        lda camX                    // remember position for collision undo
-        sta oldX
-        lda camX+1
-        sta oldX+1
-        lda camY
-        sta oldY
-        lda camY+1
-        sta oldY+1
         lda zInput                  // turning
         and #IN_LEFT
         beq !+
@@ -208,9 +200,8 @@ movePlayer:
         beq !+
         :subWord(zSinT, zMvDX)      // strafe L -= ( sin, -cos)
         :addWord(zCosT, zMvDY)
-!:      :addWord(zMvDX, camX)
-        :addWord(zMvDY, camY)
-        jsr checkMove
+!:      jmp moveSteps               // apply it in MOVESUBS tested pieces, and
+                                    // return through the last of them
 moveDone:
         rts
 
@@ -309,18 +300,22 @@ checkMove:
         lda zTy+1
         sta zB+1
         jsr ssmul32
-        lda zNum                    // cross = P1 - P2, need only the sign
-        sec
-        sbc zP+0
+        lda zNum                    // cross = P1 - P2, kept whole: the sign
+        sec                         // answers "is the point inside", and the
+        sbc zP+0                    // value answers "is the body clear" (below)
+        sta zCrs
         lda zNum+1
         sbc zP+1
+        sta zCrs+1
         lda zRXt
         sbc zP+2
+        sta zCrs+2
         lda zRXt+1
         sbc zP+3
-        bvc !+
-        eor #$80
-!:      bmi !inside+                // cross < 0: inside this seg
+        sta zCrs+3
+        bvs !inside+                // no 32-bit value: too far outside to be a
+                                    // seg of the subsector the player is in
+        bmi !body+                  // cross < 0: the point is inside this seg
         ldx zWIdx
         jsr segNear                 // is this the edge actually crossed?
         bcc !inside+                // no -- a collinear seg further along
@@ -330,6 +325,33 @@ checkMove:
         jsr stepOK
         bcc moveSlide
         jmp moveOK                  // through the opening: re-locate below
+
+// The point is inside, but the player is a disc of radius PLRAD and part of
+// it may not be. Three things have to hold before that blocks, and the order
+// is cheapest first:
+//
+//   - the player is beside this seg at all (segNear -- otherwise the infinite
+//     line every seg lies on would block from across the room);
+//   - the seg is one the player could not walk through anyway. A *passable*
+//     two-sided seg must never be padded: a portal the body may not overlap
+//     is a portal the player can never cross, and every doorway in the game
+//     is one of those;
+//   - the motion is pushing into the seg (segPush). Without that last test a
+//     player who is already inside the band -- carried there through a portal,
+//     since only the segs of the subsector he was in were ever tested -- would
+//     be frozen, with every direction blocked including the way out.
+!body:  ldx zWIdx
+        jsr segNear
+        bcc !inside+
+        ldy sgBack,x
+        cpy #$ff
+        beq !solid+
+        jsr stepOK
+        bcs !inside+                // a portal he may cross: no radius here
+!solid: jsr segBody
+        bcc !inside+
+        jsr segPush
+        bcs moveSlide
 !inside:
         lda zWIdx
         clc
@@ -875,5 +897,305 @@ bobStep:
         jmp setEyeZ
 
 .errorif * > BOBCODE_END, "the walk bob overflows into the converter tables"
+
+//------------------------------------------------------------
+.pc = MOVECODE "the substepped move"
+//------------------------------------------------------------
+//  moveSteps — apply this frame's displacement in MOVESUBS tested pieces.
+//
+//  checkMove is a *point* test against the segs of one subsector, and the
+//  subsector it tests is the one the player started the step in. So the real
+//  limit on a step is not how far the player may travel but how far they may
+//  travel *unchecked*: cross a thin subsector whole and the seg on its far
+//  side was never in SEGBUF, was never tested, and does not block.
+//
+//  E1M1's doors are exactly that geometry. Sector 76's door track is 16 units
+//  deep and sector 75 in front of it is another 16, against MOVE_SPEED = 21:
+//  walking south into the door from subsector 216, the step crossed 216's own
+//  seg (two-sided, into 75, legally passable), jumped clean over subsector 217
+//  and landed inside the closed door. The door's seg belongs to 217, the
+//  player was never in 217, and so nothing ever asked whether the door was
+//  shut. Four parts put the longest substep at 7.4 units, well under the
+//  16-unit floor of E1M1's geometry -- see MOVESUBS in defs.asm for the cost.
+//
+//  Each substep is a whole move: its own undo point, its own containment
+//  test, its own slide, and its own bspFindSsec at the end -- which is what
+//  makes the *next* substep test the subsector the player has just entered
+//  rather than the one they left. That is the whole fix; the arithmetic below
+//  is only about splitting the motion without losing any of it.
+//------------------------------------------------------------
+
+//------------------------------------------------------------
+// quarter: q = d >> MOVESHIFT (arithmetic), r = d & (MOVESUBS-1).
+// `cmp #$80` puts the sign in carry, which is what makes the shift signed.
+//------------------------------------------------------------
+.macro quarter(d, q, r) {
+        lda d
+        and #MOVESUBS-1
+        sta r
+        lda d
+        sta q
+        lda d+1
+        sta q+1
+        ldx #MOVESHIFT
+!:      lda q+1
+        cmp #$80
+        ror q+1
+        ror q
+        dex
+        bne !-
+}
+
+//------------------------------------------------------------
+// subStep: d = q, plus one of the r units the shift rounded away. Handing
+// those out one substep at a time is what makes the parts sum to the frame's
+// motion exactly -- floor() alone would make walking west up to 20% faster
+// than walking east, since it rounds towards minus infinity in both.
+//------------------------------------------------------------
+.macro subStep(q, r, d) {
+        lda q
+        sta d
+        lda q+1
+        sta d+1
+        lda r
+        beq !+
+        dec r
+        inc d
+        bne !+
+        inc d+1
+!:
+}
+
+moveSteps:
+        :quarter(zMvDX, zSubX, zRemX)
+        :quarter(zMvDY, zSubY, zRemY)
+        lda #MOVESUBS
+        sta zSubN
+!sub:   lda camX                    // the undo point is this substep's start,
+        sta oldX                    // not the frame's: moveBlocked and the
+        lda camX+1                  // slide retry both measure from it
+        sta oldX+1
+        lda camY
+        sta oldY
+        lda camY+1
+        sta oldY+1
+        :subStep(zSubX, zRemX, zMvDX)
+        :subStep(zSubY, zRemY, zMvDY)
+        :addWord(zMvDX, camX)
+        :addWord(zMvDY, camY)
+        jsr checkMove               // leaves camSsec/camSec on the subsector
+        dec zSubN                   // this substep ended in, so the next one
+        bne !sub-                   // is tested against the right segs
+        rts
+
+.errorif * > MOVECODE_END, "the substepped move overflows into the wall tiles"
+
+//------------------------------------------------------------
+.pc = BODYCODE "the player's radius"
+//------------------------------------------------------------
+//  The player used to be a point, and a point can stand *on* a wall. Two
+//  things went wrong with that, and only the second one is visible:
+//
+//   - a wall the eye is closer to than NEAR = 16 is dropped by the renderer's
+//     near-plane clip, and a dropped seg leaves its columns open, so the room
+//     behind a thin wall paints through it. Standing against a wall put one
+//     side of the view inside the next room while the other stayed correct.
+//   - the player could stand in geometry no real body fits in: inside corners,
+//     door tracks, the far side of a one-unit-thick wall.
+//
+//  So the test point grows into a disc of radius PLRAD. The cross product is
+//  *linear* in the point, which is what makes this cheap: for a seg direction
+//  (dx, dy), moving the test point by (ex, ey) changes the cross by
+//  dx*ey - dy*ex, and the corner of the player's box that maximises that is
+//  worth exactly PLRAD*(|dx| + |dy|). So the most-outside point of the whole
+//  body is the value already computed plus one term -- no second cross
+//  product, no square root, and the same trick as Doom's P_BoxOnLineSide.
+//
+//  It is exact for an axis-aligned seg, which is most of them, and blocks up
+//  to R*(sqrt(2)-1) early on a 45-degree one. Early is the safe direction.
+//------------------------------------------------------------
+
+//------------------------------------------------------------
+// segBody: does the player's body reach the seg the cross in zCrs was
+// computed for? Carry set = yes (cross + PLRAD*(|dx| + |dy|) >= 0).
+// Call with zCrs negative -- the point itself inside -- and zTx/zTy still
+// holding the seg's direction, which they do for the whole seg loop.
+//
+// zPad cannot overflow 24 bits: |dx| + |dy| is under 2^17 for any seg the
+// map format can express and 24 * that is under 2^22. The final add cannot
+// overflow either, because zCrs is negative here and zPad is not -- which is
+// why the sign of the high byte is the whole answer.
+//------------------------------------------------------------
+segBody:
+        lda zTx                     // zA = |dx|
+        sta zA
+        lda zTx+1
+        sta zA+1
+        bpl !+
+        jsr negA
+!:      lda zTy                     // zB = |dy|
+        sta zB
+        lda zTy+1
+        sta zB+1
+        bpl !+
+        jsr negB
+!:      lda #0                      // zPad = |dx| + |dy|, in 24 bits
+        sta zPad+2
+        clc
+        lda zA
+        adc zB
+        sta zPad
+        lda zA+1
+        adc zB+1
+        sta zPad+1
+        bcc !+
+        inc zPad+2
+!:      ldx #3                      // zPad *= 24, as (L << 4) + (L << 3)
+!:      asl zPad
+        rol zPad+1
+        rol zPad+2
+        dex
+        bne !-
+        lda zPad                    // keep 8L
+        sta zP
+        lda zPad+1
+        sta zP+1
+        lda zPad+2
+        sta zP+2
+        asl zPad                    // 16L
+        rol zPad+1
+        rol zPad+2
+        clc
+        lda zPad
+        adc zP
+        sta zPad
+        lda zPad+1
+        adc zP+1
+        sta zPad+1
+        lda zPad+2
+        adc zP+2
+        sta zPad+2
+        clc                         // cross + pad: negative = the body is clear
+        lda zCrs
+        adc zPad
+        lda zCrs+1
+        adc zPad+1
+        lda zCrs+2
+        adc zPad+2
+        lda zCrs+3
+        adc #0
+        bmi segBodyNo
+        sec
+        rts
+segBodyNo:
+        clc
+        rts
+
+//------------------------------------------------------------
+// segPush: is this substep's motion pushing the body into the seg?
+// Carry set = yes. The quantity is the same cross product taken over the
+// displacement instead of the position -- d = dx*mvDY - dy*mvDX -- because
+// cross is linear, so d is exactly how much the seg's cross product grew
+// this substep, and "inside" is cross < 0.
+//
+// Blocking only when d > 0 is what keeps the radius from being a trap. A
+// player can legitimately end up inside the band: only the segs of the
+// subsector he is standing in are ever tested, so stepping through a portal
+// can land him next to a wall belonging to the subsector he just entered.
+// Without this test every direction out of that band would be blocked too,
+// and he would be stuck for good. With it, the band is a wall he can leave
+// and slide along -- and sliding is exactly the d = 0 case.
+//------------------------------------------------------------
+segPush:
+        lda zTx
+        sta zA
+        lda zTx+1
+        sta zA+1
+        lda zMvDY
+        sta zB
+        lda zMvDY+1
+        sta zB+1
+        jsr ssmul32
+        lda zP+0
+        sta zNum
+        lda zP+1
+        sta zNum+1
+        lda zP+2
+        sta zRXt
+        lda zP+3
+        sta zRXt+1
+        lda zTy
+        sta zA
+        lda zTy+1
+        sta zA+1
+        lda zMvDX
+        sta zB
+        lda zMvDX+1
+        sta zB+1
+        jsr ssmul32
+        lda zNum                    // d = P1 - P2, and zSign accumulates the
+        sec                         // low bytes so that d = 0 (motion parallel
+        sbc zP+0                    // to the seg) can be told from d > 0
+        sta zSign
+        lda zNum+1
+        sbc zP+1
+        ora zSign
+        sta zSign
+        lda zRXt
+        sbc zP+2
+        ora zSign
+        sta zSign
+        lda zRXt+1
+        sbc zP+3
+        bvc !+
+        eor #$80
+!:      bmi segPushNo               // d < 0: the motion is away from the seg
+        ora zSign
+        beq segPushNo               // d = 0: along it -- a slide, not a push
+        sec
+        rts
+segPushNo:
+        clc
+        rts
+
+//------------------------------------------------------------
+// nearFix: doWall's near-plane fail-safe, jumped to (not called) from
+// walls.asm's !reject with both endpoints nearer than ry = NEAR.
+//
+// Dropping such a seg leaves its columns open, and an open column paints
+// whatever the BSP visits next -- which is the subsector *behind* the wall.
+// That is the see-through: stand against a thin wall and the room on the far
+// side comes through the part of the screen the wall should have covered.
+//
+// Only one case is genuinely invisible: both endpoints behind the eye. Then
+// the seg is dropped exactly as before. Otherwise the seg is in front and
+// simply too close for the projection to divide by, so both endpoints are
+// pushed out to the near plane and the seg is drawn from there. The span that
+// gives is narrower than the truth -- a wall at ry = 8 subtends twice what the
+// same rx does at 16 -- so a sliver can still leak at the edges, but the wall
+// is drawn, it closes its columns, and nothing divides by a depth of zero.
+//
+// The radius (PLRAD = 24 > NEAR) already keeps every seg of the subsector the
+// player is standing in outside the near plane. What it cannot reach is segs
+// of *neighbouring* subsectors: collision only ever tests the subsector the
+// player is in, so a wall a few units away that belongs to the subsector next
+// door is still reachable, and that is the case this covers. E1M1 has 538
+// standable grid cells within 16 units of an occluding seg's vertex.
+//------------------------------------------------------------
+nearFix:
+        lda zRY0+1                  // both high bytes negative: the whole seg
+        and zRY1+1                  // is behind the eye and cannot be seen
+        bmi !drop+
+        lda #NEAR
+        sta zRY0
+        sta zRY1
+        lda #0
+        sta zRY0+1
+        sta zRY1+1
+        jmp wallNearDone
+!drop:  :Count(CNT_SEGNEAR)
+        rts
+
+.errorif * > BODYCODE_END, "the radius test overflows into the video matrix"
 
 .pc = mainSegPC "main code (cont)"

@@ -36,6 +36,7 @@ import argparse
 import math
 import os
 import re
+import struct
 import sys
 import time
 
@@ -167,13 +168,20 @@ def pick_wall(m, want_corner):
 class Engine:
     def __init__(self, mon, c, sym, m):
         self.mon, self.c, self.sym, self.m = mon, c, sym, m
+        self.cp = None              # the frame checkpoint, once run() sets it
 
     # Every monitor command halts the emulated CPU, and it stays halted until
     # the next exit_mon -- so each access here ends with one. Without it the
     # machine freezes on the first read and no frame ever completes.
+    #
+    # Once run() has installed the frame checkpoint the machine is *meant* to
+    # stay halted between frames, and resuming here would run a frame nobody
+    # asked for -- and queue a stop event that the next _wait would mistake
+    # for its own. So from that point on these are plain reads and writes.
     def rd(self, addr, n=1):
         b = self.mon.mem_get(addr, addr + n - 1)
-        self.mon.exit_mon()
+        if self.cp is None:
+            self.mon.exit_mon()
         return b
 
     def word(self, addr):
@@ -183,7 +191,8 @@ class Engine:
 
     def wr(self, addr, data):
         self.mon.mem_set(addr, data)
-        self.mon.exit_mon()
+        if self.cp is None:
+            self.mon.exit_mon()
 
     def wword(self, addr, v):
         v &= 0xFFFF
@@ -236,23 +245,56 @@ class Engine:
         self.wword(self.c["camZ"], self.m.sectors[sec].floor + self.c["EYE"])
         return ssec, sec
 
+    def _wait(self, timeout=30):
+        """Resume, and block until VICE reports the checkpoint stop (0x11).
+
+        The resume is sent raw rather than through Mon.exit_mon(), which waits
+        for its own response id and drops everything else on the way -- on a
+        fast resume that swallows the stop event and hangs the run. This is
+        jumptest.py's Stepper._wait, for the same reason.
+        """
+        self.mon._send(0xAA)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, _, blen, rtype, _, _ = struct.unpack("<BBIBBI",
+                                                    self.mon._recvn(12))
+            self.mon._recvn(blen)
+            if rtype == 0x11:
+                return
+        raise SystemExit("walktest: the engine never came back to readInput")
+
+    def pos(self):
+        """camX/camY, both words in one read. They are adjacent ($50-$53)."""
+        b = self.rd(self.c["camX"], 4)
+        p = (b[0] | b[1] << 8, b[2] | b[3] << 8)
+        return tuple(v - 0x10000 if v & 0x8000 else v for v in p)
+
     def run(self, frames, keys):
         """Hold `keys` for `frames` frames, sampling the position once per
-        frame. Returns the path, starting at the position before the run."""
-        path = [(self.word(self.c["camX"]), self.word(self.c["camY"]))]
-        self.wr(self.input_imm, bytes([keys]))
-        start = self.frame()
-        last = start
-        skipped = 0
-        while last - start < frames:
-            now = self.frame()
-            if now == last:
-                continue
-            skipped += now - last - 1
-            last = now
-            path.append((self.word(self.c["camX"]), self.word(self.c["camY"])))
+        frame. Returns the path, starting at the position before the run.
+
+        The sample is taken with the CPU stopped at the top of readInput, and
+        that is not a detail: camX/camY are written *speculatively*. checkMove
+        applies a move and then slides or undoes it if it crossed a wall, and
+        §9.3's substepping does that four times a frame -- so a free-running
+        sample can catch a position the player never actually stood at, a unit
+        or two inside a wall, and the leak test below then reports a walk
+        through solid geometry that never happened. Stopping the machine at
+        one fixed point in the loop makes every sample a settled position and
+        makes consecutive samples exactly one frame apart.
+        """
+        if self.cp is None:
+            self.cp = self.mon.checkpoint(self.sym["readInput"],
+                                          self.sym["readInput"], op=4,
+                                          stop=True)
+            self._wait()                        # arrive at the first stop
+        path = [self.pos()]
+        for _ in range(frames):
+            self.wr(self.input_imm, bytes([keys]))
+            self._wait()
+            path.append(self.pos())
         self.wr(self.input_imm, b"\x00")
-        return path, skipped
+        return path, 0
 
 
 # ---------------------------------------------------------------- scenarios
