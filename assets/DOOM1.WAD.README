@@ -1,0 +1,25 @@
+DOOM1.WAD is not included in this repository.
+
+It's id Software's copyrighted level/asset data, so it isn't redistributed
+here — you provide your own copy locally and the build reads it from this
+folder (`assets/DOOM1.WAD`, gitignored, never committed).
+
+Two ways to get one:
+
+1. The free shareware/demo WAD (recommended — this is what the project is
+   built and tested against). It's freely distributable under id Software's
+   own shareware terms. Search for "DOOM1.WAD shareware download" or grab it
+   from any long-standing Doom archive (e.g. the id Software / Doom releases
+   mirrored on archive.org).
+
+2. Your own licensed copy of the full game (e.g. via Steam/GOG), if you want
+   to point the pipeline at commercial IWAD data instead. Not required —
+   the shareware WAD is sufficient for everything this project currently
+   builds (E1M1).
+
+Once you have it:
+
+    cp /path/to/DOOM1.WAD assets/DOOM1.WAD
+    python3 tools/wad2reu.py assets/DOOM1.WAD -o build/assets.reu
+
+See tools/wad2reu.py --help for the full set of options.

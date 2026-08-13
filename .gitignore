@@ -25,3 +25,8 @@ src/build/
 src/intro/build/
 build/main.vs
 build/intro-audio.asm
+
+# Doom IWAD: copyrighted id Software data, never redistributed via this repo.
+# Get it yourself (free shareware DOOM1.WAD or your own licensed full WAD)
+# and drop it in assets/ -- see assets/DOOM1.WAD.README.
+assets/DOOM1.WAD
