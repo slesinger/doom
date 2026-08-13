@@ -584,6 +584,18 @@ def build_weapon(wad: Wad = None) -> bytes:
 # art at the wrong one.
 SPR_WMAX, SPR_HMAX = 14, 24
 
+# world_wh's own ceiling, independent of SPR_HMAX (the *art box*'s ceiling
+# above): a thing's screen height is world_wh*VFOCAL/ry_used, and at
+# SPR_NEAR=160 (sprite.asm's forced minimum ry_used) that is world_wh
+# directly, since VFOCAL is also 160. ELECA0's raw picture height is 128 --
+# more than double the next tallest (CBRAA0, 61) -- and that pushes its
+# projected box's top row above the viewport at every distance sprDraw's
+# whole-box reject was ever tested against (IMPLEMENTATION_PLAN.md §12.6):
+# it never draws. Capped at CBRAA0's own height, the tallest value already
+# confirmed to survive the reject at SPR_NEAR, rather than a value derived
+# from first principles that would need its own hardware confirmation.
+SPR_WORLD_HMAX = 61
+
 # Ramp indices, defined here (ahead of the RAMP_NAMES table further down,
 # which SPRTYPES below needs before that table exists in file order).
 STONE, WOOD, FLESH, SKY, MOSS, VIOLET, METAL, FIRE = range(8)
@@ -618,7 +630,7 @@ def _sprite_box(wad: Wad, lump: str) -> tuple:
     scale = min(1.0, SPR_WMAX / nat_w, SPR_HMAX / h)
     art_w = max(1, round(nat_w * scale))
     art_h = max(1, round(h * scale))
-    return art_w, art_h, max(1, round(w / 2)), min(255, h)
+    return art_w, art_h, max(1, round(w / 2)), min(255, h, SPR_WORLD_HMAX)
 
 
 def build_sprimg(wad: Wad) -> tuple:

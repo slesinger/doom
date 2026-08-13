@@ -761,20 +761,68 @@ landed in the sprite's projected box.
   crosses an edge while the player moves. Confirmed on hardware and explicitly
   accepted as-is: "strange, yet acceptable." Revisit only if it stops reading
   as a rendering quirk and starts reading as a bug, per §12.1's own M3 note.
-- **§12's other five types** (floor lamp, tech column, and the two remaining
-  gore/corpse variants beyond the ones confirmed) haven't each been individually
-  eyeballed on hardware — only barrels, one corpse type, and the candelabra are
-  confirmed so far by the user's report. Worth a level walk-through to see
-  every `SPRTYPES` entry at least once.
-- **`SPR_NEAR`/`MAXVIS`/`SPR_BIAS`** caps (defs.asm) haven't been stress-tested
-  against a spot with more than a couple of things visible at once, or a thing
-  pressed close against the camera (§12.3's "a barrel pressed against the
-  camera costs a frame" case).
-- **Full regression** (`make walktest`/`doortest`, `make phaseprof`, hardware
-  `make u64-map`/`make u64-fps`) not yet re-run since sprites landed — §12a's
-  landing note put compute at ~48.5 ms of the 49.7 ms cap *before* sprites; a
-  fresh `phaseprof`/hardware fps pass is the way to find out where that stands
-  now.
+- ~~§12's other five types haven't each been individually eyeballed~~ **closed
+  2026-08-13, see below.**
+- ~~`SPR_NEAR`/`MAXVIS`/`SPR_BIAS` caps haven't been stress-tested~~ **closed
+  2026-08-13, see below.**
+- ~~Full regression not yet re-run~~ **closed 2026-08-13**, modulo a units
+  mix-up along the way (below) and hardware `u64-fps` still to run.
+
+### 12.6 Verification pass *(2026-08-13)*
+
+**`tools/vicedbg/phaseprof.py`'s `ms/frame` column is emulated 1 MHz
+milliseconds, not hardware ms** — it reads CIA2 Timer B (1000 cycles/tick at
+VICE's 1 MHz), and the `ms/frame`/`kcycles` columns print identical numbers,
+which is the tell. Divide `kcycles` by 64 for the real Ultimate figure. This
+was misread once as `renderFrame` costing 2631 *milliseconds* (a 60x
+regression); it's actually 2632 kcycles = 41.1 ms @ 64 MHz, exactly where it
+has always been. Compute total: 3128.7 kcycles = **48.9 ms** against the
+49.7 ms `FPS_CAP_TICKS` mark (the real raster deadline is 59.85 ms, ~11 ms
+slack — see §14a's own note). Sprites cost +97.1 kcycles (+1.5 ms) over the
+pre-sprite §12a baseline — on plan, and `convert` fell as expected from the
+160→144 row cut. Separately: a stale `build/assets.reu` (left over from
+before the map-format version bump) makes `make check`'s screenshot render as
+a flat 2-colour fill, which looks exactly like a hung/broken renderer —
+`rm build/assets.reu && make assets` before trusting a `make check` failure.
+`make check`/`walktest`/`doortest` all green at HEAD with fresh assets.
+
+**All seven `SPRTYPES` individually confirmed rendering, except one.**
+Floor lamp (COLUA0), bloody mess (PLAYW0), dead player (PLAYN0), and pool of
+blood (POL5A0) all confirmed by camera-teleport + MATRIX ramp-nibble scan
+over the VICE monitor (same technique as the original zA/zD bug hunt) —
+alongside the already-confirmed barrel, candelabra, and one corpse type, that
+is all seven types seen at least once.
+
+**Except: the tech column (type 3, ELECA0) draws nowhere, from any tested
+vantage point (60+ positions, both map instances).** Root-caused, not a code
+defect: ELECA0's world height is 128 — far taller than any other type (next
+tallest is 61) — and `SPR_NEAR`'s forced minimum apparent distance pushes its
+projected box's top row above the viewport for the near instance, so it fails
+§12.1's whole-box reject on every position tried; the far instance passes the
+reject and computes a legitimate box but draws zero pixels, consistent with
+being genuinely occluded by nearer geometry at every angle tried. This is
+§12.1's already-accepted "no partial clip" and §12.3's `SPR_NEAR` clamp
+colliding with one outlier-tall asset, not a bug with an obvious fix.
+**Closed 2026-08-13 (Honza's call): capped harder in `wad2reu.py`.**
+`SPR_WORLD_HMAX = 61` — the tallest value already confirmed to survive the
+whole-box reject at `SPR_NEAR` (the candelabra) — now clamps every type's
+`world_wh`, not just ELECA0's; nothing else in `SPRTYPES` was near that
+ceiling so only ELECA0 (raw 128) is actually affected. Confirmed rendering
+after the fix: 1250 TECH-ramp pixels landed on screen from a real vantage
+point (vs. 0 before), `make check` still green.
+
+**`SPR_NEAR`/`SPR_BIAS` stress-tested clean; `MAXVIS` untested at its
+actual limit.** A barrel pressed to 1, 3, and 8 world units from the camera
+clamps to a bounded box every time (no hang, no garbage, no crash). The
+busiest cluster found in E1M1 (sector 72, ~11 in-scope things) produced
+`sprVisN = 6` from the best vantage point — never reached `MAXVIS = 10`, so
+the cap itself went unexercised at its limit. E1M1's own layout doesn't
+appear to put more than ~6 in-scope things in one sightline; treat `MAXVIS`
+as untested rather than confirmed safe at capacity.
+
+**Still open:** hardware `make u64-map`/`make u64-fps`, to confirm the 48.9 ms
+emulator figure against the real Ultimate and see where the frame actually
+lands relative to the 59.85 ms raster deadline.
 
 ## 12a. A weapon view *(proposed 2026-08-13, not built)*
 
