@@ -713,24 +713,18 @@ hudBlitCell:
 // rows 21+HUD_GLYPH_ROW .. +HUD_GLYPH_ROW+1.
 //------------------------------------------------------------
 hudDrawDigit:
-        // zHudGlyphBase = HUDFONT_STAGE + digit * HUD_FONT_GLYPH_BYTES (128)
-        lda zHudDigit
-        lsr
-        clc
-        adc #>HUDFONT_STAGE
-        sta zHudGlyphBase+1
-        lda zHudDigit
-        and #1
-        beq !even+
-        lda #$80
-        jmp !setlo+
-!even:  lda #$00
-!setlo: clc
-        adc #<HUDFONT_STAGE
+        // zHudGlyphBase = HUDFONT_STAGE + digit * HUD_FONT_GLYPH_BYTES (40).
+        // 40 isn't a power of two, so there's no shift/branch trick for it
+        // (the previous version assumed a 128-byte stride, which is what was
+        // silently corrupting every digit but 0 -- 0*128 and 0*40 are both
+        // 0, so only the all-zero glyph ever looked right). A 10-entry
+        // lookup table sidesteps the multiply entirely and stays correct
+        // however HUD_FONT_GLYPH_BYTES is defined.
+        ldx zHudDigit
+        lda hudFontGlyphLo,x
         sta zHudGlyphBase
-        bcc !+
-        inc zHudGlyphBase+1
-!:
+        lda hudFontGlyphHi,x
+        sta zHudGlyphBase+1
         // Both addresses below are computed fresh from a stable base each
         // time, never incremented across unrolled iterations, on purpose:
         // a data-dependent branch (bcc/bne) inside a compile-time .for
@@ -764,6 +758,14 @@ hudDrawDigit:
         }
         rts
 
+// Per-digit glyph base address, low/high byte, indexed by digit (0-9) --
+// see the comment in hudDrawDigit above for why this replaced a shift/adc
+// multiply.
+hudFontGlyphLo:
+        .for (var d=0; d<HUD_FONT_GLYPHS; d++) .byte <[HUDFONT_STAGE + d*HUD_FONT_GLYPH_BYTES]
+hudFontGlyphHi:
+        .for (var d=0; d<HUD_FONT_GLYPHS; d++) .byte >[HUDFONT_STAGE + d*HUD_FONT_GLYPH_BYTES]
+
 //------------------------------------------------------------
 // hudDrawField -- A = value (0-255), X = field's leftmost cell column
 // (0-39). Draws HUD_DIGITS glyphs, most significant first, each
@@ -787,6 +789,36 @@ hudDrawField:
         clc
         adc #HUD_FONT_CELLS_W
         sta zHudCol
+
+        ldx #0
+!:      lda zHudVal
+        cmp #10
+        bcc !d10+
+        sbc #10
+        sta zHudVal
+        inx
+        jmp !-
+!d10:   stx zHudDigit
+        jsr hudDrawDigit
+        lda zHudCol
+        clc
+        adc #HUD_FONT_CELLS_W
+        sta zHudCol
+
+        lda zHudVal
+        sta zHudDigit
+        jsr hudDrawDigit
+        rts
+
+//------------------------------------------------------------
+// hudDrawField2 -- A = value (0-99), X = field's leftmost cell column
+// (0-39). Draws 2 digits, most significant first, each HUD_FONT_CELLS_W
+// cells wide -- for AMMO/HEALTH, whose boxes in the art are only 4 cells
+// wide (see defs.asm); callers are expected to clamp A to 0-99 first.
+//------------------------------------------------------------
+hudDrawField2:
+        sta zHudVal
+        stx zHudCol
 
         ldx #0
 !:      lda zHudVal
@@ -844,21 +876,21 @@ hudBgLoop:
         bne hudBgLoop
 
         // AMMO's and HEALTH's boxes are only 4 cells wide in the art (see
-        // defs.asm) -- clamp to 99 so the hundreds digit hudDrawField always
-        // draws stays "0" and the two fields pack without either spilling
-        // into ARMOR/ARMS territory. ARMOR's box is the full 6 cells, unclamped.
+        // defs.asm) -- hudDrawField2 draws just the 2 digits that fit, so
+        // clamp the value to 99 first rather than let it wrap. ARMOR's box
+        // is the full 6 cells, so it keeps hudDrawField's 3 digits, unclamped.
         lda hudAmmo
         cmp #100
         bcc !+
         lda #99
 !:      ldx #HUD_AMMO_COL
-        jsr hudDrawField
+        jsr hudDrawField2
         lda hudHealth
         cmp #100
         bcc !+
         lda #99
 !:      ldx #HUD_HEALTH_COL
-        jsr hudDrawField
+        jsr hudDrawField2
         lda hudArmor
         ldx #HUD_ARMOR_COL
         jsr hudDrawField

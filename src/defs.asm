@@ -638,20 +638,22 @@
 // the way Doom's own STBAR has undecorated space above its digits.
 //
 // Horizontally, AMMO's and HEALTH's blank boxes are only 4 cells wide in
-// the art (room for 2 digits), while HUD_DIGITS below draws 3 zero-padded
-// digits per field unconditionally -- so hudBoot clamps hudAmmo/hudHealth
-// to 99 and the two fields are packed back-to-back at cols 0-11 with no
-// collision between them: AMMO's padding lands on its own border/divider
-// cells, HEALTH's on its own baked-in "%" icon. ARMOR's blank box is
-// exactly 6 cells (cols 23-28), so it takes the full 3-digit field as-is,
-// unclamped. Column below is each field's leftmost cell (0-39). AMMO left,
-// HEALTH centre, ARMOR right -- Doom's own left-to-right order, minus the
+// the art -- room for 2 digits, not 3 -- so they're drawn with
+// hudDrawField2 (clamped to 0-99) instead of hudDrawField's fixed 3-digit
+// unroll; the earlier 3-digit-clamped-to-99 attempt still painted a
+// permanent leading "0" glyph, which ate a whole extra cell each and, on
+// hardware, landed on top of AMMO's left border and HEALTH's baked-in "%"
+// icon rather than beside them. ARMOR's blank box is the full 6 cells
+// (cols 23-28), so it keeps the 3-digit field, unclamped. Column below is
+// each field's leftmost cell (0-39); positions past AMMO were confirmed
+// against a real render, not just the decoded art. AMMO left, HEALTH
+// centre, ARMOR right -- Doom's own left-to-right order, minus the
 // face/keys this bar has no room for.
 .const HUD_GLYPH_ROW  = 1            // top cell-row a glyph is blitted at
-.const HUD_DIGITS     = 3            // digits per field, zero-padded
-.const HUD_AMMO_COL   = 0            // clamped to 0-99, packed against HEALTH
-.const HUD_HEALTH_COL = 6            // clamped to 0-99, packed against AMMO
-.const HUD_ARMOR_COL  = 23           // exact fit, no clamp needed
+.const HUD_DIGITS     = 3            // digits in ARMOR's field, zero-padded
+.const HUD_AMMO_COL   = 1            // 2 digits, clamped to 0-99
+.const HUD_HEALTH_COL = 6            // 2 digits, clamped to 0-99
+.const HUD_ARMOR_COL  = 23           // 3 digits, exact fit, no clamp needed
 
 // segFacing, the world-space backface test, in the free RAM between the BSP
 // stack and MATRIX. $0f51-$0fc3.
