@@ -44,7 +44,7 @@ from collections import Counter, defaultdict
 # ----------------------------------------------------------------------------
 
 MAGIC = b"D64U"
-VERSION = 6                     # 2 added the bounding spheres (SSEC_HDR, block 4)
+VERSION = 7                     # 2 added the bounding spheres (SSEC_HDR, block 4)
                                 # 3 added the music stream (block 5) and the
                                 #   page-unit length flag it needs
                                 # 4 added the wall texture tiles (block 6) and
@@ -58,6 +58,13 @@ VERSION = 6                     # 2 added the bounding spheres (SSEC_HDR, block 
                                 #   them resident now, so an image of the old
                                 #   size is not merely finer or coarser, it is
                                 #   the wrong length for texLoad's one transfer
+                                # 7 added the weapon view (block 10). The
+                                #   engine keeps this block's REU offset and
+                                #   streams from it every frame, so an image
+                                #   without it leaves wpnReuBase at zero and
+                                #   the gun simply is not drawn -- but the
+                                #   version still moves, because block 10's
+                                #   descriptor is what carries the offset
 
 HEADER_SIZE = 128               # 15 descriptors. 64 through version 4, which
                                 # held 7 and the eighth block outgrew; the
@@ -193,172 +200,369 @@ LK_NONE, LK_DOOR, LK_LIFT, LK_FLOOR, LK_EXIT = 0, 1, 2, 3, 4
 # The HUD -- IMPLEMENTATION_PLAN.md §13.
 #
 # Boot-only: the engine paints the status bar exactly once, from these two
-# blocks, using MATRIX's own byte-per-pixel chunky format (%rrrriiii, the same
-# one the per-frame renderer writes) rather than WALLTEX's nibble-packed
-# format. That is deliberate -- it means the boot blit can drive the SAME
-# ditherTabs/scrTab/colTab tables chunky2mc.asm already has resident for the
-# renderer, so "what does this ramp+intensity look like on screen" has one
-# answer, in the world and in the HUD alike. There is no runtime patching:
-# code RAM has nothing left to spend on a dirty-flag mechanism (see the M2
-# state notes), so the bar is fixed at boot with plausible placeholder values
-# and wired to variables only so M3 does not have to touch the pipeline.
+# blocks, straight into BITMAP0/1 + SCREEN0/1 + $D800 -- real VIC multicolor
+# bitmap format (background shared and black, two screen-RAM nibble colours
+# and one colour-RAM colour per cell), not WALLTEX's nibble-packed format and
+# not the ramp/intensity chunky format the 3D renderer's dither chain uses.
+# There is no runtime patching: code RAM has nothing left to spend on a
+# dirty-flag mechanism (see the M2 state notes), so the bar is fixed at boot
+# with plausible placeholder values and wired to variables only so M3 does
+# not have to touch the pipeline.
 #
-# A cell is one multicolor cell -- 4 px wide, 8 tall, 32 bytes, MATRIX's own
-# "cell n at MATRIX+n*32, offset = row*4+px" -- so a HUD block is simply a
-# strip of MATRIX-format cells, row-major (cell index = row*width+col).
+# The art itself comes from a hand-painted Koala Painter image
+# (assets/hud.kla) rather than the WAD's own STBAR/STTNUM lumps: those are
+# authored for a much larger palette and downsampling them through the
+# engine's dither chain (the previous approach) crushed them to a washed-out
+# blur. A real C64 multicolor editor already enforces the exact per-cell
+# colour limits the hardware has, so what gets painted there is what lands
+# on screen -- a crop, not a conversion.
+#
+# A cell is one multicolor cell -- 4 px wide, 8 tall: 8 bitmap bytes, 1
+# screen-RAM byte, 1 colour-RAM byte, 10 bytes total, cropped directly out of
+# the Koala file's own layout (see KOALA_* below, matching src/intro/intro.asm's
+# import offsets for doom-title.kla) -- so a HUD block is simply a strip of
+# these cells, row-major (cell index = row*width+col).
 #
 # Neither block gets a MAPINFO field. Like LINEDEFS (block 7), they are
 # streamed and read exactly once, by their own loader triggered off the block
 # id during mapLoad's descriptor walk -- there is nothing to be resident
 # *of*, since nothing reads this data again after boot.
 BLK_HUDBG, BLK_HUDFONT = 8, 9
+BLK_WEAPON = 10                 # IMPLEMENTATION_PLAN.md §12a, streamed per frame
 
-HUD_RAMP = 8                        # a spare ramp slot in chunky2mc.asm's
-                                     # ramps table (8-15 are reserved, unused
-                                     # duplicates of ramp 0, for exactly this)
-HUD_CELL_BYTES = 32                 # one MATRIX-format cell: 4x8, 1 B/pixel
+HUD_CELL_BYTES = 10                 # 8 bitmap bytes + 1 screen byte + 1 colour byte
 
 # The status bar is the three rows M1 always reserved below the 22-row
 # viewport (main.asm's clearHudRows) -- 40 cells wide, 3 tall.
 HUD_BG_CELLS_W = 40
 HUD_BG_CELLS_H = 3
-HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES   # 3840
+HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES   # 1200
 
-# STTNUM0..9, the big HUD digit font. Measured, not estimated (§4's rule):
-# one cell (4x8) renders every digit as a near-solid blob -- checked by eye
-# against the WAD's own STTNUM0 pixels, which really are that dense; Doom's
-# HUD font reads by outer silhouette, not an internal hole, and 4 px wide
-# loses the silhouette along with everything else. 2x2 cells (8x16 logical
-# px, against STTNUM's native ~14x16) keeps enough of the outline that 0/1/4/7
-# are clearly distinct by eye. Still four cells, still boot-only, still
-# trivial against REU's abundant space.
+# The big HUD digit font, still 2x2 cells (8x16 logical px) -- measured
+# against STTNUM's own ~14x16 when the art still came from the WAD (§4's
+# rule): one cell renders every digit as a near-solid blob, since Doom's HUD
+# font reads by outer silhouette and 4 px wide loses it. Kept at this size
+# now that the art is hand-painted, so the two artists (background, font)
+# share one grid convention.
 HUD_FONT_GLYPHS = 10
 HUD_FONT_CELLS_W = 2
 HUD_FONT_CELLS_H = 2
-HUD_FONT_GLYPH_BYTES = HUD_FONT_CELLS_W * HUD_FONT_CELLS_H * HUD_CELL_BYTES  # 128
-HUD_FONT_BYTES = HUD_FONT_GLYPHS * HUD_FONT_GLYPH_BYTES            # 1280
+HUD_FONT_GLYPH_BYTES = HUD_FONT_CELLS_W * HUD_FONT_CELLS_H * HUD_CELL_BYTES  # 40
+HUD_FONT_BYTES = HUD_FONT_GLYPHS * HUD_FONT_GLYPH_BYTES            # 400
+
+# assets/hud.kla's own layout -- a standard Koala Painter file, the same one
+# src/intro/intro.asm imports raw for doom-title.kla: 2-byte PRG load address,
+# 8000 B bitmap, 1000 B screen RAM, 1000 B colour RAM, 1 B background colour.
+KOALA_BITMAP_OFS = 2
+KOALA_SCREEN_OFS = KOALA_BITMAP_OFS + 8000
+KOALA_COLOR_OFS = KOALA_SCREEN_OFS + 1000
+KOALA_BG_OFS = KOALA_COLOR_OFS + 1000
+KOALA_SIZE = KOALA_BG_OFS + 1
+
+# Where the two hand-painted elements live on hud.kla's 40x25-cell canvas --
+# one combined image rather than two files, so the artist can see the bar and
+# the font glyphs together while painting. Everything outside these two
+# regions is unused and can be left blank.
+HUD_BAR_COL0, HUD_BAR_ROW0 = 0, 22      # the bar occupies the bottom 3 rows,
+                                         # matching where it lands on screen
+HUD_FONT_COL0, HUD_FONT_ROW0 = 0, 0     # digits 0-9, 2 cells each, top-left
 
 
-def _picture_intensity_grid(wad: Wad, lumpname: str, dst_w: int,
-                            dst_h: int) -> list:
-    """A WAD picture lump -> dst_w*dst_h intensity nibbles, u-major
-    (index = x*dst_h + y), 0 meaning "transparent, paint background".
-
-    Same nearest-neighbour bucket-and-average technique as
-    texture_luma_tile, generalised from a TEXTURE1 composite to a single
-    picture lump and an arbitrary destination grid -- STBAR and STTNUM are
-    plain patch-format pictures, not composites, so decode_picture is all
-    the WAD reading this needs.
+def load_koala(path: str) -> bytes:
+    """assets/hud.kla -> its raw bytes, checked for size and a black
+    background -- the engine's $d021 is fixed to black at boot
+    (src/main.asm) and never changed again, so a hud.kla painted against any
+    other background colour would show a seam the moment it lands on screen.
     """
-    luma = palette_luma(wad)
-    w, h, px = decode_picture(wad.lump(lumpname))
-    acc = [0.0] * (dst_w * dst_h)
-    cnt = [0] * (dst_w * dst_h)
-    for (x, y), c in px.items():
-        dx = x * dst_w // w
-        dy = y * dst_h // h
-        if 0 <= dx < dst_w and 0 <= dy < dst_h:
-            k = dx * dst_h + dy
-            acc[k] += luma[c]
-            cnt[k] += 1
-    return [light_to_intensity(acc[k] / cnt[k]) if cnt[k] else 0
-            for k in range(dst_w * dst_h)]
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) != KOALA_SIZE:
+        raise ValueError(
+            f"{path}: expected a {KOALA_SIZE}-byte Koala Painter file, got "
+            f"{len(data)} -- export from Multipaint as C64 Multicolor/Koala")
+    bg = data[KOALA_BG_OFS]
+    if bg != 0:
+        raise ValueError(
+            f"{path}: background colour must be black (0) to match the "
+            f"engine's fixed $d021, got colour {bg}")
+    return data
 
 
-#: The only four intensities that survive chunky2mc.asm's dither untouched.
-#: dcode() is min(floor(v/5 + (t+0.5)/16), 3) with t the 0-15 Bayer threshold,
-#: so v in {0,5,10,15} lands on code 0/1/2/3 for *every* t -- no ordered-dither
-#: noise at all. Anything between them alternates between two codes across the
-#: 4x4 Bayer cell, which is right for a shaded wall and wrong for the HUD: the
-#: first build let the full 0-15 range through and the bar came out a uniform
-#: speckle with the digits barely a shade different from it (measured off a
-#: live VICE bitmap dump, not judged by eye). Snapping to these four makes the
-#: bar flat and the glyphs crisp.
-HUD_LEVELS = (0, 5, 10, 15)
-
-
-def _hud_snap(v: int) -> int:
-    """An intensity nibble -> the nearest dither-free HUD_LEVELS value."""
-    return min(HUD_LEVELS, key=lambda L: abs(L - v))
-
-
-def _pack_hud_cell(intensities_row_major: list) -> bytes:
-    """32 intensities, index = row*4+px (MATRIX's own cell layout) -> 32
-    MATRIX-format bytes, every one carrying HUD_RAMP in its high nibble --
-    including intensity-0 (background) pixels.
-
-    That looks wasteful -- ramp is meaningless at intensity 0 -- but it is
-    load-bearing: chunky2mc.asm's convert() samples *one* pixel per cell
-    (row 3, px 1) to pick the whole cell's screen/colour-RAM colours, on the
-    assumption a cell is one surface and shares one ramp. A wall does; a
-    digit glyph does not -- most of its cells are part background, part ink
-    -- and if the sampled pixel happens to be a background one, a bare 0
-    there would fall back to ramp 0 (grey) for the *entire* cell, ink
-    included. Carrying HUD_RAMP on the 0s costs nothing else: ditherTabs
-    keys only on the low nibble, so an intensity-0 pixel still dithers to
-    %00/black regardless of what its ramp nibble says.
-    """
-    return bytes((HUD_RAMP << 4) | v for v in intensities_row_major)
+def _koala_cell(kla: bytes, col: int, row: int) -> bytes:
+    """8 bitmap bytes + 1 screen byte + 1 colour byte for the C64 cell at
+    (col, row) in hud.kla's 40x25 grid -- exactly the raw multicolor bitmap
+    layout BITMAP0/1 + SCREEN0/1 + $D800 already use, so packing this is a
+    crop, not a conversion."""
+    n = row * HUD_BG_CELLS_W + col
+    bitmap = kla[KOALA_BITMAP_OFS + n * 8: KOALA_BITMAP_OFS + n * 8 + 8]
+    screen = kla[KOALA_SCREEN_OFS + n]
+    color = kla[KOALA_COLOR_OFS + n] & 0x0F
+    return bitmap + bytes((screen, color))
 
 
 def _hud_fallback_cell(pattern: int) -> bytes:
-    """A cell for the TEST map, which has no WAD to downsample from. Not
-    trying to look like anything -- just a fixed, checkable pattern, the same
-    role _pattern_tile plays for WALLTEX's test-map path."""
-    cell = [(pattern >> (v % 4)) & 1 for v in range(32)]
-    return _pack_hud_cell([_hud_snap(TEX_MID) if b else 0 for b in cell])
+    """A cell for the TEST map, which has no hud.kla to crop from. Not
+    trying to look like anything -- just a fixed, checkable raw cell, the
+    same role _pattern_tile plays for WALLTEX's test-map path."""
+    if pattern & 1:
+        return bytes([0b01010101] * 8) + bytes((0x10, 0x02))  # colour 1 fill
+    return bytes(8) + bytes((0x00, 0x00))                     # background
 
 
-def build_hudbg(wad: Wad = None) -> bytes:
-    """Block 8: HUD_BG_CELLS_W x HUD_BG_CELLS_H cells, row-major, from STBAR.
+def build_hudbg(kla: bytes = None) -> bytes:
+    """Block 8: HUD_BG_CELLS_W x HUD_BG_CELLS_H cells, row-major, cropped
+    from hud.kla at (HUD_BAR_COL0, HUD_BAR_ROW0).
 
-    Without a WAD (the test map) this is a fixed placeholder pattern instead,
-    at full size either way -- build_walltex's own reasoning applies here
-    too: the two images should differ only in content, not in code path.
+    Without a hud.kla (the test map) this is a fixed placeholder pattern
+    instead, at full size either way -- build_walltex's own reasoning
+    applies here too: the two images should differ only in content, not in
+    code path.
     """
-    if wad is None:
+    if kla is None:
         return b"".join(
             _hud_fallback_cell((cx + cy) & 1)
             for cy in range(HUD_BG_CELLS_H) for cx in range(HUD_BG_CELLS_W))
-    w = HUD_BG_CELLS_W * 4
-    h = HUD_BG_CELLS_H * 8
-    grid = _picture_intensity_grid(wad, "STBAR", w, h)
-    out = bytearray()
-    for cy in range(HUD_BG_CELLS_H):
-        for cx in range(HUD_BG_CELLS_W):
-            cell = [_hud_snap(grid[(cx * 4 + px) * h + (cy * 8 + row)])
-                   for row in range(8) for px in range(4)]
-            out += _pack_hud_cell(cell)
-    return bytes(out)
+    return b"".join(
+        _koala_cell(kla, HUD_BAR_COL0 + cx, HUD_BAR_ROW0 + cy)
+        for cy in range(HUD_BG_CELLS_H) for cx in range(HUD_BG_CELLS_W))
 
 
-def build_hudfont(wad: Wad = None) -> bytes:
+def build_hudfont(kla: bytes = None) -> bytes:
     """Block 9: HUD_FONT_GLYPHS glyphs, each HUD_FONT_CELLS_W x _H cells,
-    row-major within the glyph, from STTNUM0..9.
-
-    Two levels only, not the four HUD_LEVELS the background gets: ink is
-    forced to 15 (ramp 8's brightest, yellow) and STTNUM's transparent
-    surround to 0 (black). A digit is 8 screen pixels wide here -- the
-    shading of the real font's bevel does not survive that, and trying to
-    keep it just costs contrast against the bar behind it.
+    row-major within the glyph, cropped from hud.kla starting at
+    (HUD_FONT_COL0, HUD_FONT_ROW0), digits left to right.
     """
-    if wad is None:
+    if kla is None:
         return b"".join(
             _hud_fallback_cell(d + i)
             for d in range(HUD_FONT_GLYPHS)
             for i in range(HUD_FONT_CELLS_W * HUD_FONT_CELLS_H))
-    w_px = HUD_FONT_CELLS_W * 4
-    h_px = HUD_FONT_CELLS_H * 8
     out = bytearray()
     for d in range(HUD_FONT_GLYPHS):
-        grid = _picture_intensity_grid(wad, f"STTNUM{d}", w_px, h_px)
+        col0 = HUD_FONT_COL0 + d * HUD_FONT_CELLS_W
         for cy in range(HUD_FONT_CELLS_H):
             for cx in range(HUD_FONT_CELLS_W):
-                cell = [15 if grid[(cx * 4 + px) * h_px + (cy * 8 + row)]
-                        else 0
-                       for row in range(8) for px in range(4)]
-                out += _pack_hud_cell(cell)
+                out += _koala_cell(kla, col0 + cx, HUD_FONT_ROW0 + cy)
     return bytes(out)
+
+
+# ----------------------------------------------------------------------------
+# The weapon view — IMPLEMENTATION_PLAN.md §12a. Block 10.
+#
+# One static pose, the shotgun, screen-fixed: not a world Thing, so none of
+# §12's transform, sort or per-subsector pickup applies to it.
+#
+# SIZE IS DOOM'S OWN, not §12a's proposed 96x56. SHTGA0 is 79x60 of Doom's
+# 320x200, i.e. 24.7% of the screen's width. This viewport is 160 columns of
+# 2:1 pixels covering the same 320, so faithful is 79/2 = 40 columns -- and 40
+# columns is 1120 packed bytes against 96's 2688, which matters because the
+# block is streamed every frame (below) and REU bytes are 1 us each flat.
+# §12a's 60%-of-the-width figure would have made the gun more than twice as
+# wide as the one in Doom.
+#
+# Both axes are cell-aligned deliberately (WPN_COL0 = 60 = 15 cells of 4,
+# WPN_ROW0 = 88 = 11 cell-rows of 8, WPN_H = 56 = 7 cell-rows). Cell-aligned
+# in MATRIX rows is enough: the converter shifts the whole buffer down by a
+# whole number of cell-rows (VIEWTOP, src/defs.asm), so alignment survives the
+# trip to the bitmap. A VIC
+# multicolor cell carries one 3-colour ramp, so a weapon whose edge fell
+# mid-cell would drag its ramp into the wall behind it -- M1 risk #5, and the
+# one form of attribute clash that is free to avoid.
+#
+# STREAMED, NOT RESIDENT, and that is a RAM decision rather than a speed one:
+# the 2816 B that §12's viewport cut freed is the only contiguous code-capable
+# block in the machine, and §12's sprite art plus this phase's code already
+# spend it. 1120 B/frame is 1.12 ms of the ~11 ms free (§14a.1's measurement
+# plus §13's landing note), and unlike the sprite art it cannot be cached
+# anywhere: nothing in MATRIX survives a frame.
+WPN_LUMP = "SHTGA0"
+WPN_W = 40                      # columns, cell-aligned (4 px/cell)
+WPN_H = 56                      # rows, cell-aligned (8 px/cell)
+WPN_COL0 = 60                   # leftmost viewport column: (160-40)/2, cell 15
+WPN_ROW0 = 144 - WPN_H          # 88 -- MATRIX row, not raster row: the gun
+                                # sits on the bottom edge of the view
+WPN_ROW_BYTES = WPN_W // 2      # 20, two pixels per byte
+WPN_ART_BYTES = WPN_H * WPN_ROW_BYTES           # 1120
+WPN_SIL_BYTES = WPN_W                           # 40
+WPN_BYTES = WPN_SIL_BYTES + WPN_ART_BYTES       # 1160
+WPN_RAMP = 14                   # the first of chunky2mc.asm's two spare slots
+
+# Transparency is intensity 0, the convention §12.2 reserves for all of §12's
+# art. It costs nothing: light_to_intensity already clamps opaque pixels to
+# 2..15 so that a dark surface does not dissolve into the background, which
+# leaves 0 and 1 unused and 0 free to mean "not part of the sprite".
+SPR_CLEAR = 0
+SPR_MIN, SPR_MAX = 2, 15        # the opaque intensity range, SPR_CLEAR excluded
+
+# A destination cell is opaque only if this fraction of the source texels it
+# covers are. Sprite edges are what this number is for: take "any coverage" and
+# every sprite grows a one-pixel fringe of half-transparent guesswork, which at
+# our scale is a visible halo; take "full coverage" and thin things (a barrel's
+# rim, a candle) erode away. Half is the ordinary answer and it is what Doom's
+# own low-detail mode effectively does.
+SPR_COVER = 0.5
+
+# The weapon's own tone curve. Rank spreading (below) normalises every sprite to
+# the same *mean* brightness, which is right for props scattered through a level
+# and wrong for the one object permanently in front of the camera: E1M1's walls
+# are largely stone and tan, both grey-topped, so a gun normalised to mid-grey
+# sits in front of grey and disappears.
+#
+# Two knobs, and only the second one works. Squeezing the range (1..12, then
+# 1..8) darkens by pushing the whole distribution down, but because the spread
+# is uniform the top goes with it -- at 1..8 the gun is 88% black-and-brown with
+# no third tone at all, i.e. a flat silhouette rather than a dark object.
+# Raising the rank to a power darkens the *body* while leaving the top rank at
+# 1.0, so the barrel highlight survives at full range. Measured over SHTGA0's
+# 1292 opaque cells, as the fraction of subpixels each dither code gets:
+#
+#   range  gamma   black   brown   dgrey   grey
+#    2..15   1.0     5.5%   36.2%   39.3%  19.0%   original -- grey on grey
+#    1..12   1.0    14.4%   44.6%   37.5%   3.4%   squeezed: highlight gone
+#    1..8    1.0    23.5%   64.4%   12.1%   0.0%   squeezed harder: two tones
+#    1..15   3.0    41.4%   35.6%   16.5%   6.5%   curved: dark body, lit barrel
+#
+# (the last two columns are ramp 14's own colours, which dropped a step at each
+# end for the same reason -- see chunky2mc.asm. Brown/dgrey/grey is the darkest
+# neutral triple the VIC has; below brown there is nothing but blue and black,
+# so past this point darkening can only mean *more black*, not darker colours.)
+#
+# Floor 1, not 0: intensity 0 is SPR_CLEAR and wpnFrame skips those nibbles, so
+# a "black" pixel written as 0 would be a hole the world is forbidden to fill
+# (colBotSeed has sealed the column) showing last frame's garbage. The black is
+# the dither's, not the intensity's -- which is why a curve darkens at all.
+WPN_MIN, WPN_MAX = 1, 15
+WPN_GAMMA = 3.0
+
+
+def _picture_intensity_grid(wad: Wad, lump: str, dst_w: int, dst_h: int,
+                            lo: int = SPR_MIN, hi: int = SPR_MAX,
+                            gamma: float = 1.0) -> list:
+    """A Doom picture lump -> dst_w*dst_h intensity nibbles, u-major (column
+    x's rows are grid[x*dst_h : (x+1)*dst_h]), SPR_CLEAR where the sprite is
+    transparent.
+
+    Box-average of the covered texels per destination cell, then the sprite's
+    own distribution spread across lo..hi **by rank, not by value**, optionally
+    bent by `gamma` (rank ** gamma, so > 1 darkens the body and leaves the
+    brightest cell alone). Both are parameters because the weapon wants a much
+    darker curve than world sprites do -- see WPN_GAMMA.
+
+    A linear min..max stretch is what this did first and it produced a black
+    blob: SHTGA0's luminance histogram has half its opaque pixels in the bottom
+    quarter of its own range and its maximum in a specular highlight a dozen
+    pixels wide, so a linear map put 77% of the gun at intensity <= 5. The
+    dither turns intensity 3 into one lit pixel in five, and the result reads
+    as a silhouette rather than as an object.
+
+    Ranking fixes that by construction: every intensity gets an equal share of
+    the sprite's pixels, so the contrast that survives the 4-bit quantisation
+    is the contrast *within the sprite*, which is the only kind a foreground
+    object needs. Absolute brightness is not preserved and is not wanted --
+    nothing downstream compares one sprite's brightness with another's, and
+    the walls behind them already normalise per texture (quantise_tile).
+
+    Equal-luminance cells share a rank, so a flat region stays flat rather
+    than being split across two intensities by tie-breaking order.
+    """
+    luma = palette_luma(wad)
+    w, h, px = decode_picture(wad.lump(lump))
+    acc = [0.0] * (dst_w * dst_h)
+    cnt = [0] * (dst_w * dst_h)
+    tot = [0] * (dst_w * dst_h)
+    for y in range(h):
+        for x in range(w):
+            k = (x * dst_w // w) * dst_h + (y * dst_h // h)
+            tot[k] += 1
+            if (x, y) in px:
+                acc[k] += luma[px[(x, y)]]
+                cnt[k] += 1
+    lit = [acc[k] / cnt[k] for k in range(len(acc))
+           if tot[k] and cnt[k] >= tot[k] * SPR_COVER]
+    if not lit:
+        raise ValueError(f"sprite {lump!r} has no opaque cells at "
+                         f"{dst_w}x{dst_h} -- it downsampled to nothing")
+    # value -> the mean rank of the cells sharing it, as a 0..1 fraction
+    order = sorted(lit)
+    rank = {}
+    i = 0
+    while i < len(order):
+        j = i
+        while j < len(order) and order[j] == order[i]:
+            j += 1
+        rank[order[i]] = (i + j - 1) / 2.0 / max(1, len(order) - 1)
+        i = j
+    out = []
+    for k in range(len(acc)):
+        if not tot[k] or cnt[k] < tot[k] * SPR_COVER:
+            out.append(SPR_CLEAR)
+            continue
+        v = rank[acc[k] / cnt[k]] ** gamma
+        out.append(lo + int(round(v * (hi - lo))))
+    return out
+
+
+def _pack_nibbles(px_row: list) -> bytes:
+    """A row of intensity nibbles -> two pixels per byte, EVEN x in the LOW
+    nibble. The blit reads a byte, masks the low nibble for the left pixel and
+    shifts down for the right one, which is one `and` and four `lsr` against
+    any other assignment's extra shift."""
+    out = bytearray(len(px_row) // 2)
+    for i in range(0, len(px_row), 2):
+        out[i // 2] = (px_row[i] & 0x0F) | ((px_row[i + 1] & 0x0F) << 4)
+    return bytes(out)
+
+
+def _solid_from_bottom(cols: list, h: int) -> list:
+    """Per column, the topmost row from which the column is opaque
+    *continuously to the bottom* -- or h if its bottom pixel is clear.
+
+    This is the occlusion pre-seed §12a wants (set colBot[x] here and the wall
+    and floor passes never draw the rows the gun covers, which is what makes a
+    big weapon cheaper than a small one), and the continuity requirement is
+    what keeps it honest. Seeding from the mere topmost opaque pixel would
+    also stop the world drawing in any transparent GAP below it -- between the
+    barrel and the stock, say -- and a gap the world is forbidden to draw and
+    the gun does not paint comes out as a black hole in the middle of the
+    screen. Scanning up from the bottom stops at the first such gap, so every
+    row the seed closes is a row the blit definitely fills.
+    """
+    tops = []
+    for col in cols:
+        r = h
+        while r > 0 and col[r - 1] != SPR_CLEAR:
+            r -= 1
+        tops.append(r)
+    return tops
+
+
+def build_weapon(wad: Wad = None) -> bytes:
+    """Block 10: WPN_SIL_BYTES silhouette bytes then WPN_H rows of
+    WPN_ROW_BYTES, row-major.
+
+    The silhouette comes first because the engine reads it exactly once, at
+    boot, into a resident 40-byte array -- it never changes, so paying 40 REU
+    bytes a frame for it would be pure waste -- while the art after it is
+    streamed a row at a time into SEGBUF every frame.
+    """
+    if wad is None:
+        # The test map has no WAD. A plain filled block, like _pattern_tile
+        # and _hud_fallback_cell: not trying to look like a gun, just
+        # something with a known shape that the checks can find.
+        cols = [[8 if 8 <= r < WPN_H else SPR_CLEAR for r in range(WPN_H)]
+                for _ in range(WPN_W)]
+    else:
+        grid = _picture_intensity_grid(wad, WPN_LUMP, WPN_W, WPN_H,
+                                       WPN_MIN, WPN_MAX, WPN_GAMMA)
+        cols = [[grid[x * WPN_H + y] for y in range(WPN_H)]
+                for x in range(WPN_W)]
+    sil = _solid_from_bottom(cols, WPN_H)
+    out = bytearray(bytes(sil))
+    for y in range(WPN_H):
+        out += _pack_nibbles([cols[x][y] for x in range(WPN_W)])
+    assert len(out) == WPN_BYTES, (len(out), WPN_BYTES)
+    return bytes(out)
+
 
 LF_WALKOVER = 0x10              # crossing the line fires it; else the use key
 LF_REPEAT = 0x20                # fires again after it has run; else once only
@@ -1550,7 +1754,8 @@ def pack_mapinfo(m: MapData, ssec_reu_base: int, spawn_ssec: int,
 
 
 def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
-                hudbg: bytes = b"", hudfont: bytes = b"") -> bytes:
+                hudbg: bytes = b"", hudfont: bytes = b"",
+                weapon: bytes = b"") -> bytes:
     """Assemble the whole .reu image. Blocks follow the header in id order,
     each padded up to a 256-byte boundary (docs/reu-format.md §3).
 
@@ -1581,6 +1786,7 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
     ofs_hudbg = ofs_walltex + align(len(walltex))
     ofs_hudfont = ofs_hudbg + align(len(hudbg))
     ofs_lines = ofs_hudfont + align(len(hudfont))
+    ofs_weapon = ofs_lines + align(len(linedefs))
 
     ofs_music = MUSIC_OFFSET if music else 0
 
@@ -1611,6 +1817,12 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
     # because a resident block's home is a *page* in the descriptor and neither
     # hole starts on one (docs/reu-format.md §4.8).
     blocks.append((BLK_LINEDEFS, 0, ofs_lines, linedefs, 0))
+    # Read every frame, not once: weaponBoot keeps the descriptor's REU offset
+    # in wpnReuBase and streams the art from it after each renderFrame. It is
+    # the first block whose *address* the engine has to remember rather than
+    # its contents (docs/reu-format.md §4.9).
+    if weapon:
+        blocks.append((BLK_WEAPON, 0, ofs_weapon, weapon, 0))
     if music:
         blocks.append((BLK_MUSIC, BF_PAGES, ofs_music, music, 0))
 
@@ -1621,7 +1833,7 @@ def build_image(m: MapData, music: bytes = b"", walltex: bytes = b"",
             "src/defs.asm together -- mapload.asm derives MAXDESCS from it and "
             "rejects the image with mapErr=4 (bad block count).")
 
-    used = align(ofs_lines + len(linedefs))
+    used = align(ofs_weapon + len(weapon))
     if used > REU_PROBE_OFFSET:
         raise ValueError(
             f"image is {used} B and would reach REU ${REU_PROBE_OFFSET:06X}, "
@@ -1953,6 +2165,33 @@ def validate(m: MapData, img: bytes) -> list[str]:
             check(len(set(glyph)) > 1,
                   f"digit glyph {d} is uniform -- it will render blank")
 
+    # The weapon: presence, size, and the two properties the blit relies on
+    # that a bad downsample would quietly break -- the art must not be blank,
+    # and the silhouette must actually agree with the art it claims to
+    # describe. The second is the one worth spending cycles on: a silhouette
+    # that closes a column the art leaves transparent punches a black hole
+    # through the world, and nothing else in the pipeline would notice.
+    wp = p["blocks"].get(BLK_WEAPON)
+    check(wp is not None, "image has no WEAPON block")
+    if wp is not None:
+        check(wp["flags"] & BF_RESIDENT == 0, "WEAPON must not be resident")
+        check(wp["length"] == WPN_BYTES,
+              f"WEAPON is {wp['length']} B, expected {WPN_BYTES}")
+        if wp["length"] == WPN_BYTES:
+            sil = wp["data"][:WPN_SIL_BYTES]
+            art = wp["data"][WPN_SIL_BYTES:]
+            check(any(b != 0 for b in art), "the weapon art is entirely clear")
+            check(all(t <= WPN_H for t in sil),
+                  "a weapon silhouette entry is past the bottom of the art")
+            for x in range(WPN_W):
+                for y in range(sil[x], WPN_H):
+                    byte = art[y * WPN_ROW_BYTES + x // 2]
+                    px = (byte >> 4) if (x & 1) else (byte & 0x0F)
+                    if px == SPR_CLEAR:
+                        bad.append(f"weapon column {x} is sealed from row "
+                                   f"{sil[x]} but row {y} is transparent")
+                        break
+
     # 2. every child resolves
     for i, nd in enumerate(p["nodes"]):
         for name, child in (("right", nd.right), ("left", nd.left)):
@@ -2157,7 +2396,8 @@ def report(m: MapData, img: bytes) -> None:
                       (BLK_SECTORS, "SECTORS"), (BLK_SSECDATA, "SSECDATA"),
                       (BLK_NODESPH, "NODESPH"), (BLK_WALLTEX, "WALLTEX"),
                       (BLK_HUDBG, "HUDBG"), (BLK_HUDFONT, "HUDFONT"),
-                      (BLK_LINEDEFS, "LINEDEFS"), (BLK_MUSIC, "MUSIC")):
+                      (BLK_LINEDEFS, "LINEDEFS"), (BLK_WEAPON, "WEAPON"),
+                      (BLK_MUSIC, "MUSIC")):
         if bid not in p["blocks"]:
             continue
         b = p["blocks"][bid]
@@ -2203,6 +2443,11 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out", required=True, help="output .reu image")
     ap.add_argument("--map", default="E1M1",
                     help="map lump name, or TEST for the built-in test map")
+    ap.add_argument("--hud", default="assets/hud.kla",
+                    help="hand-painted Koala Painter image for the status "
+                         "bar and digit font (default: %(default)s); if "
+                         "missing, a fixed placeholder pattern is used "
+                         "instead so a build never hard-fails on it")
     ap.add_argument("--png", help="write a top-down render of the decoded image")
     ap.add_argument("--music", metavar="STREAM",
                     help="a SID register stream from tools/sidstream.py "
@@ -2213,19 +2458,22 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     try:
+        kla = load_koala(a.hud) if a.hud and os.path.exists(a.hud) else None
         if a.map.upper() == "TEST":
             m = build_test_map()
             walltex = build_walltex(None)
-            hudbg, hudfont = build_hudbg(None), build_hudfont(None)
+            hudbg, hudfont = build_hudbg(kla), build_hudfont(kla)
+            weapon = build_weapon(None)
         else:
             if not a.wad:
                 ap.error("a WAD path is required unless --map TEST")
             wad = Wad(a.wad)
             m = load_wad_map(wad, a.map.upper())
             walltex = build_walltex(wad)
-            hudbg, hudfont = build_hudbg(wad), build_hudfont(wad)
+            hudbg, hudfont = build_hudbg(kla), build_hudfont(kla)
+            weapon = build_weapon(wad)
         music = load_music(a.music) if a.music else b""
-        img = build_image(m, music, walltex, hudbg, hudfont)
+        img = build_image(m, music, walltex, hudbg, hudfont, weapon)
     except (ValueError, OSError) as e:
         print(f"wad2reu: {e}", file=sys.stderr)
         return 2

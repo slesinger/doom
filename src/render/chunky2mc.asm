@@ -50,7 +50,21 @@
                                         // METAL exactly
 .eval ramps.add(List().add($b,$8,$f))   // 12 door    dgrey orange lgrey
 .eval ramps.add(List().add($8,$7,$1))   // 13 lite    orange yellow white
-.for (var r=14; r<16; r++) .eval ramps.add(List().add($b,$c,$f)) // spare
+// 14 claimed 2026-08-13 by the weapon view (IMPLEMENTATION_PLAN.md §12a;
+// wad2reu.py's WPN_RAMP). Brown into dark grey into grey -- one step darker at
+// both ends than the tan ramp it started as. E1M1 is mostly stone ($b/$c/$f)
+// and tan ($9/$c/$f), so a gun topping out at light grey is a grey object in
+// front of grey walls whatever its shape; capping it at $c and giving it black
+// (dither code 0) for its dark half is the only contrast available, because the
+// ramp is per 4x8 cell and the background's is not ours to choose. Paired with
+// WPN_MIN/WPN_MAX in wad2reu.py -- the ramp sets which three colours, the range
+// sets how often the top one is reached, and darkening needs both.
+//
+// Not shared with ramp 9 despite starting as its twin: the weapon is the one
+// thing always in the foreground, and a tweak to it must not repaint every
+// STARTAN wall in E1M1. This edit is exactly that case.
+.eval ramps.add(List().add($9,$b,$c))   // 14 gun     brown dgrey grey
+.eval ramps.add(List().add($b,$c,$f))   // 15 spare
 
 // intensity(0-15) + Bayer threshold -> 2-bit code 0..3
 .function dcode(v, px, row) {
@@ -89,8 +103,8 @@ convert:
         jsr initFrame
         lda #>MATRIX
         sta matPage
-        lda #100                    // 100 pages * 8 cells = 800 cells = 20
-        sta pageCnt                 // cell-rows = 160 px (176 -> 160, was 110/880/22)
+        lda #VIEWCELLS/8            // pages * 8 cells = VIEWCELLS = VIEWCELLROWS
+        sta pageCnt                 // cell-rows (176/22 -> 160/20 -> 144/18)
 pageLoop:
         jsr patchMatrixPage         // 32+1 fetch hi-bytes := matPage
         ldx #0                      // X = (cell & 7) * 32
@@ -155,22 +169,28 @@ bumpBmpPage:
         .for (var k=0; k<8; k++) inc bmpHiOps.get(k)
         rts
 
-initFrame:                          // aim all self-mod ops at the back buffer
-        lda #0
-        sta bmY+1
+// Aim all self-mod ops at the back buffer -- and at the *top letterbox's far
+// side*, not at byte 0. MATRIX row 0 is raster row VIEWTOP, so every output
+// pointer starts VIEWCELLTOP cell-rows in (defs.asm). This is the only place
+// the shift is applied: the renderer, spanFill and the sprite blits all work
+// in MATRIX rows and know nothing about it.
+initFrame:
+        lda #<VIEWBMPOFS            // 640 = $0280: low byte into bmY's stride,
+        sta bmY+1                   // the $02 folded into the hi-byte ops below
+        lda #VIEWCELLOFS
         sta scrSta+1
         sta colSta+1
-        lda #>COLBUF
+        lda #>[COLBUF + VIEWCELLOFS]
         sta colSta+2
         lda backBuf
         bne !b1+
-        lda #>SCREEN0
+        lda #>[SCREEN0 + VIEWCELLOFS]
         sta scrSta+2
-        lda #>BITMAP0
+        lda #>[BITMAP0 + VIEWBMPOFS]
         jmp !set+
-!b1:    lda #>SCREEN1
+!b1:    lda #>[SCREEN1 + VIEWCELLOFS]
         sta scrSta+2
-        lda #>BITMAP1
+        lda #>[BITMAP1 + VIEWBMPOFS]
 !set:   .for (var k=0; k<8; k++) sta bmpHiOps.get(k)
         rts
 
@@ -189,10 +209,25 @@ flip:
 !:      sta $dd00
         lda #$08                    // both buffers: screen +$0000, bitmap +$2000
         sta $d018
-        ldx #0                      // COLBUF -> $d800 (800 bytes, 176 -> 160
-!:      lda COLBUF,x                // rows: 20 cell-rows * 40 cols)
+        // COLBUF -> $d800, VIEWCELLS bytes starting at cell VIEWCELLOFS.
+        // Source and destination carry the *same* offset -- initFrame aimed
+        // colSta at COLBUF+VIEWCELLOFS for exactly this reason -- so every
+        // byte's low address matches and the burst is three plain X loops:
+        // a partial page in, two whole pages, then the tail. At 18 cell-rows
+        // shifted down 2 that is 176 + 256 + 256 + 32 = 720, spanning
+        // $0450-$071f, which stops short of TX_SEED at $0770 (defs.asm).
+        //
+        // The colour cells outside this window are the two letterbox bands and
+        // the HUD, written once by clearHudRows/hudBoot straight to $d800 and
+        // never re-burst.
+        .errorif VIEWCELLOFS == 0 || VIEWCELLOFS >= 256, "the flip burst wants a sub-page top letterbox"
+        .errorif VIEWCELLOFS + VIEWCELLS <= 768 || VIEWCELLOFS + VIEWCELLS > 1024, "the flip burst is shaped for a partial page, two whole pages and a tail"
+        ldx #VIEWCELLOFS
+!:      lda COLBUF,x
         sta $d800,x
-        lda COLBUF+$100,x
+        inx
+        bne !-
+!:      lda COLBUF+$100,x
         sta $d900,x
         lda COLBUF+$200,x
         sta $da00,x
@@ -201,8 +236,8 @@ flip:
 !:      lda COLBUF+$300,x
         sta $db00,x
         inx
-        cpx #32
-        bne !-
+        cpx #VIEWCELLOFS+VIEWCELLS-768
+        bcc !-
         lda backBuf                 // swap
         eor #1
         sta backBuf

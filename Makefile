@@ -57,6 +57,11 @@ PRG       := build/doom.prg
 REUIMG    ?= build/assets.reu
 TESTREU   := build/testmap.reu
 WAD       := assets/DOOM1.WAD
+# Hand-painted status bar + digit font (docs/reu-format.md §4.9). Optional --
+# wad2reu.py falls back to a fixed placeholder if it is missing -- so this is
+# $(wildcard ...), not a plain assignment: a bare assets/hud.kla prerequisite
+# would make `make assets` fail outright before the file exists.
+HUDKLA    := $(wildcard assets/hud.kla)
 
 # VICE: REU with the map image attached read-only.
 #
@@ -111,7 +116,12 @@ run: $(PRG) $(REUIMG)
 # of this run -- so its status says nothing about success. Ignore it and judge
 # the run by its artifact instead: the PNG must exist and be newer than the
 # PRG. `make check` then judges the PNG's content.
-SHOT_CYCLES ?= 50000000
+# 50M was marginal: it landed inside the *first* conversion often enough that
+# `make shot` produced a screenful of half-converted MATRIX staging bytes, which
+# checkshot happily passed at 39% coverage. That is §4's "make framehash, not
+# make shot" warning showing up in the gate rather than in a reading. 80M leaves
+# the shot several completed frames past boot; under warp it costs a second.
+SHOT_CYCLES ?= 80000000
 SHOT        := build/shot.png
 shot: $(PRG) $(REUIMG)
 	rm -f $(SHOT)
@@ -279,11 +289,11 @@ $(MUSICBIN): tools/sidstream.py tools/cpu6502.py $(MUSICSID)
 
 music: $(MUSICBIN)
 
-build/assets.reu: tools/wad2reu.py $(WAD) $(MUSICBIN)
-	$(PYTHON) tools/wad2reu.py $(WAD) --music $(MUSICBIN) -o $@
+build/assets.reu: tools/wad2reu.py $(WAD) $(MUSICBIN) $(HUDKLA)
+	$(PYTHON) tools/wad2reu.py $(WAD) --music $(MUSICBIN) --hud assets/hud.kla -o $@
 
-$(TESTREU): tools/wad2reu.py
-	$(PYTHON) tools/wad2reu.py --map TEST -o $(TESTREU)
+$(TESTREU): tools/wad2reu.py $(HUDKLA)
+	$(PYTHON) tools/wad2reu.py --map TEST --hud assets/hud.kla -o $(TESTREU)
 
 # Real hardware. u64-config must run before the PRG: the engine selects its
 # CPU speed by writing $D031, and that register only exists when the machine's

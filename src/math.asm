@@ -23,10 +23,12 @@ sqrHi: .fill 512, >floor(i*i/4)
 sinLo: .fill 256, <round(16383*sin(i*2*PI/256))
 sinHi: .fill 256, >round(16383*sin(i*2*PI/256))
 // matrix row-of-cells base addresses: MATRIX + cellrow*1280
-// 20 entries (176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1): the freed
-// tail of MATRIX past row 160 is permanent RAM once the first frame has run.
-rowCellLo: .fill 20, <[MATRIX + i*1280]
-rowCellHi: .fill 20, >[MATRIX + i*1280]
+// VIEWCELLROWS entries (176 -> 160 -> 144 rows, IMPLEMENTATION_PLAN.md §14a.1
+// then §12): the freed tail of MATRIX past the last row is permanent RAM once
+// the first frame has run. spanPrep's two clamps below are what keep a bad row
+// from stepping the cell pointer off the end of this table.
+rowCellLo: .fill VIEWCELLROWS, <[MATRIX + i*1280]
+rowCellHi: .fill VIEWCELLROWS, >[MATRIX + i*1280]
 
 .pc = MATHCODE "math+span code"
 
@@ -369,9 +371,9 @@ spanDone:
 //------------------------------------------------------------
 spanPrep:
         lda zSY1                    // clamp the run's far end to the last
-        cmp #161                    // valid row (160 = 20 cell-rows * 8):
+        cmp #VIEWROWS+1             // valid row (VIEWROWS = VIEWCELLROWS * 8):
         bcc !+                      // otherwise the cell loop steps the
-        lda #160                    // pointer past rowCell's 20 entries, one
+        lda #VIEWROWS               // pointer past rowCell's entries, one
         sta zSY1                    // full cell at a time, unbounded
 !:      sec
         sbc zSY0
@@ -388,7 +390,7 @@ spanPrep:
         lsr
         lsr
         lsr
-        cmp #20
+        cmp #VIEWCELLROWS
         bcs !nul-
         tay                         // Y = cell row of first pixel
         lda xOfsLo,x

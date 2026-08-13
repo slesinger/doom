@@ -8,9 +8,10 @@ assembles, runs, `make debug` stays clean, and the display shows nothing.
 `make debug` cannot see that — it only proves nobody wrote outside their
 buffers — so the screenshot needs an assertion of its own.
 
-Two cheap properties separate "a frame" from "not a frame", inside the 320x160
-3D viewport (the top 20 of the 25 text rows; rows 20-24 are letterbox + HUD,
-both blanked -- IMPLEMENTATION_PLAN.md §14a.1, 176 -> 160 rows):
+Two cheap properties separate "a frame" from "not a frame", inside the 320x144
+3D viewport (text rows 2-19; rows 0-1 and 20-21 are the two letterbox bands and
+rows 22-24 the HUD -- IMPLEMENTATION_PLAN.md §14a.1 then §12, 176 -> 160 -> 144
+rows, the last cut split evenly off the top and the bottom):
 
   coverage  fraction of pixels that are not the black background. A wall/floor/
             ceiling view fills most of the viewport; the known-good E1M1-less
@@ -37,7 +38,11 @@ except ImportError:
 # area is centred in it. Derive the offset rather than hardcoding 32/36, so a
 # different -exitscreenshot geometry still lines up.
 DISPLAY_W, DISPLAY_H = 320, 200
-VIEWPORT_H = 160                 # rows 0-159: the 3D view. Below is letterbox+HUD.
+# The 3D view is 144 rows centred on the old 176-row window: 16 blank rows above
+# it, 16 below, then the HUD at 176. Cropping from row 0 would have measured the
+# top letterbox as "the renderer drew nothing there", which is true and useless.
+VIEWPORT_Y = 16
+VIEWPORT_H = 144                 # rows 16-159. Outside it: letterbox + HUD.
 
 
 def measure(path):
@@ -47,7 +52,8 @@ def measure(path):
         raise ValueError(f"{path} is {w}x{h}, too small to hold a C64 display")
     x0 = (w - DISPLAY_W) // 2
     y0 = (h - DISPLAY_H) // 2
-    view = im.crop((x0, y0, x0 + DISPLAY_W, y0 + VIEWPORT_H))
+    view = im.crop((x0, y0 + VIEWPORT_Y,
+                    x0 + DISPLAY_W, y0 + VIEWPORT_Y + VIEWPORT_H))
     # getcolors returns [(count, rgb), ...]; the limit is well above the 16
     # colours a VIC-II frame can contain, so it never falls back to None.
     hist = Counter({rgb: n for n, rgb in view.getcolors(maxcolors=1 << 16)})

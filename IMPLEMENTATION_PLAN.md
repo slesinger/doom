@@ -850,7 +850,7 @@ frame. That is why the options below are largely one compromise wearing
 different hats, and why the first is the only one that pays into both budgets
 at once.
 
-### 14a.1 Viewport height *(closed 2026-08-12: 176 → 160, and no further)*
+### 14a.1 Viewport height *(closed 2026-08-12: 176 → 160; reopened and closed again 2026-08-13 at 144 — see §14a.1b)*
 
 176 → 160 rows (20 cell-rows), a contained edit in four places (`math.asm`,
 `bsp.asm`, `walls.asm`, `chunky2mc.asm`), freeing 2560 B of MATRIX — the tail
@@ -876,6 +876,102 @@ phaseprof's cycle counts as usable without a hardware trip.
 
 **What it costs:** a letterboxed view — Doom's own 320×200 view is 168 rows
 under its status bar, so 176 was already generous.
+
+#### 14a.1b Reopened for §12: 160 → 144 rows, split evenly *(closed 2026-08-13)*
+
+"Not scheduled" lasted one section. §12 needs ~2 KB of contiguous code-capable
+RAM for resident sprite art and there is no other lever in the machine that
+produces any (§14a.7), so the second cut was taken after all: **160 → 144 rows
+(18 cell-rows), freeing another 2560 B** and, as §14a.1 predicted to the
+decimal, **another 1.13 ms** (compute 3051.1k → 2979.1k cycles, −2.4%;
+`convert` 391.1k → 352.1k, exactly the 18/20 row ratio).
+
+**The 32 rows now come off symmetrically — 16 top, 16 bottom.** The first pass
+took all 32 off the bottom, which is cheaper to write (the buffer still starts
+at row 0) but drops eye level to two thirds of the way down the picture: the
+player reads it as permanently looking up at the ceiling. Symmetric splits the
+letterbox into two 16-row bands and keeps the horizon at raster 88 where it has
+always been. It costs one constant offset, applied in exactly one place —
+`initFrame` aims the converter's three output pointers `VIEWCELLTOP` cell-rows
+in, and nothing upstream of the bitmap knows. Two coordinate systems now exist
+and `defs.asm` names both: MATRIX rows 0..143 with `HORIZON` = 72 (what
+`projRow` subtracts from), and raster rows 0..199 with the view at 16..159.
+
+Fallout worth knowing: the burst in `flip` has to reach a *fourth* page of
+`$d8xx` once the view starts at colour cell 80, and those nine bytes overran
+the converter's block. `cntBump` moved to the top of the same 21-byte gap
+(`instrument.asm`) — the two blocks now spend the gap exactly, with an
+`.errorif` on each side. `TABLES_FREE` is not a fallback despite the name;
+SEGBUF, the BSP node test and the counters have taken all of it.
+
+Also fixed here, not in this section's scope but found by it: `make shot` ran
+`SHOT_CYCLES = 50000000` and was landing the screenshot *inside* the first
+conversion, so `checkshot.py` was passing a bitmap half full of staging bytes
+at 39.7% coverage. Raised to 80M. §4's warning that `make framehash`, not
+`make shot`, is the acceptance test was showing up in the gate itself.
+
+### 12a landing note *(2026-08-13)*
+
+The gun is on screen, streamed, bobbing and sealing its own columns.
+
+**Sized to Doom, not to §12a.** SHTGA0 is 79×60 of Doom's 320×200 = 24.7% of
+the screen width; this viewport is 160 columns of 2:1 pixels covering the same
+320, so faithful is **40 columns, not §12a's 96** — which would have made the
+gun more than twice as wide as the one in Doom. That also takes the per-frame
+stream from 2688 B to **1120 B = 1.12 ms** of the REU's flat microsecond a byte.
+
+**The pre-seed scans up from the bottom, not down from the top.** `colBotSeed`
+is a 160-byte table `renderFrame` now seeds `colBot` from (the two window loops
+merged into one to pay for the extra load — that block had no bytes left).
+Seeding each column from its topmost *opaque* pixel would also forbid the world
+to draw in any transparent gap below it, and a gap the world may not draw and
+the gun does not paint is a black hole. `wad2reu.py`'s `_solid_from_bottom`
+stops at the first such gap so every sealed row is a row the blit fills, and
+`validate()` re-checks that against the shipped art. `make framehash` reporting
+**nonzero 100.0%** is the invariant holding.
+
+**The art is ranked, not stretched.** A linear min..max map produced a black
+blob: SHTGA0 has half its opaque pixels in the bottom quarter of its own
+luminance range and its maximum in a highlight a dozen pixels wide, so 77% of
+the gun landed at intensity ≤ 5 — and the dither turns intensity 3 into one lit
+pixel in five. Spreading by *rank* gives every intensity an equal share of the
+sprite's pixels, so what survives 4 bits is the contrast within the sprite,
+which is the only kind a foreground object needs. §12's sprites use the same
+path.
+
+**Ranking normalises brightness, and the foreground did not want that.** After
+hardware confirmed the gun renders and paces, its remaining fault was that it
+read grey against grey walls — rank spreading gives every sprite the same *mean*
+brightness, which is right for props scattered through a level and wrong for the
+one object permanently in front of the camera. Two levers, and only the second
+one works. Ramp 14 dropped a step at each end (brown / **dgrey / grey**, was
+brown / grey / lgrey) — that is as dark as the VIC goes, since below brown there
+is nothing but blue and black, so past it *darker* can only mean **more black**.
+Squeezing the intensity range does that but takes the top down with it, because
+rank spreading is uniform: at 1..8 the gun is 88% black-and-brown with no third
+tone, a flat silhouette rather than a dark object. Raising the rank to a power
+(`WPN_GAMMA = 3.0`, range 1..15) darkens the body and leaves the top rank at 1.0,
+so the barrel highlight survives. Over SHTGA0's 1292 opaque cells, by share of
+subpixels:
+
+| | black | | | |
+|---|---|---|---|---|
+| original, 2..15 γ1 | 5.5% | brown 36.2% | grey 39.3% | lgrey 19.0% |
+| squeezed, 1..8 γ1 | 23.5% | brown 64.4% | dgrey 12.1% | grey 0.0% |
+| **curved, 1..15 γ3** | **41.4%** | brown 35.6% | dgrey 16.5% | grey 6.5% |
+
+Mean intensity 8.5 → 4.42. Floor 1 and not 0 because 0 is `SPR_CLEAR` — the blit
+skips it and `colBotSeed` has sealed the column, so a zero would be a black hole
+by the §12a rule above. **The black is the dither's, not the intensity's**, which
+is why a tone curve darkens at all.
+
+**Cost, `make phaseprof`, 8 frames:** compute 2979.1k → **3031.6k cycles**
+(+52.5k = 0.82 ms at 64 MHz) for prep + blit, *net of* whatever the seal saved
+inside the traversal — the two are in one bucket and were not separated. Plus
+**1.12 ms of REU DMA** that VICE does not charge and hardware does. That puts a
+frame at roughly **48.5 ms against the 49.7 ms cap**, which is the first time
+this milestone has been inside one raster frame of the limit: §12's sprites
+have to be measured on hardware before they are believed.
 
 ### 14a.2 Resident downsampled sprites, instead of streamed *(open, recommended)*
 

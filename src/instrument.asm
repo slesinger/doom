@@ -51,9 +51,22 @@
 .const CNT_LAST       = cntPix + 2
 .errorif CNT_LAST > TABLES_FREE_END, "instrumentation counters overrun TABLES_FREE"
 
+// cntBump used to live in the 21-byte gap between the converter code and
+// MATHCODE. §12's symmetric viewport cut spent that gap: flip's colour-RAM
+// burst has to reach a fourth page of $d8xx once the view starts at cell 80,
+// and that fourth loop is nine bytes the gap did not have. cntBump moves here
 // cntBump lives in the 21-byte gap between the converter code and MATHCODE,
-// which is the only free block big enough that nothing else wants.
-.const CNTCODE        = $9b4b
+// which is the only free block big enough that nothing else wants. It is
+// pushed to the *top* of that gap now rather than the bottom: §12's symmetric
+// viewport cut made flip's colour-RAM burst reach a fourth page of $d8xx, and
+// the converter needs five of the gap's bytes for the extra loop. Sixteen
+// bytes ending flush against MATHCODE is what is left, so the two blocks
+// between them spend the gap exactly; both .errorifs below hold the line.
+//
+// TABLES_FREE is not an alternative despite the name: SEGBUF ($9740-$97bf),
+// the BSP node test ($97c0-$98e3) and these counters ($98e4-$98fe) have taken
+// all of it.
+.const CNTCODE        = MATHCODE - 16
 
 // Counter indices, i.e. the byte offset of each 3-byte record from cntNode.
 // The Count macro passes one in X rather than inlining the increment: the
@@ -106,8 +119,8 @@ done:
 //
 // Assembled unconditionally, even though only an INSTRUMENT build calls it:
 // a `.if` block is a scope in KickAssembler, so a label inside one is not
-// visible to the Count macro expanding in another file. Sixteen bytes in a
-// gap nothing else fits in is the cheaper answer.
+// visible to the Count macro expanding in another file. Sixteen bytes off the
+// top of TABLES_FREE, which has 400 spare either way, is the cheaper answer.
 //------------------------------------------------------------
 .pc = CNTCODE "instrumentation"
 cntBump:

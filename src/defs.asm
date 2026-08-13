@@ -14,12 +14,61 @@
 .const BITMAP1 = $e000
 .const COLBUF  = $0400
 
+// The viewport, in rows and in cell-rows. IMPLEMENTATION_PLAN.md §14a.1 cut
+// 176 -> 160 and §12 cut 160 -> 144: sprites and the weapon view need ~2 KB of
+// *contiguous, code-capable* RAM and this is the only lever in the machine that
+// produces any (§14a.7). It also returns ~1.1 ms of compute, on the same
+// measured basis as the last cut -- a quarter of what the row percentage
+// predicts, because renderFrame's cost is per-seg and per-column, not per-row.
+//
+// **The 32 rows come off symmetrically: 16 from the top and 16 from the
+// bottom.** Taking them all off the bottom would have been cheaper to write --
+// the buffer starts at row 0 either way -- but it drops the camera's eye level
+// from the middle of the picture to two thirds of the way down it, which reads
+// as permanently looking at the ceiling. Symmetric keeps the horizon where the
+// player's eye already expects it, at physical raster row 88, and splits the
+// letterbox into two 16-row bands instead of one 32-row band at the bottom.
+//
+// Two separate coordinate systems fall out of that, and mixing them is the
+// bug this comment exists to prevent:
+//
+//   * MATRIX rows 0..VIEWROWS-1 are what the renderer writes. The horizon in
+//     *this* space is HORIZON = 72, the middle of the buffer -- that is the
+//     number projRow subtracts from (src/render/walls.asm).
+//   * Physical raster rows 0..199 are what the VIC shows. The view is shifted
+//     down by VIEWTOP = 16, so MATRIX row 0 lands on raster row 16 and the
+//     horizon lands back on raster 88. The converter applies the shift once,
+//     as a constant offset added to its three output pointers (initFrame,
+//     src/render/chunky2mc.asm) -- nothing downstream of MATRIX knows about it.
+//
+// Everything that indexes the buffer vertically must read these and not a
+// literal: rowCellLo/Hi's length and spanPrep's clamps (src/math.asm),
+// renderFrame's colBot seed (src/render/bsp.asm), projRow's horizon
+// (src/render/walls.asm), the converter's page count, initFrame's origin and
+// flip's colour-RAM burst (src/render/chunky2mc.asm), and clearHudRows' two
+// letterbox bands (src/main.asm). 160 appears in walls.asm too and is
+// *columns* -- leave it.
+.const VIEWROWS     = 144
+.const VIEWCELLROWS = VIEWROWS / 8          // 18
+.const VIEWCELLS    = VIEWCELLROWS * 40     // 720: colour bytes flip copies
+.const HORIZON      = VIEWROWS / 2          // 72, eye level in MATRIX rows
+.const VIEWTOP      = 16                    // first raster row the view occupies
+.const VIEWCELLTOP  = VIEWTOP / 8           // 2 cell-rows of top letterbox
+.const VIEWCELLOFS  = VIEWCELLTOP * 40      // 80: screen/colour cells to skip
+.const VIEWBMPOFS   = VIEWCELLTOP * 320     // 640: bitmap bytes to skip
+.errorif VIEWROWS != VIEWCELLROWS * 8, "the viewport must be a whole number of cell-rows"
+.errorif VIEWTOP != VIEWCELLTOP * 8, "the top letterbox must be a whole number of cell-rows"
+// The HUD's three cell-rows are fixed at raster 176; the view plus both bands
+// must fit above them, or the converter writes over the bar.
+.errorif VIEWTOP + VIEWROWS > 176, "the view and its top letterbox overrun the HUD"
+
 // Wall texture tiles, resident, in the tail the 160-row viewport freed.
 //
 // MATRIX is 28160 B ($1000-$7dff) and the renderer now writes only the first
-// 25600 ($1000-$73ff) -- IMPLEMENTATION_PLAN.md §14a.1 cut 176 rows to 160 and
-// nothing had claimed what that freed. This is the claim: sixteen families of
-// 128 bytes, loaded once by texLoad (src/mapload.asm) and never moved.
+// MATRIX_LIVE ($1000-$69ff) -- IMPLEMENTATION_PLAN.md §14a.1 cut 176 rows to
+// 160 and nothing had claimed what that freed. This is the claim: sixteen
+// families of 128 bytes, loaded once by texLoad (src/mapload.asm) and never
+// moved. §12's further cut to 144 opened the block below it (SPRFREE).
 //
 // **Residency is not an optimisation here, it is the phase.** A 16x16 tile is
 // 128 B against Stage A's 32, and Stage A re-fetched the tile *per seg*: at
@@ -29,11 +78,81 @@
 // 2.2 KB/frame and is worth ~2.2 ms before the finer tile costs anything.
 //
 // It is safe under the first frame for the same reason BOOTCODE is not: boot
-// staging reaches MATRIX+$64ff (HUDFONT_STAGE) and the live buffer ends at
-// $73ff, so $7600 is under neither.
+// staging reaches MATRIX+$573f (HUDFONT_STAGE) and the live buffer ends at
+// $69ff, so $7600 is under neither.
 .const WALLTILE     = MATRIX + $6600        // $7600-$7dff, 16 x 128 B
 .const WALLTILE_LEN = 16 * 128
 .errorif WALLTILE + WALLTILE_LEN > MATRIX + 28160, "wall tiles run past MATRIX"
+
+// The block §12's viewport cut opened: $6a00-$75ff, 3072 B between the live
+// chunky buffer and the wall tiles. It is the only contiguous code-capable
+// RAM the machine has left (IMPLEMENTATION_PLAN.md §14a.7), which is the whole
+// reason the cut was taken, and §12 plus §12a spend all of it.
+//
+// **Code here is in the PRG image and runs from where it loads** -- no
+// .pseudopc relocation, unlike BOOTCODE/LINECODE/MUSCODE. That is not a
+// stylistic choice: the PRG already spans $0801-$cffd, so these bytes cost the
+// image nothing, and this block is above both the live buffer and everything
+// mapLoad stages (which ends at HUDFONT_STAGE, $673f). The one thing it is not
+// is *diffed*: probe.py allows all of $1000-$7dff as MATRIX, so `make check`
+// would not notice a stray write landing on this code. WALLTILE has always had
+// the same exposure.
+.const SPRFREE      = MATRIX + VIEWROWS*160 // $6a00, first byte past the view
+.const SPRFREE_END  = WALLTILE              // $7600
+.errorif SPRFREE >= SPRFREE_END, "the viewport cut left no room below the wall tiles"
+
+// Per-column seed for renderFrame's colBot, 160 bytes. VIEWROWS everywhere the
+// weapon does not reach, and the weapon's silhouette where it does -- so the
+// world is never drawn behind the gun (IMPLEMENTATION_PLAN.md §12a). Written
+// by wpnPrep once a frame, read by renderFrame's opening loop; a table rather
+// than an immediate because §12's sprites want the same hook.
+.const colBotSeed   = SPRFREE               // 160 B, $6a00-$6a9f
+
+// The weapon view. wpnSil is the resident silhouette (one row per column,
+// fetched once at boot); wpnArtBase is the REU address of the art after it,
+// which is streamed a row at a time every frame and is zero when the image
+// carries no weapon block, which wpnFrame reads as "draw nothing".
+.const wpnSil       = SPRFREE + 160         // 40 B,  $6aa0-$6ac7
+.const wpnArtBase   = SPRFREE + 200         // 3 B,   $6ac8
+.const wpnRow0      = SPRFREE + 203         // this frame's top MATRIX row
+.const wpnRows      = SPRFREE + 204         // rows that fit below it
+.const wpnOK        = SPRFREE + 205         // nonzero once the block has loaded
+.const WPNCODE      = SPRFREE + $100        // $6b00-$6cff
+.const WPNCODE_END  = SPRFREE + $300
+
+// §12's sprite art: 24 distinct things, tight aspect-correct boxes, 4-bit
+// packed, resident. Everything left between the weapon code and MOVECODE --
+// *not* up to WALLTILE: MOVECODE already holds the last page below the tiles
+// (the substepped move, below), which is why SPRFREE_END is not the bound.
+//
+// 2048 B, and the art was priced at 2278 for 24 sprites in 16x28 boxes, so
+// something has to give when §12 lands: either the box cap (16x24 costs 2158,
+// 14x28 costs 1945) or this block, by moving wpnFrame's ~200 bytes of unrolled
+// blit out to $7eeb-$7fff, the 277 B behind BODYCODE. Deliberately left as a
+// choice for the phase that has the real numbers rather than guessed at here.
+.const SPRART       = SPRFREE + $300        // $6d00-$74ff, 2048 B
+.const SPRART_END   = MATRIX + $6500        // = MOVECODE
+.errorif WPNCODE_END > SPRART, "the weapon code overruns the sprite art"
+.errorif SPRART_END > SPRFREE_END, "the sprite art runs past the free block"
+
+// The weapon's geometry. Every one of these is also a constant in
+// tools/wad2reu.py under the same name, and the pair must move together --
+// the .reu block is WPN_SIL_BYTES + WPN_ART_BYTES long and weaponLoad rejects
+// any other length with MERR_SIZE, so a mismatch fails at boot rather than
+// drawing rubbish. See that file's own header for why 40 columns and not 96.
+.const WPN_W         = 40                   // columns, 10 cells of 4
+.const WPN_H         = 56                   // rows, 7 cell-rows of 8
+.const WPN_COL0      = 60                   // leftmost column, (160-40)/2
+.const WPN_ROW0      = VIEWROWS - WPN_H     // 88, unbobbed top MATRIX row
+.const WPN_ROW_BYTES = WPN_W / 2            // 20, two pixels per byte
+.const WPN_SIL_BYTES = WPN_W                // 40
+.const WPN_ART_BYTES = WPN_H * WPN_ROW_BYTES
+.const WPN_BYTES     = WPN_SIL_BYTES + WPN_ART_BYTES
+.const WPN_RAMP      = 14                   // chunky2mc.asm's "gun" ramp
+.const WPN_CLEAR     = 0                    // intensity 0 = transparent
+.errorif WPN_COL0 + WPN_W > 160, "the weapon runs off the right of the view"
+.errorif [WPN_COL0 & 3] != 0 || [WPN_W & 3] != 0, "the weapon must be cell-aligned in x"
+.errorif [WPN_ROW0 & 7] != 0 || [WPN_H & 7] != 0, "the weapon must be cell-aligned in y"
 
 // The substepped move (moveSteps, src/input.asm), in the 256 bytes between
 // what the HUD stages at boot and what the wall tiles hold for good.
@@ -43,10 +162,9 @@
 //
 //   - the renderer stops at $73ff (the 160-row viewport, §14a.1), so no span
 //     ever reaches this page;
-//   - boot staging stops at $74ff (HUDFONT_STAGE + HUD_FONT_BYTES), so the
-//     loader does not overwrite it between the PRG landing and the first
-//     frame. That is why it is $7500 and not $7400: the page below is free at
-//     runtime but is the HUD font's staging area at boot.
+//   - boot staging stops at $673f (HUDFONT_STAGE + HUD_FONT_BYTES), well below
+//     this page, so the loader does not overwrite it between the PRG landing
+//     and the first frame.
 //
 // It is in the PRG image like ordinary code -- the image already spans this
 // address (BOOTCODE6 ends at $6049) -- so unlike LINECODE and MUSCODE there is
@@ -358,10 +476,18 @@
 // other loader does -- lineLoad included -- and consumed immediately by
 // hudBoot, which runs once mapLoad (and its descriptor-walk callouts to
 // hudBgLoad/hudFontLoad) has returned. Must match wad2reu.py's HUD_* exactly.
-.const HUD_CELL_BYTES = 32          // one MATRIX-format cell: 4x8, 1 B/pixel
+//
+// A cell is 10 raw bytes -- 8 bitmap bytes (one C64 multicolor cell, 4x8
+// px), 1 screen-RAM byte and 1 colour-RAM byte -- straight VIC multicolor
+// bitmap format, not the ramp/intensity chunky format the 3D renderer's
+// dither chain uses. wad2reu.py cuts these directly out of a hand-painted
+// Koala-format image (assets/hud.kla), so hudBlitCell below is a plain copy,
+// no dithering: what the artist painted in a real C64 multicolor editor is
+// exactly what lands on screen.
+.const HUD_CELL_BYTES = 10          // 8 bitmap bytes + 1 screen + 1 colour
 .const HUD_BG_CELLS_W = 40
 .const HUD_BG_CELLS_H = 3
-.const HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES  // 3840
+.const HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES  // 1200
 .const HUD_FONT_GLYPHS = 10
 .const HUD_FONT_CELLS_W = 2
 .const HUD_FONT_CELLS_H = 2
@@ -374,12 +500,12 @@
 // MATRIX+0 -- so the bar's first cells came out as raw linedef records. The
 // bug was invisible in the screenshot and obvious the moment the staged bytes
 // were diffed against wad2reu.py's own build_hudbg() output at a hudBoot
-// checkpoint. Staging above the boot code instead ($6100-$74ff, inside the
+// checkpoint. Staging above the boot code instead ($6100-$673f, inside the
 // $6100-$7dff MATRIX tail nothing else claims) makes the two independent of
 // descriptor order, which is what the ordering assumption should never have
 // been.
-.const HUDBG_STAGE   = MATRIX + $5100            // $6100, 3840 B
-.const HUDFONT_STAGE = HUDBG_STAGE + HUD_BG_BYTES // $7000, 1280 B, ends $74ff
+.const HUDBG_STAGE   = MATRIX + $5100            // $6100, 1200 B
+.const HUDFONT_STAGE = HUDBG_STAGE + HUD_BG_BYTES // $65b0, 400 B, ends $673f
 .errorif HUDFONT_STAGE + HUD_FONT_BYTES > MATRIX + $6e00, "HUD staging runs past MATRIX's boot-time tail"
 
 // The three values the bar reads once at boot. COLBUF's tail past what flip
@@ -604,7 +730,11 @@
 // with their tags and target heights resolved by wad2reu.py rather than
 // searched for here -- the engine has neither a tag array nor sector
 // adjacency (IMPLEMENTATION_PLAN.md §11.2a).
-.const MAPFMT_VERSION = 6
+// 6 took the wall tiles from 8x8 to 16x16 (block 6, 512 -> 2048 B).
+// 7 added the weapon view (block 10, §12a). It is the first block the engine
+// keeps the *address* of rather than the contents: weaponBoot records the
+// descriptor's REU offset in wpnReuBase and streams the art every frame.
+.const MAPFMT_VERSION = 7
 .const hdrMagic     = MAPHDR + 0    // "D64U"
 .const hdrVersion   = MAPHDR + 4
 .const hdrBlocks    = MAPHDR + 5

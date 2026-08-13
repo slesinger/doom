@@ -50,15 +50,18 @@ renderFrame:
         // 159..0, and 128..159 all have bit 7 set -- a bpl-terminated
         // countdown from #159 stops after one iteration. Count 160..1
         // and test with cpx/bne, which doesn't care about the sign bit.
+        //
+        // One loop for both windows now, where it used to be two. colBot is
+        // seeded from a *table* rather than from VIEWROWS, so the weapon view
+        // can seal the columns it covers before a single wall is drawn
+        // (wpnPrep, §12a) -- with no weapon loaded every entry is VIEWROWS and
+        // this is the old constant seed. Merging the loops is what paid for
+        // the extra load: this block had no bytes left at all.
         ldx #160
+!:      dex
         lda #0
-!:      dex
         sta colTop,x
-        cpx #0
-        bne !-
-        ldx #160
-        lda #160                    // 176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1
-!:      dex
+        lda colBotSeed,x
         sta colBot,x
         cpx #0
         bne !-

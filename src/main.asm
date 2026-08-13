@@ -59,7 +59,10 @@ mainLoop:
         jsr readInput
         jsr playerFrame             // walk, jump, and set the eye -- input.asm
         jsr lineFrame               // doors and moving sectors -- lines.asm
+        jsr wpnPrep                 // bob the gun and seal its columns before
+                                    // renderFrame reads the seed -- §12a
         jsr renderFrame             // 3D -> MATRIX
+        jsr wpnFrame                // the gun, over the world it just sealed
         jsr convert                 // MATRIX -> back buffer
         jsr framePace               // hold the rate at 25 fps -- clock.asm
         jsr flip                    // show it
@@ -131,6 +134,10 @@ bootMain:
         // Is there an REU? This used to be advisory. The map now lives in it
         // and there is nothing else to draw, so both this and the load below
         // are fatal -- see mapHalt.
+        // Before mapLoad, not after: this opens every column of colBotSeed
+        // and marks the weapon absent, and mapLoad's descriptor walk is what
+        // turns it on if the image carries block 10 (weaponLoad).
+        jsr wpnBoot
         jsr reuProbe
         lda #0
         rol                         // carry -> bit 0
@@ -246,40 +253,57 @@ turboOn:
 
 
 //------------------------------------------------------------
-// The converter only writes cells 0-799 (rows 0-19, IMPLEMENTATION_PLAN.md
-// §14a.1: 176 -> 160 rows); rows 20-24 are now blank once in both buffers --
-// rows 20-21 are the letterbox the shorter viewport opened up, rows 22-24
-// are still the HUD area, and both are cleared the same way in one pass.
+// The converter writes only the VIEWCELLS cells starting at VIEWCELLOFS
+// (IMPLEMENTATION_PLAN.md §14a.1 cut 176 -> 160 rows, §12 cut 160 -> 144 and
+// split the loss symmetrically). Everything outside that window is blanked
+// once in both buffers: the top letterbox (cell-rows 0..VIEWCELLTOP-1), the
+// bottom letterbox, and the HUD area, which hudBoot paints over afterwards.
 //
-// COLBUF's own rows 20-24 ($0700-$07e7) are deliberately *not* cleared: flip
-// copies only the first 800 bytes of it to $d800, so nothing ever reads them
-// back (IMPLEMENTATION_PLAN.md §8.3's table says so, and this is the code that
-// made the claim true).
+// Every bound is generated from the defs.asm constants rather than written
+// out, because this routine is exactly where the last viewport cut's
+// arithmetic was hidden in literals.
+//
+// The two *bitmap* bands share one X loop, with overlapping 256-byte strides
+// so the last one lands flush against BITMAP's 8000-byte end -- this must not
+// spill into TX_UENDS at $bf40 just past BITMAP0. The two *screen/colour*
+// bands cannot use that trick: both are under 256 cells and an overlapping
+// stride would reach into the live view between them, so each gets an exact
+// loop of its own.
+//
+// COLBUF's own tail is deliberately *not* cleared: flip copies only the
+// window back to $d800, so nothing ever reads the rest (IMPLEMENTATION_PLAN.md
+// §8.3's table says so, and this is the code that made the claim true).
 //------------------------------------------------------------
+.var CLR_TOP   = VIEWBMPOFS                             // 640: bitmap, above
+.var CLR_FROM  = VIEWBMPOFS + VIEWCELLROWS * 320        // 6400: first byte below
+.var CLR_BYTES = 8000 - CLR_FROM                        // 1600 at 144 rows
+.var SCR_FROM  = VIEWCELLOFS + VIEWCELLS                // 800: first cell below
+.var SCR_BYTES = 1000 - SCR_FROM                        // 200 at 144 rows
+.errorif VIEWCELLOFS > 128 || SCR_BYTES > 256, "the screen/colour bands are shaped for one exact loop each"
+.var clrDst = List().add(SCREEN0, SCREEN1, $d800)
 clearHudRows:
         lda #0
         tax
-!:      sta BITMAP0+[20*320],x      // 1600 bytes as 7 overlapping 256B
-        sta BITMAP0+[20*320]+256,x  // strides, exact to BITMAP's 8000-byte
-        sta BITMAP0+[20*320]+512,x  // end (20*320+1600 = 8000) so this can't
-        sta BITMAP0+[20*320]+768,x  // spill into TX_UENDS just past it
-        sta BITMAP0+[20*320]+1024,x
-        sta BITMAP0+[20*320]+1280,x
-        sta BITMAP0+[20*320]+1344,x
-        sta BITMAP1+[20*320],x
-        sta BITMAP1+[20*320]+256,x
-        sta BITMAP1+[20*320]+512,x
-        sta BITMAP1+[20*320]+768,x
-        sta BITMAP1+[20*320]+1024,x
-        sta BITMAP1+[20*320]+1280,x
-        sta BITMAP1+[20*320]+1344,x
+!:      .for (var k=0; k*256 < CLR_TOP; k++) {
+            .var ofs = min(k*256, CLR_TOP-256)
+            sta BITMAP0 + ofs, x
+            sta BITMAP1 + ofs, x
+        }
+        .for (var k=0; k*256 < CLR_BYTES; k++) {
+            .var ofs = min(k*256, CLR_BYTES-256)
+            sta BITMAP0 + CLR_FROM + ofs, x
+            sta BITMAP1 + CLR_FROM + ofs, x
+        }
         inx
         bne !-
-!:      sta SCREEN0+800,x           // screen/color rows 20-24: 200 bytes
-        sta SCREEN1+800,x
-        sta $d800+800,x
+        ldx #VIEWCELLOFS-1              // top band, counted down: < 128 cells
+!:      .for (var k=0; k<clrDst.size(); k++) sta clrDst.get(k), x
+        dex
+        bpl !-
+        ldx #0                          // bottom band + HUD, up to cell 999
+!:      .for (var k=0; k<clrDst.size(); k++) sta clrDst.get(k) + SCR_FROM, x
         inx
-        cpx #200
+        cpx #SCR_BYTES
         bcc !-
         rts
 
@@ -303,6 +327,7 @@ clearHudRows:
 
 #import "render/walls.asm"
 #import "render/bsp.asm"
+#import "render/weapon.asm"
 #import "render/tex.asm"
 #import "lines.asm"
 #import "clock.asm"

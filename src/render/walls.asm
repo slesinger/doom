@@ -13,7 +13,7 @@
 //
 //  Camera space: ry = forward, rx = rightward.
 //    sx  = 80 + rx*HFOCAL/ry          (HFOCAL = 80, 90 deg FOV)
-//    row = 88 - dz*VFOCAL/ry          (VFOCAL = 160)
+//    row = HORIZON - dz*VFOCAL/ry     (VFOCAL = 160, HORIZON = VIEWROWS/2)
 //
 //  Screen y lines (wall top/bottom edges) are linear in screen x,
 //  so per-column work is pure 24-bit accumulator stepping.
@@ -785,7 +785,9 @@ projSX:
         rts
 
 //------------------------------------------------------------
-// projRow: row = 88 - (zA * VFOCAL)/zV  (zA = dz signed, zV > 0)
+// projRow: row = HORIZON - (zA * VFOCAL)/zV  (zA = dz signed, zV > 0)
+// HORIZON is the eye level in MATRIX rows (defs.asm), not in raster rows --
+// the converter shifts the whole buffer down by VIEWTOP on the way out.
 // result signed 16: A = lo, Y = hi
 //------------------------------------------------------------
 projRow:
@@ -813,7 +815,7 @@ projRow:
         sta zD+1
 !:      bit zSign
         bmi !neg+
-        lda #88                     // row = 88 - q
+        lda #HORIZON                // row = HORIZON - q
         sec
         sbc zD+0
         pha
@@ -822,9 +824,9 @@ projRow:
         tay
         pla
         rts
-!neg:   lda zD+0                    // row = 88 + q
+!neg:   lda zD+0                    // row = HORIZON + q
         clc
-        adc #88
+        adc #HORIZON
         pha
         lda zD+1
         adc #0

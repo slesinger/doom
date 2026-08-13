@@ -46,6 +46,7 @@
 .const BLK_WALLTEX  = 6
 .const BLK_HUDBG    = 8
 .const BLK_HUDFONT  = 9
+.const BLK_WEAPON   = 10
 
 .const MAPINFOSZ = 32
 .const NODETABSZ = NODETAB_END - NODETAB
@@ -143,6 +144,11 @@ mapBlockLoop:
         jsr texLoad
         jmp mapNextBlock
 !notTex:
+        cmp #BLK_WEAPON
+        bne !notWeapon+
+        jsr weaponLoad
+        jmp mapNextBlock
+!notWeapon:
         cmp #BLK_HUDFONT
         bne mapNextBlock
         jsr hudFontLoad
@@ -446,43 +452,86 @@ hudFontLoad:
         jmp mapFail
 
 //------------------------------------------------------------
-// hudBlitCell -- one MATRIX-format cell (zHudSrc, 32 bytes, offset =
-// row*4+px, chunky2mc.asm's own layout) -> the bitmap, screen and colour RAM
-// at cell index zHudN (n*8 is the bitmap byte offset, n is the screen/colour
-// byte offset -- "cell n -> BITMAP + n*8", chunky2mc.asm's convert). Drives
-// the SAME ditherTabs/scrTab/colTab tables the per-frame converter has
-// resident, so a ramp+intensity byte means the same thing here as there.
+// weaponLoad — block 10, and the only block whose *address* the engine keeps.
+//
+// The other streamed blocks are read once here and forgotten. This one is
+// half read and half remembered: the WPN_SIL_BYTES silhouette at the front is
+// fetched into wpnSil for good (it never changes, so paying 40 REU bytes a
+// frame for it would be waste), and the art behind it is left where it is,
+// with its REU address in wpnArtBase for wpnFrame to stream from every frame
+// (src/render/weapon.asm, IMPLEMENTATION_PLAN.md §12a).
+//
+// wpnOK is what turns the gun on. wpnBoot cleared it before mapLoad ran, so
+// an image without block 10 -- or with one of the wrong size, which fails
+// below like every other block does -- simply renders no weapon rather than
+// blitting whatever happens to be at REU address zero.
+//------------------------------------------------------------
+weaponLoad:
+        ldy #bdLen
+        lda (zMLDesc),y
+        cmp #<WPN_BYTES
+        bne !bad+
+        iny
+        lda (zMLDesc),y
+        cmp #>WPN_BYTES
+        bne !bad+
+        ldy #bdReuOfs               // the silhouette: fetch it now
+        lda (zMLDesc),y
+        sta REU_REUADDR
+        iny
+        lda (zMLDesc),y
+        sta REU_REUADDR+1
+        iny
+        lda (zMLDesc),y
+        sta REU_BANK
+        lda #<wpnSil
+        sta REU_C64ADDR
+        lda #>wpnSil
+        sta REU_C64ADDR+1
+        lda #WPN_SIL_BYTES
+        sta REU_LENGTH
+        lda #0
+        sta REU_LENGTH+1
+        lda #REU_FETCH
+        sta REU_COMMAND
+        ldy #bdReuOfs               // the art: remember where it is, 24-bit
+        lda (zMLDesc),y
+        clc
+        adc #WPN_SIL_BYTES
+        sta wpnArtBase
+        iny
+        lda (zMLDesc),y
+        adc #0
+        sta wpnArtBase+1
+        iny
+        lda (zMLDesc),y
+        adc #0
+        sta wpnArtBase+2
+        lda #1
+        sta wpnOK
+        rts
+!bad:   lda #MERR_SIZE
+        jmp mapFail
+
+//------------------------------------------------------------
+// hudBlitCell -- one raw cell (zHudSrc, 10 bytes: 8 bitmap bytes, 1 screen
+// byte, 1 colour byte -- straight VIC multicolor bitmap format, cut directly
+// out of a Koala-format image by wad2reu.py) -> the bitmap, screen and
+// colour RAM at cell index zHudN (n*8 is the bitmap byte offset, n is the
+// screen/colour byte offset -- "cell n -> BITMAP + n*8", chunky2mc.asm's own
+// layout, shared here so the HUD lands in the same cell grid the renderer
+// uses).
+//
+// A plain copy, not a conversion: what the artist painted in a real C64
+// multicolor editor (background colour shared and already $d021 = black,
+// two screen-RAM nibble colours and one colour-RAM colour per cell -- the
+// actual hardware limits, not this engine's dither approximation of them)
+// is exactly what lands on screen. No ditherTabs/scrTab/colTab involved.
 //
 // A real subroutine, not the per-frame unrolled hot path: BOOTCODE6 has no
 // cycle budget to defend, called ~130 times total and never again.
 //------------------------------------------------------------
 hudBlitCell:
-        // ---- copy the cell to a fixed buffer, so the dither chain below can
-        // index it absolutely. convert() writes `ldy MATRIX+s*4+j,x`, and it
-        // is load-bearing that the fetch lands in Y without going through A:
-        // the four pixels of a row accumulate into A across three `ora`s. The
-        // first version of this routine fetched indirectly instead --
-        // `ldy #s*4+j / lda (zHudSrc),y / tay` -- which quietly overwrites
-        // that accumulator between the ora's, so every packed byte came out
-        // as the last pixel's source value ORed with its own dither code.
-        // 32 bytes of buffer and 32 boot-time copies buy the same addressing
-        // mode convert() has.
-        ldy #HUD_CELL_BYTES-1
-!:      lda (zHudSrc),y
-        sta hudCell,y
-        dey
-        bpl !-
-
-        // ---- pack 8 bitmap bytes: dither, one source row at a time ----
-        .for (var s=0; s<8; s++) {
-            .for (var j=0; j<4; j++) {
-                ldy hudCell + s*4 + j
-                .if (j==0) lda ditherTabs + [j*4 + mod(s,4)]*256,y
-                .if (j!=0) ora ditherTabs + [j*4 + mod(s,4)]*256,y
-            }
-            sta zTmp+s
-        }
-
         // ---- zHudOff8 = zHudN * 8 ----
         lda zHudN
         sta zHudOff8
@@ -501,12 +550,11 @@ hudBlitCell:
         lda zHudOff8+1
         adc #>BITMAP0
         sta zHudPtr+1
-        ldy #0
-        .for (var s=0; s<8; s++) {
-            lda zTmp+s
-            sta (zHudPtr),y
-            iny
-        }
+        ldy #7
+!:      lda (zHudSrc),y
+        sta (zHudPtr),y
+        dey
+        bpl !-
 
         // ---- BITMAP1 + off8, 8 bytes ----
         lda zHudOff8
@@ -516,16 +564,16 @@ hudBlitCell:
         lda zHudOff8+1
         adc #>BITMAP1
         sta zHudPtr+1
-        ldy #0
-        .for (var s=0; s<8; s++) {
-            lda zTmp+s
-            sta (zHudPtr),y
-            iny
-        }
+        ldy #7
+!:      lda (zHudSrc),y
+        sta (zHudPtr),y
+        dey
+        bpl !-
 
-        // ---- attributes: sample pixel (row 3, px 1) picks the ramp ----
-        ldx hudCell + 13
-        ldy #0
+        // ---- screen byte (offset 8): SCREEN0, SCREEN1 ----
+        ldy #8
+        lda (zHudSrc),y
+        tax
 
         lda zHudN
         clc
@@ -534,7 +582,8 @@ hudBlitCell:
         lda zHudN+1
         adc #>SCREEN0
         sta zHudPtr+1
-        lda scrTab,x
+        txa
+        ldy #0
         sta (zHudPtr),y
 
         lda zHudN
@@ -544,11 +593,16 @@ hudBlitCell:
         lda zHudN+1
         adc #>SCREEN1
         sta zHudPtr+1
-        lda scrTab,x
+        txa
         sta (zHudPtr),y
 
-        // $D800 directly, not COLBUF -- flip only ever copies COLBUF's first
-        // 880 bytes (main.asm's clearHudRows makes the same choice).
+        // ---- colour byte (offset 9): $D800 directly, not COLBUF -- flip
+        // only ever copies COLBUF's first 880 bytes (main.asm's
+        // clearHudRows makes the same choice).
+        ldy #9
+        lda (zHudSrc),y
+        tax
+
         lda zHudN
         clc
         adc #<$d800
@@ -556,7 +610,8 @@ hudBlitCell:
         lda zHudN+1
         adc #>$d800
         sta zHudPtr+1
-        lda colTab,x
+        txa
+        ldy #0
         sta (zHudPtr),y
         rts
 
@@ -597,7 +652,7 @@ hudDrawDigit:
         // carries the one possible overflow with no branch at all.
         .for (var cy=0; cy<HUD_FONT_CELLS_H; cy++) {
             .for (var cx=0; cx<HUD_FONT_CELLS_W; cx++) {
-                .var cellOfs = [cy*HUD_FONT_CELLS_W + cx] * 32
+                .var cellOfs = [cy*HUD_FONT_CELLS_W + cx] * HUD_CELL_BYTES
                 lda #<[[22+HUD_GLYPH_ROW+cy]*40]
                 clc
                 adc zHudCol
@@ -685,7 +740,7 @@ hudBgLoop:
         jsr hudBlitCell
         lda zHudSrc
         clc
-        adc #32
+        adc #HUD_CELL_BYTES
         sta zHudSrc
         bcc !+
         inc zHudSrc+1
@@ -707,11 +762,6 @@ hudBgLoop:
         ldx #HUD_ARMOR_COL
         jsr hudDrawField
         rts
-
-// hudBlitCell's working copy of the cell it is packing. Lives here, in
-// boot-only MATRIX, for the same reason everything else in BOOTCODE6 does.
-hudCell:
-        .fill HUD_CELL_BYTES, 0
 
 //------------------------------------------------------------
 // mapCopyStaged — MATRIX -> (zMLDst), zMLLen bytes, with RAM

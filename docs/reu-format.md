@@ -512,51 +512,53 @@ numbers), so health/armour/ammo are wired to three bytes the boot code reads
 once rather than baked in as immediates, and M3 — which gives them a real
 source — is what makes them live.
 
-**Both blocks use MATRIX's own chunky format, one byte per pixel
-(`ramp << 4 | intensity`), not `WALLTEX`'s nibble-packed one.** That is
-deliberate: the boot blit runs each cell through the *same*
-`ditherTabs`/`scrTab`/`colTab` tables `chunky2mc.asm`'s per-frame converter
-already has resident, so a ramp+intensity byte means the same thing on
-screen whether the renderer or the boot-time HUD blit wrote it. A cell is one
-multicolor cell — 4 px wide, 8 tall, 32 bytes, `chunky2mc.asm`'s own "cell n
-at `MATRIX+n*32`, offset = `row*4+px`" — and both blocks are simply strips of
-these cells, row-major (cell index = `row*width + col`).
+**Both blocks are raw VIC multicolor bitmap bytes, not `MATRIX`'s
+ramp/intensity chunky format and not `WALLTEX`'s nibble-packed one.** A cell
+is one multicolor cell — 4 px wide, 8 tall: 8 bitmap bytes, 1 screen-RAM
+byte, 1 colour-RAM byte, 10 bytes total — and both blocks are simply strips
+of these cells, row-major (cell index = `row*width + col`). `hudBlitCell`
+(`src/mapload.asm`) copies them straight into `BITMAP0/1` + `SCREEN0/1` +
+`$D800`; there is no dither step and no `ditherTabs`/`scrTab`/`colTab`
+involved, unlike the 3D renderer's per-frame converter.
 
-`HUDBG`, 3840 B: `40 x 3` cells, downsampled from the WAD's `STBAR` lump —
-the three rows `main.asm`'s `clearHudRows` has always reserved below the
-22-row viewport. `HUDFONT`, 1280 B: ten glyphs (`STTNUM0`..`STTNUM9`), each
-**2×2 cells** (8×16 logical pixels), from the WAD's own big HUD digit font.
+That is a deliberate change from the original approach, which downsampled the
+WAD's own `STBAR`/`STTNUM0..9` lumps through the renderer's dither chain —
+snapping every pixel to one hue's four shades (`chunky2mc.asm` samples one
+pixel per cell to pick its screen/colour-RAM pair, so a cell can only ever
+show one ramp). That produced a washed-out bar no matter how the source art
+was massaged. Real VIC multicolor bitmap format has no such restriction *at
+the engine level* — the only limit is the hardware's own (background colour
+shared across the whole screen, plus two screen-RAM colours and one
+colour-RAM colour per cell) — so the art is instead hand-painted directly in
+a real C64 multicolor editor (e.g. Multipaint), which already enforces those
+exact limits, and cropped out of the result: a crop, not a conversion, so
+what is painted is what lands on screen.
 
-One cell (4×8) per glyph was tried first and measured, not estimated (§4's
-rule): every digit rendered as a near-solid blob, checked by eye against
-`STTNUM0`'s own pixels, which really are that dense — Doom's HUD font reads
-by outer silhouette rather than an internal hole, and 4 px wide loses the
-silhouette along with everything else. 2×2 cells, against `STTNUM`'s native
-~14×16, keeps enough of the outline that 0/1/4/7 are clearly distinct.
+`HUDBG`, 1200 B: `40 x 3` cells, cropped from `assets/hud.kla` at cell
+`(HUD_BAR_COL0, HUD_BAR_ROW0)` = `(0, 22)` — the three rows `main.asm`'s
+`clearHudRows` has always reserved below the 22-row viewport, so the artist
+can paint the bar in its actual on-screen position. `HUDFONT`, 400 B: ten
+glyphs, each **2×2 cells** (8×16 logical pixels), cropped starting at
+`(HUD_FONT_COL0, HUD_FONT_ROW0)` = `(0, 0)`, digits 0-9 left to right — a
+size kept from the original approach, where one cell (4×8) per glyph was
+tried first and measured (§4's rule) to render every digit as a near-solid
+blob, Doom's HUD font reading by outer silhouette rather than an internal
+hole.
 
-`wad2reu.py`'s `_picture_intensity_grid` is `texture_luma_tile`'s downsample
-technique (nearest-neighbour bucket-and-average, §4.7) generalised from a
-`TEXTURE1` composite to a single WAD picture lump and an arbitrary
-destination grid — `STBAR` and `STTNUM` are plain patch-format pictures, so
-`decode_picture` is all the WAD reading either needs.
+`assets/hud.kla` is a single combined image (one canvas, two regions) rather
+than two files, so the artist can see the bar and the font glyphs together
+while painting; everything outside the two regions above is unused and can
+be left blank. It must be a standard 10003-byte Koala Painter file — 2-byte
+PRG load address, 8000 B bitmap, 1000 B screen RAM, 1000 B colour RAM, 1 B
+background colour, the same layout `src/intro/intro.asm` already imports raw
+for `doom-title.kla` — with its background colour set to black (0): the
+engine's `$d021` is fixed to black at boot and never changed again
+(`src/main.asm`), so any other background in the source image would show a
+seam the moment it lands on screen. `wad2reu.py --hud` (default
+`assets/hud.kla`) reads it; if the file is missing, a fixed, deliberately
+unrealistic placeholder pattern is used instead (the same role `_pattern_tile`
+plays for `WALLTEX`'s test-map path) so a build never hard-fails on it.
 
-Two things the world's own pipeline does not do, both forced by measurement
-rather than taste:
-
-- **Every byte carries ramp 8 in its high nibble, including the intensity-0
-  background pixels.** `chunky2mc.asm` samples *one* pixel per cell (row 3,
-  px 1) to pick that cell's screen/colour-RAM pair, on the assumption a cell
-  is one surface with one ramp. A wall is; a digit glyph is not — most of its
-  cells are part ink, part background — and a bare `0` in the sampled
-  position dropped the *whole* cell, ink included, to ramp 0's greys.
-- **Intensities are snapped to `{0, 5, 10, 15}` (`HUD_LEVELS`), and the font
-  to `{0, 15}` only.** Those four are the fixed points of
-  `chunky2mc.asm`'s `dcode()`: they map to codes 0/1/2/3 for *every* Bayer
-  threshold, so nothing dithers. The first build let the full 0-15 range
-  through and the bar came out a uniform speckle with the digits barely a
-  shade different from it — read off a live bitmap dump, not judged from a
-  screenshot. Ordered dither is right for a shaded wall and wrong for a
-  status bar.
 
 Both blocks share **ramp 8**, the first of `chunky2mc.asm`'s spare ramp slots,
 redefined with the WAD's own status-bar palette. No table growth, no RAM
