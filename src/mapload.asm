@@ -619,7 +619,7 @@ hudBlitCell:
 // hudDrawDigit -- zHudDigit (0-9), zHudCol (leftmost cell column, 0-39) ->
 // blits STTNUM's HUD_FONT_CELLS_W x _H (2x2) cells for that digit, row-major
 // within the glyph (matching wad2reu.py's build_hudfont), at absolute cell
-// rows 22+HUD_GLYPH_ROW .. +HUD_GLYPH_ROW+1.
+// rows 21+HUD_GLYPH_ROW .. +HUD_GLYPH_ROW+1.
 //------------------------------------------------------------
 hudDrawDigit:
         // zHudGlyphBase = HUDFONT_STAGE + digit * HUD_FONT_GLYPH_BYTES (128)
@@ -653,12 +653,12 @@ hudDrawDigit:
         .for (var cy=0; cy<HUD_FONT_CELLS_H; cy++) {
             .for (var cx=0; cx<HUD_FONT_CELLS_W; cx++) {
                 .var cellOfs = [cy*HUD_FONT_CELLS_W + cx] * HUD_CELL_BYTES
-                lda #<[[22+HUD_GLYPH_ROW+cy]*40]
+                lda #<[[21+HUD_GLYPH_ROW+cy]*40]
                 clc
                 adc zHudCol
                 adc #cx
                 sta zHudN
-                lda #>[[22+HUD_GLYPH_ROW+cy]*40]
+                lda #>[[21+HUD_GLYPH_ROW+cy]*40]
                 adc #0
                 sta zHudN+1
                 lda zHudGlyphBase
@@ -730,9 +730,9 @@ hudBoot:
         sta zHudSrc
         lda #>HUDBG_STAGE
         sta zHudSrc+1
-        lda #<[22*40]                // cell 880, the bar's top-left cell
+        lda #<[21*40]                // cell 840, the bar's top-left cell
         sta zHudN
-        lda #>[22*40]
+        lda #>[21*40]
         sta zHudN+1
         lda #0
         sta zHudCnt                  // NOT X -- hudBlitCell clobbers it

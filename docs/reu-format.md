@@ -534,9 +534,9 @@ a real C64 multicolor editor (e.g. Multipaint), which already enforces those
 exact limits, and cropped out of the result: a crop, not a conversion, so
 what is painted is what lands on screen.
 
-`HUDBG`, 1200 B: `40 x 3` cells, cropped from `assets/hud.kla` at cell
-`(HUD_BAR_COL0, HUD_BAR_ROW0)` = `(0, 22)` — the three rows `main.asm`'s
-`clearHudRows` has always reserved below the 22-row viewport, so the artist
+`HUDBG`, 1600 B: `40 x 4` cells, cropped from `assets/hud.kla` at cell
+`(HUD_BAR_COL0, HUD_BAR_ROW0)` = `(0, 21)` — the four rows `main.asm`'s
+`clearHudRows` reserves below the viewport, so the artist
 can paint the bar in its actual on-screen position. `HUDFONT`, 400 B: ten
 glyphs, each **2×2 cells** (8×16 logical pixels), cropped starting at
 `(HUD_FONT_COL0, HUD_FONT_ROW0)` = `(0, 0)`, digits 0-9 left to right — a

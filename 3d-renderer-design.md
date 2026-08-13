@@ -107,7 +107,7 @@ $E000-$FF3F  BITMAP1 (under Kernal ROM — write-only, fine)
 the VIC is banked to 2 or 3 during gameplay, so it is ordinary RAM.
 
 Screens/bitmaps deliberately avoid $9000-$9FFF (char-ROM shadow in VIC bank 2).
-Bottom 3 char rows (rows 22-24) of each bitmap/screen are free for a HUD; they
+Bottom 4 char rows (rows 21-24) of each bitmap/screen are free for a HUD; they
 are blanked once at startup by `clearHudRows` in `src/main.asm`.
 
 ## REU usage

@@ -9,9 +9,10 @@ assembles, runs, `make debug` stays clean, and the display shows nothing.
 buffers — so the screenshot needs an assertion of its own.
 
 Two cheap properties separate "a frame" from "not a frame", inside the 320x144
-3D viewport (text rows 2-19; rows 0-1 and 20-21 are the two letterbox bands and
-rows 22-24 the HUD -- IMPLEMENTATION_PLAN.md §14a.1 then §12, 176 -> 160 -> 144
-rows, the last cut split evenly off the top and the bottom):
+3D viewport (text rows 2-19; rows 0-1 are the top letterbox band, row 20 the
+bottom letterbox band, and rows 21-24 the HUD -- IMPLEMENTATION_PLAN.md
+§14a.1 then §12, 176 -> 160 -> 144 rows, the last cut split evenly off the
+top and the bottom):
 
   coverage  fraction of pixels that are not the black background. A wall/floor/
             ceiling view fills most of the viewport; the known-good E1M1-less

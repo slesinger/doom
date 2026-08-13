@@ -58,9 +58,9 @@
 .const VIEWBMPOFS   = VIEWCELLTOP * 320     // 640: bitmap bytes to skip
 .errorif VIEWROWS != VIEWCELLROWS * 8, "the viewport must be a whole number of cell-rows"
 .errorif VIEWTOP != VIEWCELLTOP * 8, "the top letterbox must be a whole number of cell-rows"
-// The HUD's three cell-rows are fixed at raster 176; the view plus both bands
+// The HUD's four cell-rows are fixed at raster 168; the view plus both bands
 // must fit above them, or the converter writes over the bar.
-.errorif VIEWTOP + VIEWROWS > 176, "the view and its top letterbox overrun the HUD"
+.errorif VIEWTOP + VIEWROWS > 168, "the view and its top letterbox overrun the HUD"
 
 // Wall texture tiles, resident, in the tail the 160-row viewport freed.
 //
@@ -486,8 +486,8 @@
 // exactly what lands on screen.
 .const HUD_CELL_BYTES = 10          // 8 bitmap bytes + 1 screen + 1 colour
 .const HUD_BG_CELLS_W = 40
-.const HUD_BG_CELLS_H = 3
-.const HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES  // 1200
+.const HUD_BG_CELLS_H = 4
+.const HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES  // 1600
 .const HUD_FONT_GLYPHS = 10
 .const HUD_FONT_CELLS_W = 2
 .const HUD_FONT_CELLS_H = 2
@@ -521,13 +521,13 @@
 .const hudArmor  = $07fe
 .const hudAmmo   = $07ff
 // Field layout. A glyph is HUD_FONT_CELLS_W x _H = 2x2 cells, so it spans two
-// of the bar's three cell-rows -- rows 1-2, leaving row 0 as a plain band
+// of the bar's four cell-rows -- rows 2-3, leaving rows 0-1 as a plain band
 // above the numbers, the way Doom's own STBAR has undecorated space above its
 // digits. Three digits per field, most significant first, each digit two
 // cells wide; column below is the field's leftmost cell (0-39). AMMO left,
 // HEALTH centre, ARMOR right -- Doom's own left-to-right order, minus the
-// face/keys this 3-row bar has no room for.
-.const HUD_GLYPH_ROW  = 1            // top cell-row a glyph is blitted at
+// face/keys this bar has no room for.
+.const HUD_GLYPH_ROW  = 2            // top cell-row a glyph is blitted at
 .const HUD_DIGITS     = 3            // digits per field, zero-padded
 .const HUD_AMMO_COL   = 2
 .const HUD_HEALTH_COL = 17

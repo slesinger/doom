@@ -232,11 +232,11 @@ BLK_WEAPON = 10                 # IMPLEMENTATION_PLAN.md §12a, streamed per fra
 
 HUD_CELL_BYTES = 10                 # 8 bitmap bytes + 1 screen byte + 1 colour byte
 
-# The status bar is the three rows M1 always reserved below the 22-row
-# viewport (main.asm's clearHudRows) -- 40 cells wide, 3 tall.
+# The status bar is the four rows reserved below the viewport (main.asm's
+# clearHudRows) -- 40 cells wide, 4 tall.
 HUD_BG_CELLS_W = 40
-HUD_BG_CELLS_H = 3
-HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES   # 1200
+HUD_BG_CELLS_H = 4
+HUD_BG_BYTES = HUD_BG_CELLS_W * HUD_BG_CELLS_H * HUD_CELL_BYTES   # 1600
 
 # The big HUD digit font, still 2x2 cells (8x16 logical px) -- measured
 # against STTNUM's own ~14x16 when the art still came from the WAD (§4's
@@ -263,7 +263,7 @@ KOALA_SIZE = KOALA_BG_OFS + 1
 # one combined image rather than two files, so the artist can see the bar and
 # the font glyphs together while painting. Everything outside these two
 # regions is unused and can be left blank.
-HUD_BAR_COL0, HUD_BAR_ROW0 = 0, 22      # the bar occupies the bottom 3 rows,
+HUD_BAR_COL0, HUD_BAR_ROW0 = 0, 21      # the bar occupies the bottom 4 rows,
                                          # matching where it lands on screen
 HUD_FONT_COL0, HUD_FONT_ROW0 = 0, 0     # digits 0-9, 2 cells each, top-left
 
