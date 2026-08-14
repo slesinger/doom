@@ -556,6 +556,42 @@ when jump and bob were built, and it changes player feel in a way that wants a
 tuning pass, not a one-shot implementation. Pick up if a future session wants
 mouselook specifically; nothing here blocks it.
 
+### 11c landing note *(built 2026-08-14, not yet verified on hardware or VICE)*
+
+Built as X-only turning, additive alongside keys/joystick, single button
+shared with SPACE's use/jump — decided by conversation, not re-derived here.
+
+**A fresh audit found the machine tighter than this section's own estimate**:
+every carved-out hole from §11a onward (`MOVECODE`, `BODYCODE`, `WPNBLIT`,
+`SPRCODE`/`2`/`3`, `JUMPBOOT`, `LINECODE*`, `TX_SEED`/`TX_FETCH`) is now sized
+flush to its contents, each guarded by its own `.errorif`; the tape buffer and
+the classic FP zero page were checked as possible finds and are already spent
+(`colBot`/`TX_FETCH` and the engine's own `zA`-`zT` scratch, respectively).
+Zero page had exactly three free bytes left (`$e3`, `$f3`, `$f8`), not the
+"couple" estimated above — enough regardless, since `mouseTurn` needs only
+one persistent byte.
+
+**Where the code went**: `MAXVIS` (§12) dropped 10 → 8 — §12.6's stress pass
+never saw more than 6 things in one sightline, so two of the ten slots were
+margin nobody had exercised — which frees 16 bytes in `SPRCODE3`, the gap
+between the visible-thing list and `SPRIMG`. `mouseTurn` (28 bytes, `src/
+render/sprite.asm`) lives there. No new call site was needed anywhere: both
+`jumpStep` and `bobStep` already end in `jmp setEyeZ` on `playerFrame`'s
+behalf, and both now say `jmp mouseTurn` instead (which itself ends `jmp
+setEyeZ`) — changing an existing jmp's operand costs the packed segment
+nothing, unlike a new `jsr`.
+
+**Left over, not yet checked:** the `$dc00` bit pattern that selects port 1's
+pots onto POTX (`%01000000`) is inferred from `readInput`'s own row-7 keyboard
+mask, not confirmed against real 1351 hardware or VICE's mux emulation — per
+§4's rule, nothing on an unverified hardware path should be trusted, and this
+qualifies. `MOUSE_SHIFT = 2` (defs.asm) is a guess at sensitivity, picked the
+same way `TURN_SPEED` was, and wants a feel pass. The terminal was unusable
+this session (`Sandbox dependency installation failed`, both plain commands
+and package installs), so none of this has been run through `make check` —
+verified by code review only, same caveat as the HUD's `.kla` change in
+§13's history.
+
 ## 11d. The player stops being a point *(shipped 2026-08-13)*
 
 Two play-reported bugs, one cause: collision was a **point** test, sampled once

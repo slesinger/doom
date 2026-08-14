@@ -19,6 +19,7 @@ al C:9fb8 .msRead
 al C:c17 .slideProj
 al C:527d .lineLoad
 al C:dbde .lnGetH
+al C:6fda .mouseTurn
 al C:c30 .sphereVisible
 al C:9cf6 .spanCells
 al C:97fe .sideBack
@@ -80,14 +81,14 @@ al C:dfb1 .lnEnter
 al C:9eb4 .clipT
 al C:770 .vSeed
 al C:df20 .lnFire
-al C:6f4a .sprSetupUV
+al C:6f2a .sprSetupUV
 al C:9db3 .lineSetup
 al C:9f49 .projRow
 al C:5ef7 .hudFontGlyphHi
 al C:5c40 .hudBgLoad
 al C:6c74 .sprBlit
 al C:bfbf .texMulT
-al C:6f1d .sprScale
+al C:6efd .sprScale
 al C:5422 .musSrc
 al C:cb46 .wallNearDone
 al C:5c81 .texLoad
@@ -99,7 +100,7 @@ al C:57b1 .txSeedEnd
 al C:6021 .mapMaxLenLo
 al C:7500 .moveSteps
 al C:cb3 .wallShade
-al C:6f3d .sprStep
+al C:6f1d .sprStep
 al C:6b1b .wpnPrep
 al C:6008 .mapCopyDone
 al C:ffe4 .jumpStep
@@ -184,7 +185,7 @@ al C:cf99 .secBack
 al C:6b8f .sprPick
 al C:9a41 .pageDone
 al C:cfc0 .setEyeZ
-al C:6fa0 .sprDrawX
+al C:6f80 .sprDrawX
 al C:bfb .slideNorm
 al C:810 .main
 al C:e70 .segNear

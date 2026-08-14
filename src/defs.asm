@@ -191,7 +191,19 @@
 
 // ---- Runtime: the visible-thing list, rebuilt every frame in renderSsec's
 // wake (bsp.asm), sorted back-to-front, then walked once by sprFrame. ----
-.const MAXVIS        = 10
+//
+// 6, not 10: §12.6's stress pass (E1M1's busiest sightline, sector 72) never
+// saw more than sprVisN = 6, so four of the original ten slots were margin
+// nobody had exercised -- this is that peak exactly, with no headroom left
+// above it. The 32 bytes those four slots cost across the eight SoA arrays
+// below are what the 1351 mouse's turn code (mouseTurn, src/render/
+// sprite.asm) is spending -- SPRCODE3 is the only code-capable gap left in
+// the machine (§14a.7). mouseTurn's glitch guard (added after MAXVIS=7 still
+// overflowed by 8 B) is what used the last slot of margin; if a busier
+// sightline than sector 72 ever needs a 7th visible thing, something else in
+// SPRCODE3 has to shrink first, or a MAXVIS=7 pass has to come back and take
+// its 8 B from somewhere other than mouseTurn.
+.const MAXVIS        = 6
 .const sprVisRXlo    = SPRDATA_END
 .const sprVisRXhi    = sprVisRXlo + MAXVIS
 .const sprVisRYlo    = sprVisRXhi + MAXVIS
@@ -1297,6 +1309,22 @@
 // one of the two remaining bytes.
 .const zCrs    = $db        // 32-bit: the seg's cross product, whole
 .const zPad    = $df        // 24-bit: PLRAD * (|dx| + |dy|)
+
+// The 1351 mouse's previous POTX sample (mouseTurn, src/render/sprite.asm) --
+// $e3 is the very last free byte of zero page in the machine; nothing else
+// was left after §12's zSegQ took $e2. One byte is all mouseTurn needs: the
+// delta is an 8-bit wraparound subtract against last frame's raw reading, and
+// everything else it touches is dead renderer scratch at the point in the
+// frame mouseTurn runs.
+.const zMousePX = $e3
+// Turn sensitivity: the raw POTX delta, arithmetic-shifted right this many
+// bits before it is added to camA. A feel constant, same deferred-judgment
+// shape as TURN_SPEED (§8.1) -- picked, not derived, and easy to retune by
+// changing the shift count in mouseTurn itself (each step of the `cmp #$80 /
+// ror` pair costs 3 B, cheaper than a parameterised loop at this size).
+// 3, not 2: playtesting found /4 too twitchy for the 1351's native
+// resolution -- /8 reads as a deliberate turn instead of a flick.
+.const MOUSE_SHIFT = 3
 
 // zero page — §12's one permanent byte, the last claimed in the machine.
 // zSegQ is the current seg's quantised depth (segShade, src/render/sprite.asm)

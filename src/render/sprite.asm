@@ -500,6 +500,68 @@ sprDrawX:
 !reject:
         rts
 
+//------------------------------------------------------------
+// mouseTurn — a 1351 in proportional mode, port 1. jumpStep and bobStep
+// (src/input.asm) both end in `jmp setEyeZ` on playerFrame's behalf; both
+// now say `jmp mouseTurn` instead, which costs neither of those packed
+// blocks a byte -- only the operand of an existing jmp changed -- and still
+// runs unconditionally once a frame, same as they did. See IMPLEMENTATION_
+// PLAN.md §11c/16 for why this lives here: it is the only code-capable gap
+// MAXVIS's trim (above) left in the machine.
+//
+// $dc00 bits 6/7 mux the SID's POTX/POTY between the two control ports; port
+// 1 is selected in readInput's own joystick-port-2 read, not here (input.asm's
+// tail, %01011111 in place of the old $ff) -- that leaves the mux parked on
+// port 1 for the whole rest of the frame instead of switching to it the same
+// instant it gets read, so POTX has had a full frame to settle by the time
+// the lda below runs instead of zero cycles. This closed one source of
+// glitching but not all of it -- watched against the U64's own USB-to-1351
+// converter, turning still snaps hard partway through a slow, steady sweep,
+// so something (most likely the converter's own internal counter, not this
+// code's frame timing) occasionally hands back a POTX sample that is not a
+// small step from the last one.
+//
+// The delta is an 8-bit wraparound subtract against last frame's raw
+// sample -- exact as long as one frame's motion stays under ~128 units of
+// POTX, same assumption §11c made. Subtracting new from old (not old from
+// new) is what makes turning right (mouse moves right, POTX rises) rotate
+// camA the way TURN_SPEED's own D-key path does.
+//
+// Glitch guard: a real one-frame mouse motion, even a fast flick, does not
+// swing POTX by more than about half its range -- the observed jump does.
+// So any |delta| >= 64 is treated as a bad sample and dropped (zeroed)
+// rather than applied. delta+64, as an unsigned add with the overflow left
+// to fall where it lands, is >=$80 exactly when delta was >=64 or <-64 (the
+// two halves of "large" wrap to meet at $80 from opposite sides) and <$80
+// for every delta in between -- so testing bit 7 of that sum after the add
+// is the whole check, no second compare needed. X holds the pre-add delta
+// so the small/valid path can recover it with a plain txa instead of a
+// zero-page round trip.
+//------------------------------------------------------------
+mouseTurn:
+        ldy $d419                    // this frame's raw POTX
+        lda zMousePX                 // last frame's raw POTX
+        sec
+        sty zMousePX                 // stash this frame's for next time --
+        sbc zMousePX                 // old - new: wraparound delta, sign
+                                     // flipped from a plain new - old
+        tax                          // hold the real delta across the test
+        clc
+        adc #64                      // bit 7 of delta+64 <=> |delta| >= 64
+        bpl !small+
+        lda #0                       // bad sample: this frame contributes 0
+        beq !shift+
+!small: txa                          // restore the real delta
+!shift: .for (var i = 0; i < MOUSE_SHIFT; i++) {   // sign-extending shift right
+        cmp #$80
+        ror
+        }
+        clc
+        adc camA                     // camA wraps the same way TURN_SPEED does
+        sta camA
+        jmp setEyeZ
+
+.print "SPRCODE3 end = " + toHexString(*) + "  SPRIMG = " + toHexString(SPRIMG) + "  overflow by " + (*-SPRIMG) + " bytes"
 .errorif * > SPRIMG, "sprite draw setup overflows SPRCODE3 into SPRIMG"
 
 .pc = SPRCODE "sprite sort + draw"

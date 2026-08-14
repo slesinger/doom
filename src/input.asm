@@ -70,14 +70,17 @@ readInput:
         and #IN_ROW7
         ora zInput
         sta zInput
-        lda #$ff                    // joystick port 2 (active low)
-        sta $dc00
-        lda $dc00
-        eor #$ff
-        and #%00011111              // up/down/left/right/fire, in that order,
-        ora zInput                  // are zInput's low five bits
-        sta zInput
-        rts
+        lda #%01011111               // joystick port 2 (active low) on bits 0-4;
+        sta $dc00                   // bits 6/7 ride along as %01 -- the 1351's
+        lda $dc00                   // port-1 pot mux (mouseTurn, src/render/
+        eor #$ff                    // sprite.asm) -- so selecting it here, not
+        and #%00011111              // there, leaves the whole rest of the frame
+        ora zInput                  // as settle time before mouseTurn reads
+        sta zInput                  // POTX, instead of reading it the same
+        rts                          // instant the mux switches (§14a.7 jump bug).
+                                     // Joystick reading only looks at bits 0-4,
+                                     // so bits 6/7 are free to carry the mux
+                                     // select without disturbing it.
 
 //------------------------------------------------------------
 // 16-bit signed accumulate helpers for the displacement sum below.
@@ -834,7 +837,7 @@ jumpStep:
         txa                         // and A = 0 is the height that means it
 !:      sta camJZ
         stx camJT
-        jmp setEyeZ
+        jmp mouseTurn                // -> setEyeZ, src/render/sprite.asm
 }
 jmpStepEnd:
 
@@ -861,7 +864,9 @@ jumpTab:
 .pc = BOBCODE "the walk bob"
 //------------------------------------------------------------
 // bobStep — the eye rises and falls while the player is moving, as Doom's
-// does. playerFrame's on-foot path, so it ends in setEyeZ on its behalf.
+// does. playerFrame's on-foot path, so it ends in mouseTurn on its behalf,
+// which does the 1351's turn and chains on into setEyeZ itself (src/render/
+// sprite.asm) -- jumpStep's tail does the same.
 //
 // The wave is a triangle over the low three bits of frameCnt, reflected at 4
 // and doubled: 0 2 4 6 6 4 2 0, one entry per frame, BOBPEAK at the top. It
@@ -894,7 +899,7 @@ bobStep:
         eor #7                      // reflect 4-7 back down to 3-0
 !:      asl                         // 0-3 -> 0-BOBPEAK, in eye units
 !zero:  sta camJZ
-        jmp setEyeZ
+        jmp mouseTurn                // -> setEyeZ, src/render/sprite.asm
 
 .errorif * > BOBCODE_END, "the walk bob overflows into the converter tables"
 
