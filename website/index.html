@@ -402,24 +402,13 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       </div>
 
       <div class="cta-row">
-        <a class="btn btn-primary" href="#" onclick="return false;">▶ Watch the walkthrough</a>
+        <a class="btn btn-primary" href="https://youtu.be/D5uR3-0Rz3I" target="_blank" rel="noopener">▶ Watch the walkthrough</a>
         <a class="btn btn-ghost" href="https://github.com/slesinger/doom" target="_blank" rel="noopener">View source on GitHub</a>
         <a class="btn btn-ghost" href="javascript:void(0)" onclick="showTab('tech')">How it works →</a>
       </div>
 
       <div class="shot shot-21x9">
-        <div class="shot-tag">Hero screenshot</div>
-        <div class="shot-fill">TO FILL</div>
-        <div class="shot-inner">
-          <div class="shot-icon">▣</div>
-          <div class="shot-label">Placeholder — hero shot</div>
-          <div class="shot-desc">
-            Widescreen crop of a real hardware frame from E1M1, taken from a spot with
-            textured walls, a corridor opening into a lit room, and the weapon view + HUD
-            visible at the bottom. This is the first thing visitors see — pick the most
-            "this shouldn't run on a C64" angle you have.
-          </div>
-        </div>
+        <img class="shot-img" src="./screenshots/doom-c64u-hero.png" alt="Doom C64U hero shot: corridor with colored doors, textured walls, HUD visible">
       </div>
 
       <div class="stats">
@@ -427,6 +416,10 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
         <div class="stat"><div class="num">64 KB</div><div class="lbl">total RAM — engine, geometry cache, framebuffer, HUD, all of it</div></div>
         <div class="stat"><div class="num">16 MB</div><div class="lbl">REU streamed as the level's real memory, DMA'd per subsector</div></div>
         <div class="stat"><div class="num">0</div><div class="lbl">lines of id Software code — new engine, real WAD geometry</div></div>
+      </div>
+
+      <div style="margin-top:48px; aspect-ratio:16/9; overflow:hidden; border-radius:var(--radius); border:1px solid var(--line);">
+        <iframe width="100%" height="100%" src="https://www.youtube.com/embed/D5uR3-0Rz3I" title="Doom C64U E1M1 Real-Time Walkthrough" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
       </div>
     </div>
   </section>
@@ -473,20 +466,20 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <h2>What's here so far</h2>
       <div class="grid4">
         <div class="shot shot-4x3">
-          <div class="shot-tag">1</div><div class="shot-fill">TO FILL</div>
-          <div class="shot-inner"><div class="shot-icon">🗺</div><div class="shot-desc">A long corridor showing 2-3 different wall textures, to show texture variety isn't just one tile repeated.</div></div>
+          <div class="shot-tag">1</div>
+          <img class="shot-img" src="./screenshots/doom-c64u-gameplay-2.png" alt="Environmental variety: green grass, brown rock textures, open chamber">
         </div>
         <div class="shot shot-4x3">
-          <div class="shot-tag">2</div><div class="shot-fill">TO FILL</div>
-          <div class="shot-inner"><div class="shot-icon">🚪</div><div class="shot-desc">A door mid-open, or a moving platform/sector caught in transit — proof it's not a static diorama.</div></div>
+          <div class="shot-tag">2</div>
+          <img class="shot-img" src="./screenshots/door-half-open.png" alt="Door mid-open: brick wall texture detail, animated sector in transit">
         </div>
         <div class="shot shot-4x3">
-          <div class="shot-tag">3</div><div class="shot-fill">TO FILL</div>
-          <div class="shot-inner"><div class="shot-icon">🛢</div><div class="shot-desc">A barrel or prop sprite close-up in-scene, showing it reads clearly against the wall texture behind it.</div></div>
+          <div class="shot-tag">3</div>
+          <img class="shot-img" src="./screenshots/doom-c64u-sprites-detail.png" alt="Sprite and geometry close-up: player view, props rendered in scene">
         </div>
         <div class="shot shot-4x3">
-          <div class="shot-tag">4</div><div class="shot-fill">TO FILL</div>
-          <div class="shot-inner"><div class="shot-icon">❤</div><div class="shot-desc">Tight crop on the HUD strip — health / armor / ammo digits — sharp enough to read the glyphs.</div></div>
+          <div class="shot-tag">4</div>
+          <img class="shot-img" src="./screenshots/doom-c64u-hud-crop.png" alt="HUD detail: health, armor, ammo digits clearly visible and readable">
         </div>
       </div>
       <p style="margin-top:14px; font-size:12px; color:var(--text-faint);">Captured straight off real hardware with <a href="https://hdn.sh/" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline;">HDN Shell</a>, Hondani's other C64 Ultimate project.</p>
@@ -559,6 +552,17 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
         </svg>
         <div class="diagram-caption">renderFrame(): input → BSP traverse → wall/texture → sprites → light ramp + dither convert → flip</div>
       </div>
+    </div>
+  </section>
+
+  <section class="tight">
+    <div class="wrap">
+      <div class="eyebrow">In practice</div>
+      <h2>What the five-stage pipeline looks like in real time</h2>
+      <div class="shot shot-4x3" style="margin-top:20px; max-width:520px;">
+        <img class="shot-img" src="./screenshots/doom-c64u-gameplay-1.png" alt="Five-stage pipeline in action: chamber with colored geometry, textures, lighting, and sprites rendered in real-time">
+      </div>
+      <p style="margin-top:14px; font-size:13px; color:var(--text-dim); max-width:70ch;">Every frame you see is the result of these five stages executing within the 59.85 ms deadline. The chambers, textures, dithering, and sprite rendering happen in lockstep.</p>
     </div>
   </section>
 
@@ -872,20 +876,8 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
         </div>
         <div class="card">
           <h3><span class="chip"></span>Video walkthrough</h3>
-          <p style="font-size:13.5px;">A full real-time E1M1 walkthrough on real hardware is planned for YouTube.</p>
-          <div class="shot shot-1x1" style="margin-top:12px;">
-            <div class="shot-tag">Video</div><div class="shot-fill">TO FILL</div>
-            <div class="shot-inner">
-              <div class="shot-icon">▶</div>
-              <div class="shot-desc">
-                Record a continuous, real-time walkthrough of E1M1 direct from real hardware
-                (not the emulator). Show the HUD and weapon view on screen, and consider a
-                short side-by-side with the <code>make u64-fps</code> terminal output as proof
-                of the measured frame rate. 2–4 minutes is plenty — this replaces the embed
-                below once it's live.
-              </div>
-            </div>
-          </div>
+          <p style="font-size:13.5px;">Full real-time E1M1 walkthrough on real C64 Ultimate hardware.</p>
+          <a class="btn btn-ghost" style="margin-top:12px;" href="https://youtu.be/D5uR3-0Rz3I" target="_blank" rel="noopener">▶ Watch on YouTube →</a>
         </div>
         <div class="card">
           <h3><span class="chip"></span>Forums &amp; community</h3>
@@ -917,16 +909,10 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <hr class="rule">
 
       <div class="eyebrow">Proof shot</div>
-      <div class="shot shot-16x9">
-        <div class="shot-tag">Terminal capture</div><div class="shot-fill">TO FILL</div>
-        <div class="shot-inner">
-          <div class="shot-icon">▤</div>
-          <div class="shot-label">Placeholder — make u64-fps output</div>
-          <div class="shot-desc">
-            A clean terminal screenshot of a real <code>make u64-fps</code> run against
-            hardware — the fps line, the frame compute-time line, and the "100% on deadline"
-            histogram line. This is the receipt for every number quoted on this site.
-          </div>
+      <div style="max-width:75%; margin:0 auto;">
+        <div class="shot shot-16x9">
+          <div class="shot-tag">Terminal capture</div>
+          <img class="shot-img" src="./screenshots/full-frame-fps-counter-terminal.png" alt="make u64-fps output: 16.61 fps hardware-measured, frame timing, and deadline validation">
         </div>
       </div>
 
