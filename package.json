@@ -1,0 +1,9 @@
+{
+  "name": "doom-c64u-website",
+  "version": "1.0.0",
+  "description": "Doom for Commodore 64 Ultimate - official website",
+  "scripts": {
+    "build": "mkdir -p .vercel/output/static && cp -r public/* .vercel/output/static/"
+  },
+  "private": true
+}
