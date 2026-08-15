@@ -3,8 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Hondani — C64 Ultimate development tools and projects. Explore HDN Shell and Doom C64U.">
     <title>Hondani</title>
     <style>
+        :root {
+            --c64-blue: #3030b0;
+            --c64-cyan: #6060ff;
+            --navy-dark: #1a1a80;
+            --text-primary: #6060ff;
+            --text-secondary: #7070ff;
+            --text-dark: #0a0a1a;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -13,72 +23,315 @@
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-            color: #e0e0e0;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
+            background: #8080d0;
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 40px 20px;
         }
 
-        .container {
-            max-width: 600px;
-            text-align: center;
+        /* Light theme */
+        @media (prefers-color-scheme: light) {
+            :root {
+                --c64-blue: #3030b0;
+                --c64-cyan: #6060ff;
+                --navy-dark: #1a1a80;
+                --text-primary: #1a1a1a;
+                --text-secondary: #333333;
+                --text-dark: #0a0a1a;
+            }
+        }
+
+        :root[data-theme="light"] {
+            --c64-blue: #3030b0;
+            --c64-cyan: #6060ff;
+            --navy-dark: #1a1a80;
+            --text-primary: #1a1a1a;
+            --text-secondary: #333333;
+            --text-dark: #0a0a1a;
+        }
+
+        :root[data-theme="dark"] {
+            --c64-blue: #3030b0;
+            --c64-cyan: #6060ff;
+            --navy-dark: #1a1a80;
+            --text-primary: #6060ff;
+            --text-secondary: #7070ff;
+            --text-dark: #0a0a1a;
+        }
+
+        header {
+            padding: 3rem 2rem 1.5rem 2rem;
+            text-align: left;
+            background: var(--c64-blue);
+            border-bottom: 8px solid var(--c64-cyan);
+            position: relative;
         }
 
         h1 {
-            font-size: 3em;
-            margin-bottom: 20px;
-            background: linear-gradient(135deg, #00d4ff 0%, #0099ff 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            font-size: 3.5rem;
+            font-weight: 900;
+            letter-spacing: 0.15em;
+            color: var(--c64-cyan);
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
         }
 
-        p {
-            font-size: 1.1em;
-            margin-bottom: 40px;
-            color: #b0b0b0;
+        .tagline {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            letter-spacing: 0.05em;
+            font-weight: 500;
         }
 
-        .links {
+        .page-wrapper {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: var(--c64-blue);
+            border: 12px solid #1a1a80;
+            box-shadow: inset 0 0 0 4px var(--c64-cyan);
+        }
+
+        main {
+            padding: 3rem 2rem;
+        }
+
+        .projects {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 4rem;
+        }
+
+        @media (max-width: 768px) {
+            .projects {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .project {
+            padding: 2.5rem;
+            border-radius: 8px;
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
             display: flex;
-            gap: 20px;
             flex-direction: column;
         }
 
-        a {
+        .project:hover {
+            transform: translateY(-4px);
+        }
+
+        .project-1 {
+            background: var(--c64-blue);
+            border: 2px solid var(--c64-cyan);
+        }
+
+        .project-1:hover {
+            box-shadow: 0 16px 48px rgba(102, 255, 255, 0.2);
+        }
+
+        .project-2 {
+            background: var(--navy-dark);
+            border: 2px solid var(--c64-cyan);
+        }
+
+        .project-2:hover {
+            box-shadow: 0 16px 48px rgba(102, 255, 255, 0.15);
+        }
+
+        .project-image {
+            width: 100%;
+            height: 220px;
+            background: rgba(102, 255, 255, 0.1);
+            border-radius: 4px;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-style: italic;
+            overflow: hidden;
+        }
+
+        .project-image img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .project h2 {
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+            color: var(--c64-cyan);
+        }
+
+        .project p {
+            color: var(--text-secondary);
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+            flex-grow: 1;
+        }
+
+        .project-link {
             display: inline-block;
-            padding: 15px 30px;
-            background: linear-gradient(135deg, #00d4ff 0%, #0099ff 100%);
-            color: #000;
+            padding: 0.75rem 2rem;
+            background: var(--c64-cyan);
+            color: var(--text-dark);
             text-decoration: none;
-            border-radius: 8px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            border-radius: 4px;
+            transition: background 0.3s ease, transform 0.2s ease;
+            align-self: center;
+            text-transform: uppercase;
+            font-size: 0.95rem;
+        }
+
+        .project-link:hover {
+            background: var(--text-secondary);
+            transform: scale(1.05);
+        }
+
+        .project-link:active {
+            transform: scale(0.98);
+        }
+
+        .community {
+            text-align: center;
+            padding: 3rem 2rem;
+            background: var(--navy-dark);
+            border-top: 8px solid var(--c64-cyan);
+            border-bottom: 8px solid var(--c64-cyan);
+            margin: 3rem 0;
+        }
+
+        .community h3 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            color: var(--c64-cyan);
+            margin-bottom: 1.5rem;
+            text-transform: uppercase;
+        }
+
+        .community-text {
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .social-links {
+            display: flex;
+            gap: 1.5rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .social-link {
+            padding: 0.75rem 1.5rem;
+            background: var(--c64-blue);
+            color: var(--c64-cyan);
+            text-decoration: none;
             font-weight: 600;
-            font-size: 1.1em;
-            transition: transform 0.2s, box-shadow 0.2s;
+            letter-spacing: 0.05em;
+            border: 2px solid var(--c64-cyan);
+            border-radius: 4px;
+            transition: background 0.3s ease, color 0.3s ease, transform 0.2s ease;
+            font-size: 0.95rem;
         }
 
-        a:hover {
+        .social-link:hover {
+            background: var(--c64-cyan);
+            color: var(--text-dark);
             transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.3);
         }
 
-        a:active {
+        .social-link:active {
             transform: translateY(0);
+        }
+
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            border-top: 8px solid var(--c64-cyan);
+            background: var(--c64-blue);
+        }
+
+        /* Focus states for keyboard navigation */
+        a:focus-visible {
+            outline: 2px solid var(--c64-cyan);
+            outline-offset: 2px;
+        }
+
+        /* Reduced motion */
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Hondani</h1>
-        <p>Welcome to Hondani</p>
+    <div class="page-wrapper">
+        <header>
+            <h1>HONDANI.</h1>
+        </header>
 
-        <div class="links">
-            <a href="https://hdn.sh">Shell</a>
-            <a href="/doom">Doom C64 Ultimate</a>
-        </div>
+        <main>
+        <section class="projects">
+            <!-- HDN Shell -->
+            <article class="project project-1">
+                <div class="project-image">
+                    <img src="hdnsh-screenshot.png" alt="HDN Shell preview">
+                </div>
+                <h2>HDN Shell</h2>
+                <p>
+                    A modern development environment for C64 Ultimate. Touch and feel of the C64 combined with modern functions.
+                    Throw your PC to the corner as a server and work on the C64 again.
+                </p>
+                <a href="https://hdn.sh" class="project-link">Explore Shell</a>
+            </article>
+
+            <!-- Doom C64U -->
+            <article class="project project-2">
+                <div class="project-image">
+                    <img src="doom/screenshots/doom-c64u-social-square.png" alt="Doom C64 Ultimate preview">
+                </div>
+                <h2>Doom C64U</h2>
+                <p>
+                    C64 Ultimate running in 64MHz mode. This project explores the limits of what a modern FPGA-based Commodore 64 can do.
+                    A 3D shooter engine from scratch—25 FPS, optimized, open source.
+                </p>
+                <a href="/doom" class="project-link">Play Demo</a>
+            </article>
+        </section>
+
+        <section class="community">
+            <h3>Join the Community</h3>
+            <p class="community-text">
+                Hondani is a movement to modernize C64 development. Explore our projects, connect with the scene, and build the next impossible thing.
+            </p>
+            <div class="social-links">
+                <a href="https://www.youtube.com/@HondaniC64" class="social-link" target="_blank" rel="noopener noreferrer">YouTube</a>
+                <a href="https://csdb.dk/group/?id=901" class="social-link" target="_blank" rel="noopener noreferrer">CSDB Group</a>
+                <a href="https://hdn.sh" class="social-link">Hondani Team</a>
+                <a href="https://github.com/slesinger?tab=repositories" class="social-link" target="_blank" rel="noopener noreferrer">GitHub</a>
+            </div>
+        </section>
+    </main>
+
+        <footer>
+        </footer>
     </div>
+
 </body>
 </html>
