@@ -486,6 +486,40 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
     </div>
   </section>
 
+  <section class="tight">
+    <div class="wrap">
+      <div class="eyebrow">Get started</div>
+      <h2>Download and run</h2>
+      <div class="grid2" style="margin-top:28px; align-items:start;">
+        <div>
+          <p style="margin-bottom:18px;">Pre-built binaries are ready to run on your C64 Ultimate. Download from the latest release on GitHub, copy to your device, and follow the quick setup steps.</p>
+          <a class="btn btn-primary" href="https://github.com/slesinger/doom/releases/latest" target="_blank" rel="noopener">↓ Download from GitHub releases</a>
+          <div class="card" style="margin-top:20px;">
+            <h3 style="font-size:15px; margin-bottom:12px;"><span class="chip"></span>Setup steps</h3>
+            <ol style="padding-left:20px; color:var(--text-dim); font-size:13.5px; line-height:1.8;">
+              <li style="margin-bottom:6px;"><b>Download</b> the release from <code style="color:var(--amber);">github.com/slesinger/doom/releases/latest</code></li>
+              <li style="margin-bottom:6px;"><b>Copy</b> the files to your <code style="color:var(--amber);">doom</code> folder in your C64 Ultimate</li>
+              <li style="margin-bottom:6px;"><b>Open</b> the Ultimate menu → DISK FILE BROWSER and navigate to the doom folder</li>
+              <li style="margin-bottom:6px;"><b>Load settings:</b> <code style="color:var(--amber);">doom.cfg</code> → RETURN</li>
+              <li style="margin-bottom:6px;"><b>Load into REU:</b> <code style="color:var(--amber);">game.reu</code> → RETURN</li>
+              <li><b>Run:</b> <code style="color:var(--amber);">launcher.prg</code> → RETURN</li>
+            </ol>
+          </div>
+        </div>
+        <div class="card">
+          <h3><span class="chip"></span>What you'll need</h3>
+          <ul style="font-size:13.5px;">
+            <li>Commodore 64 Ultimate (official hardware, 2025+)</li>
+            <li><em>Or:</em> VICE emulator on any PC for development &amp; testing</li>
+            <li>A copy of DOOM1.WAD to build from source (licensed or free shareware)</li>
+          </ul>
+          <hr class="rule" style="margin:14px 0; border-color:var(--line);">
+          <p style="font-size:13px; color:var(--text-faint);">The pre-built binaries above include the assembled engine and pre-packed assets — no build tools needed to run.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
 </div>
 
 <!-- =======================================================================
@@ -728,6 +762,19 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
 
   <section class="tight">
     <div class="wrap">
+      <div class="eyebrow">Proof shot</div>
+      <h2>Real hardware verification</h2>
+      <div style="max-width:75%; margin:0 auto;">
+        <div class="shot shot-16x9">
+          <img class="shot-img" src="./screenshots/full-frame-fps-counter-terminal.png" alt="make u64-fps output: 16.61 fps hardware-measured, frame timing, and deadline validation">
+        </div>
+      </div>
+      <p style="margin-top:14px; font-size:13px; color:var(--text-dim); text-align:center;">Every frame rate number on this site comes from real C64 Ultimate hardware, verified with <code>make u64-fps</code> and cross-checked against raster-sync boundaries.</p>
+    </div>
+  </section>
+
+  <section class="tight">
+    <div class="wrap">
       <div class="eyebrow">The optimization story</div>
       <h2>Milestone 1: 56.9&nbsp;ms → 39.9&nbsp;ms</h2>
       <div class="timeline">
@@ -907,14 +954,6 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <p style="margin-bottom:14px;">The intro screenshot shown on this project's launch screen is captured from id Software's original Doom (1993). In-game screenshots of the C64 Ultimate engine itself are captured directly from real hardware using <a href="https://hdn.sh/" target="_blank" rel="noopener" style="color:var(--amber); text-decoration:underline;">HDN Shell</a>.</p>
 
       <hr class="rule">
-
-      <div class="eyebrow">Proof shot</div>
-      <div style="max-width:75%; margin:0 auto;">
-        <div class="shot shot-16x9">
-          <div class="shot-tag">Terminal capture</div>
-          <img class="shot-img" src="./screenshots/full-frame-fps-counter-terminal.png" alt="make u64-fps output: 16.61 fps hardware-measured, frame timing, and deadline validation">
-        </div>
-      </div>
 
       <hr class="rule">
 
