@@ -1,682 +1,85 @@
 # Doom C64U — Implementation Plan
 
-**Milestone 1 is closed** on real hardware: E1M1, walkable, flat-shaded, with
-music, at a measured **25.05 fps with 100% of frames on the deadline**.
+**Milestone 1:** E1M1 walkable, flat-shaded, with music at **25.05 fps** — closed ✓
 
-**Milestone 2 is most of the way in**, also on hardware: textured walls, doors
-and moving sectors, jumping, walk bob, and a HUD are all shipped at a locked
-**16.7 fps / 59.85 ms deadline**, 100% on deadline, ~10 ms of frame budget
-still free. **Sprites (§12) are the one phase left**, with a weapon-view
-overlay (§12a) recommended to land first as a de-risking step.
+**Milestone 2:** E1M1 textured, doors, HUD at **16.7 fps / 59.85 ms** — all features except sprites landed ✓
+- Textured walls (§10), doors/moving sectors (§11), jumping (§11a), walk bob (§11b), HUD (§13) shipped and measured on hardware
+- **Sprites (§12) is the remaining work**; weapon view (§12a) recommended first as a de-risk
+- Frame: ~48.5 ms compute against 49.7 ms cap; ~11 ms margin for §12 + hardware confirmation
 
-This document is compacted: **Part I** is what M1 left binding — architecture,
-memory map, lessons that will recur. **Part II** is M2 — closed phases reduced
-to their outcome and the decisions that still matter, open phases (§11c, §12,
-§12a, §14a, §15) kept in full detail. **Full session-by-session history,
-measurements and traps are in this file's git log** — nothing below is stale,
-it has just been moved out of the way of the part that is still being read.
+**This document is compacted:** M1 outcomes only (Part I). M2 closed phases summarized to outcome (Part II, §8-14a.1b); open work in full detail (§12, §12a). Full history in git log.
 
 ---
 
-# Part I — Milestone 1, as built
+# Part I — Milestone 1 (closed)
 
-## 1. What M1 was, and what it delivered
+**M1 delivered:** E1M1 walkable, flat-shaded, music, at 25.05 fps ✓
 
-> **Walk around E1M1, flat-shaded, on real Ultimate 64 hardware, at a measured
-> frame rate.**
+**Key decisions that bind M2:**
+- **BSP front-to-back, not portals** — three rejection tests (sphere, backface, column occlusion)
+- **REU is abundant; RAM is the constraint** — 90 bytes of code RAM, everything else MATRIX/tables/audio; boot-only code inside MATRIX, every block bounded by `.errorif`
+- **Measure everything on hardware**, not VICE — REU cost is 1 byte/µs flat; VICE turbo, pot, DMA behaviour differ from Ultimate; positive controls in every measurement; `make framehash` not `make shot` is the acceptance test
 
-| | Delivered |
-|---|---|
-| Geometry | Real E1M1 from `DOOM1.WAD` via `tools/wad2reu.py` → `build/assets.reu` |
-| Traversal | BSP front-to-back, bounding-sphere culled (§2) |
-| Shading | Flat `ramp\|intensity`, WAD light level → intensity, depth falloff |
-| Collision | Against the destination subsector's segs; no BLOCKMAP, no linedefs |
-| Input | WASD + joystick 2 |
-| Audio | A SID register stream replayed from REU — *not* in M1's scope, landed anyway |
-| Target | C64 Ultimate at 64 MHz; VICE as the inner loop |
-
-**The final hardware reading**, `make u64-fps`:
-
-```
-fps: 502 frames in 20.04 s = 25.05 fps (39.9 ms/frame)
-cia: 19706 CIA ms in 20044 host ms = 0.983 x
-frame: compute 37.6 ms last, 37.6 min, 38.6 max (deadline 39.90 ms)
-frame: raster frames 1x0 2x502 3x0 4+x0 -- 100% made the 25 fps deadline
-```
-
-`make u64-map` passes: `mapOK=1`, all three resident blocks verified by checksum
-against the image. `make check` is green. The rendered frame hashes
-`c5d78e65…` with and without music.
-
-How it got there, in frame time: 56.9 ms → 45.1 → 39.9, via a world-space seg
-backface test, streamed bounding spheres, a frame cap, and an arithmetic pass
-worth 9.4%. Every step was verified **bit-identical** — 0 of 104448 pixels
-differing — which is the standard M2 inherits.
-
-## 2. The architecture, as built
-
-**BSP front-to-back, not portals.** E1M1's 85 sectors are not convex, so the
-portal graph the original engine walked does not exist in the WAD; the 237
-subsectors *are* convex by construction. `renderFrame` descends `NODES` with an
-explicit stack, near child first, and at each leaf DMAs the subsector's segs and
-calls `doWall` per seg. There is no `[zXL,zXR]` window: a column is closed when
-`colTop[x] >= colBot[x]`, and `openCols` reaching zero ends the frame.
-
-**Three rejection tests, in the order they pay off:**
-
-| Test | Where | What it removes |
-|---|---|---|
-| Bounding sphere vs frustum | `bspLoop` before descending, `renderSsec` after the 8-byte header | whole subtrees — 234 node descents → 71.7, 235 subsectors → 39.3 |
-| World-space backface | `segFacing`, before any projection | 53.6 segs/frame, each of which used to cost two `transformPoint` + two `projSX` |
-| Column occlusion | `doWall` | 15-19 segs/frame |
-
-The sphere test is deliberately **not** the exact sphere-plane test: the frustum
-planes at 90° are `rx = ±ry`, and `k = r + (r>>1)` is conservative because
-`1.5 >= sqrt(2)` while costing one shift instead of a multiply. Accuracy here
-is worth more than speed — a coarse transform that needed 128 units of slop cost
-6.7% of the frame while saving 4.4%.
-
-**Frame pacing.** `flip` syncs to raster line 251, so frame time is quantised to
-`50/n` fps. `framePace` holds every frame to `FPS_CAP_TICKS` so the player moves
-at one speed regardless of what is on screen. The clock is CIA2 Timer B cascaded
-off Timer A at 1000 phi2 cycles — a millisecond counter that is **turbo-invariant
-and absolutely calibrated** (measured 0.983× against the host's wall clock;
-PAL phi2 predicts 0.985).
-
-**The engine times itself** (`src/clock.asm`, `ftInt`/`ftComp`/`ftCMin`/`ftCMax`/
-`ftHist` at `$02a0`). This exists because an average frame rate cannot
-distinguish *many frames slightly over the deadline* from *one frame
-catastrophically over* — and those two want opposite responses. It cost ~60
-cycles a frame and it overturned a whole session's conclusion the day it landed.
-
-## 3. Memory, and why it is the binding constraint
-
-**Resident blocks** (frozen in `docs/reu-format.md`, which is authoritative):
-
-| Data | Form | Size | Lives at |
-|---|---|---|---|
-| NODES | 12 SoA arrays of 240 | 2880 B | `$D000`, under I/O |
-| SECTORS | 6 SoA arrays of 96 | 576 B | `$DC00`, under I/O |
-| MAPINFO | counts, root, spawn, block bases | 32 B | `$0E00` |
-| SSECDATA | `[segCount, sectorId, sphere, segs…]` in a 128 B slot per subsector | 30 KB | **REU**, two transfers per visit |
-| NODESPH | node bounding spheres, 8 B stride | 2 KB | **REU**, streamed per node visit |
-| MUSIC | SID register delta stream | 405 KB | **REU**, streamed per tick |
-
-There is no resident SSECTORS table: each subsector owns a fixed 128-byte REU
-slot at `ssecReuBase + (i<<7)`, so the address is one shift and no multiply.
-30 KB of REU (free) bought 948 B of RAM (not free). The same trade recurs
-throughout — **REU space is abundant, REU bandwidth is 1 byte/µs flat, and RAM
-is the thing that runs out.**
-
-**Free RAM, as of the end of M1:**
-
-| Where | Size | Usable for |
-|---|---|---|
-| `$0cb3-$0cff` | 77 B | code |
-| `$0d33-$0d3f` | 13 B | code |
-| `$02b0-$02ff` | 80 B | data only (page-aligned tail of `colTop`) |
-| `$03a0-$03ff` | 96 B | data only (tail of `colBot`) |
-| `$0400-$07ff` | 1024 B | data only — **unclaimed, unverified**, see §8.1 |
-
-**About 90 bytes of code RAM exist.** Everything else is MATRIX, bitmaps,
-screens, tables and code. `$ff40-$fff9` was held open for M2's audio for two
-sessions and is now `MUSCODE`. Anything below `$0801` cannot hold code — the PRG
-loads from there — but is fine for runtime data, which is why `colTop`,
-`colBot` and the frame-time block live there.
-
-Two mechanisms bought the RAM that exists: **boot-only code lives inside
-MATRIX** (`BOOTCODE = MATRIX + $4100`; `spanFill` overwrites `mapLoad` during
-the first frame), and every block is bounded by an `.errorif` against what
-follows it, so the next thing that grows fails the build by name rather than by
-symptom.
-
-**Banking.** `$01 = $35` is the default; `$34` is entered only to touch the node
-and sector tables and always restored. Both keep RAM at `$a000`/`$e000` where the
-bitmaps live, so a bank switch never changes what a bitmap write does. Interrupts
-are safe inside these windows provided the handler saves and restores `$01` —
-measured, with a positive control that produced 3951 corruptions when the handler
-restored the wrong bank.
-
-## 4. What M1 taught, and what will bite again
-
-These cost a session each. They are not derivable from the code.
-
-- **Nothing on the REU or hardware path may be believed without an assertion.**
-  Three silent failures were found in a row on the delivery path alone, each
-  letting every read "succeed" and return wrong bytes: `reuProbe` overwriting
-  the header it was about to verify; VICE ignoring a `-reuimage` whose size is
-  not exactly the emulated REU size; and the Ultimate's REU Preload not
-  delivering at all on firmware 1.1.0. With no REU attached, `$DF00-$DF0A`
-  reads back `$00` and every transfer "succeeds" instantly.
-- **Build a positive control into every measurement.** A run in which every
-  write was silently dropped looks like a clean pass — the SID test's half-
-  and double-frequency cases, the sphere test stubbed to `sec/rts`, the IRQ
-  test's deliberately-wrong bank restore are what make the corresponding zero
-  mean something.
-- **VICE and the Ultimate disagree in specific, known ways**: `$d031` turbo is
-  inert in VICE but real (and must be toggled) on the Ultimate; `$d41b` tracks
-  frequency on hardware but not in VICE; REU DMA is a far larger share of the
-  frame on hardware (1 byte/µs is the same absolute cost, but a 1 MHz VICE
-  frame is ~2.3 emulated seconds); `-default` resets the REU too and must come
-  first on the command line. **A change trading CPU cycles for REU bytes, or
-  anything driven by a real-time interrupt, is judged wrongly by `make stats`.**
-- **The Ultimate steals the bus for ~2.3 s after reset** — two frames, always,
-  cost 2268 ticks each, which read as a plausible regression for half a
-  session before `WARMUP_SECONDS` in `u64push.py` was added to sit it out.
-- **Price a small change with a profiler hit count, not an estimate.** The
-  6-byte seg record was estimated at +0.46 ms/frame and measured +0.06 — wrong
-  in the same direction on both the ratio and the cost driver. It shipped,
-  measured, and was reverted. `tools/vicedbg/profile.py` is the only way to
-  price a change smaller than an instrument's resolution.
-- **`make framehash`, not `make shot`, is the acceptance test.** `-limitcycles`
-  stops mid-flip often enough that two runs of the same build differ by ~30
-  pixels; `framehash` reads the renderer's own buffer at a frame boundary.
-- **Anything placed below MATRIX must be checked against `bspStkLo`/`bspStkHi`
-  by hand** — a range that reads as free in the memory map can be the BSP
-  stack, and will assemble and link clean while rendering garbage.
-- **`make debug`'s port is randomised for a reason** — x64sc doesn't set
-  `SO_REUSEADDR`, so a stale `TIME-WAIT` socket makes the next VICE fail to
-  bind silently, and it boots and runs with no monitor.
-
-## 5. The M1 risk register, closed out
-
-| # | Risk | Outcome |
-|---|---|---|
-| 1 | REU DMA slow and not turbo-scaled | **Real, and priced.** 1 byte/µs flat, no setup penalty |
-| 2 | No way to get a `.reu` onto hardware | **Closed the hard way.** REU Preload doesn't deliver; `src/reuload.asm` + `machine:writemem` does |
-| 3 | 40+ visible subsectors blows the frame budget | **Arrived**, at 17.6 fps first light. Answered by spheres + backface test |
-| 4 | `$D000` banking breaks the converter or `flip` | **Never seen.** |
-| 5 | Flat shading looks like mush | **Arrived twice** — two flats on one ramp, and a depth-falloff bug (`sta` sets no flags) |
-| 6 | Projection math has range bugs real geometry exposes | **Never seen.** |
-
-## 6. Session index and what carried into M2
-
-Full logs are in this file's git history (see the note at the top). M1 ran
-08-09 to 08-11: turbo/REU setup, `wad2reu.py` and the frozen REU format, the
-BSP renderer landing on E1M1, the frame-time work (56.9 → 45.1 → 39.9 ms), the
-25 fps lock, and music as a SID register stream replayed from REU.
-
-What M1 left open, and its outcome in M2:
-
-- **Sliding along walls / one boundary per frame** → closed in M2 §9.2.
-- **`data_structures.md` never reconciled** → closed in M2 §9.3 (deleted).
-- **The uploader sends the whole 470 KB image every run** → closed in M2 §9.1,
-  it was the milestone's first blocker.
-- **Quality scaling** — the frame-time feedback loop exists, nothing reads it.
-  Still not in M2.
-- **One unexplained hardware reading**, 24.10 fps / 93%, taken once after a
-  470 KB upload, never reproduced.
+**Lessons for M2 (hard-won, will recur):**
+1. Nothing on REU/hardware path credible without assertion
+2. Positive control in every measurement (half/double-frequency, stub tests, wrong-bank corruption)
+3. VICE ≠ Ultimate in turbo, pot, DMA timing, reset
+4. Small changes need profiler hit count, not estimates
+5. Anything below MATRIX checked against `bspStkLo`/`bspStkHi` by hand
+6. Price a change with `phaseprof`/`profile.py` before design commits to it
 
 ---
 
 # Part II — Milestone 2
 
-## 8. Scope, and the budget decision that shapes it
+## 8. Scope and budget (M2 complete except sprites)
 
-> **E1M1 with textured walls, working doors, sprites on screen, and a HUD —
-> on hardware, at a locked frame rate.**
+**Scope:** E1M1 with textured walls ✓, doors ✓, moving sectors ✓, HUD ✓, sprites (open)
 
-| | M2 |
+**Frame budget decision:** 3 raster frames = 16.7 fps / 59.85 ms deadline (vs M1's 25 fps / 39.9 ms)
+- Consequence: motion constants ×1.5 (`MOVE_SPEED` 14→21, `TURN_SPEED` 3→4)
+- `FPS_CAP_TICKS = 49`; measure drift with `ftHist` buckets, not average fps
+- Measured compute: 37.6-38.6 ms (unchanged from M1, textures found free time); ~11 ms margin post-HUD
+
+**RAM budget:** M1 found ~90 B code / ~200 B data RAM; `$0400-$07ff` is `COLBUF` (live), not free
+- Texture sampling, sprite list, depth array, HUD blit all share MATRIX or boot-only code (via §14a.1-1b's viewport cuts)
+- Remaining levers: boot-only code into MATRIX (like M1), accept fragmentation, reuse per-frame scratch
+
+## 9. Ground clearing (M2 complete)
+
+| | Outcome |
 |---|---|
-| Wall textures | **In.** Intensity-modulated within the surface's existing ramp (§10) |
-| Floor/ceiling textures | **Out.** Flats stay flat — perspective-correct span texturing is a different renderer |
-| Doors and moving sectors | **In.** Doors, platforms, switches, walkover triggers (§11) |
-| Sprites | **In, rendering only.** Things are drawn, sorted and clipped. **No AI, no combat** (§12) |
-| HUD | **In**, and landed — status bar with health/ammo/armour. **Fixed values, not live**: no code RAM for a runtime patch path, see §13 |
-| Enemy behaviour, weapons, damage, pickups | **Out.** M3 |
-| PVS/REJECT, quality scaling, visplanes | **Out** |
+| §9.1: Uploader sending 470 KB | **Fixed:** chunking + content-hash cache → 8 s (was minutes). Risk #6 (404) not re-observed but stays open. Verified `$0400-$07ff` is `COLBUF` live. |
+| §9.2: Sliding along walls | **Fixed:** `checkMove` projects onto blocked seg, retries up to 3×. 96% distance at shallow angle; 12 units from inside corner. Not fully closed (single-subsector test only) but unobserved in practice. |
+| §9.3: `data_structures.md` | **Deleted.** Superseded by `docs/reu-format.md` (frozen, boot-checked). |
+| §9.4: `pipeline.md` portal docs | **Reconciled.** Code-as-built documented; §11 (frame trace) unreconciled — deferred. |
 
-### 8.1 The frame budget triples the room, and that is the whole plan *(landed 2026-08-11)*
+## 10. Textured walls (closed)
 
-**Decision: M2 targets three raster frames — 16.7 fps, a 59.85 ms deadline.**
-25 fps with textures and sprites is not reachable on this hardware without
-giving up one of them, and 16.7 fps locked is preferable to 25 fps that
-judders, which is the trap M1 spent two sessions climbing out of.
+**Shipped:** 16×16 resident tiles, intensity-modulated, 8 units/texel. Measured 16.63 fps (60.1 ms), compute 46.7-47.7 ms, 100% on deadline.
 
-| | M1 | M2 |
-|---|---:|---:|
-| Deadline | 39.90 ms | **59.85 ms** |
-| `FPS_CAP_TICKS` | 39 | **49** |
-| Measured compute | 37.6 ms | 37.6-38.6 ms |
-| **Available** | ~2 ms | **~21 ms** |
+**Design:** Intensity nibble only (no ramp clash); `u` from existing line divide; `v` affine per-seg; tiles resident beat 8×8 streamed by 1.4 ms net (measured, not estimated). Five new ramps from duplicates. Floors/ceilings stay flat (would need visplanes).
 
-`make u64-fps` on hardware: `335 frames in 20.04 s = 16.71 fps`,
-`raster frames 3x335 4+x0 -- 100%`, `make framehash` unchanged, `make check`
-green.
+**653 B code** in 11 `.pc` blocks, three below `$0801` relocated via `BOOTCODE4`/`texBoot`; checked by `probe.py`. Stage B (64×64 cached) deferred to M3 on budget.
 
-**`FPS_CAP_TICKS` is 49, not the 58 first predicted**, because `framePace` used
-to measure from its own last *release* rather than from the last flip, so a
-release-to-release period pinned below the raster grid drifted and beat every
-~20th frame (95%, not 100%, at 58). The fix was the reference point:
-`framePace` now measures from `msFrame`, re-seeded every raster crossing by
-`frameMark`, so the phase resets each frame instead of accumulating. That also
-makes the exact cap value uncritical — anything from 41 to 58 selects the same
-raster crossing; 49 is just the middle. **Lesson for any future cap/pacing
-change: `ftHist`'s bucket histogram is the only instrument that shows this
-class of drift — an average frame rate cannot.**
+## 11. Doors and moving sectors (closed)
 
-**Three consequences that must land in the same commit as the cap** (all done):
+**Shipped:** Renderer unchanged (door = sector ceiling height). No seg→linedef ref needed (19 special lines kept resident). Activation sector-based, not line-crossing (saved 660 B for 640 B budget). Tags/heights built at build time.
 
-1. Every per-frame motion constant rescaled ×1.5 for the longer frame:
-   `MOVE_SPEED` 14 → **21**. `TURN_SPEED` 3 → **4** (67°/s, not the exact 75°;
-   a fractional accumulator would give the exact rate at the cost of a
-   zero-page byte + 6 cycles/frame — a feel judgement, deliberately deferred).
-2. `ftHist`'s target bucket moved 2 → 3 via `TARGET_FRAMES` in `u64push.py`.
-   `frameMark`'s own buckets did not move — they count raster frames, a VIC
-   property, not the cap.
-3. The music tick (CIA-driven, not per-frame) is unaffected — it just fires 6
-   times per rendered frame instead of 4.
+**Cost:** Effectively free; thinker list + activation in 640 B under I/O via `.pseudopc` + `sei`/bank-switch safety. Measured 34.5 ms compute (well under budget), doors cost nothing measurable.
 
-Do this **first**, before any feature work, so features aren't measured against
-the wrong deadline and constants aren't tuned twice.
+**Measured lesson:** back-to-back readings degrade 100%→88% regardless; treat close runs as noise.
 
-### 8.2 The budget, allocated
+## 11a–11d. Quality-of-life fixes (all closed)
 
-22 ms available, ~2 ms held back as margin — M1 shipped on 2 ms of margin and
-that was uncomfortably tight.
+| | Outcome |
+|---|---|
+| **11a: Jumping** | 42 B + 2 zp; 7-byte arc table; `EYE + JUMPPEAK = 69` exact against E1M1's 72 min opening. Ledge-jumping free from `camJZ`. `make jumptest` green. |
+| **11b: Walk bob** | 23 B; triangle wave off `frameCnt` bits; runs only on `IN_MOVE`. Bug: `zInput` aliased `zNum+1`, moved to `$90`. `make bobtest` green. |
+| **11c: 1351 mouse** | Built 2026-08-14 as X-only additive turning. Code review only (terminal down), not yet run through `make check`. `MOUSE_SHIFT=2` sensitivity wants tuning. Pot select inferred, not verified on hardware. |
+| **11d: Player body** | Fixed two bugs: (1) door walk-through via substep loop `MOVECODE` `$7500`, 56/56 blocked. (2) wall see-through via radius `PLRAD=24`, `segBody` `BODYCODE` `$7e00`. Both measured on hardware. 538 lattice cells still reachable near walls (blockmap deferred). |
 
-| | Estimate | Basis |
-|---|---:|---|
-| Wall textures | ~~6-9 ms~~ **8.7 ms spent** | §10, measured on hardware 2026-08-12 |
-| Doors and moving sectors | < 0.5 ms | §11; the renderer needs no change |
-| Sprites | 6-8 ms | §12.4, dominated by REU streaming |
-| HUD | **0 ms spent** | §13; measured, painted once at boot, nothing runs per frame |
-| Margin | 2 ms | |
-| **Total** | **15-20 ms** | against 22 |
-
-It fits, with little room for a surprise. **Every phase reports `ftComp` before
-and after** — the frame timer already exists and this is what it is for. A phase
-that overruns its estimate stops the milestone rather than eating the next
-phase's budget.
-
-### 8.3 RAM is still the binding constraint, and the first job is to find some
-
-M1 ended with **~90 bytes of code RAM**. M2 needs, at minimum, a texture
-sampling inner loop, a moving-sector thinker list, a sprite list with a sort, a
-per-column depth array for sprite clipping, and a HUD blitter. That is
-kilobytes, not bytes, and no amount of clever will fit it into 90.
-
-**The candidate was `$0400-$07ff`, and it is gone.** *(Checked 2026-08-11,
-before anything was designed around it — which is the entire reason §9.1 asked
-for the check.)* It is **`COLBUF`**, the colour-RAM staging buffer:
-`.const COLBUF = $0400` in `defs.asm`, written per cell by `chunky2mc`'s
-self-modifying `colSta`, and burst-copied to `$D800` by `flip` every frame.
-`probe.py` has always listed it in `ALLOWED`; a `dump` run reads 880 of 896
-bytes non-zero. The claim in an earlier draft of this section — "nothing in
-`defs.asm` claims it" — was simply false, and a `grep` would have said so.
-
-What is actually there:
-
-| Range | Size | State |
-|---|---:|---|
-| `$0400-$076f` | 880 B | `COLBUF`, live every frame. **Unavailable.** |
-| `$0770-$07e7` | 120 B | written once at boot by `clearHudRows`; `flip` copies only the first 880 B, so nothing reads it back |
-| `$07e8-$07ff` | 24 B | genuinely free |
-
-**So M2 has ~90 bytes of code RAM and ~200 bytes of data RAM, not 1 KB**, and
-risk #1 in §14 has arrived on day one. Two consequences, both already priced:
-
-- **§12's per-column depth array needs a different home** — and there is a
-  better one than any free block. See §12.1.
-- **Stage B textures are that much less likely.** A per-frame texel cache
-  needs a scratch region; the only one that exists is MATRIX, staged the way
-  `mapLoad` stages, which is what §10 already proposed.
-
-For code, the remaining levers are the two M1 already used:
-
-- **More boot-only code into MATRIX.** `mapLoad` went there and returned 411
-  bytes. `reuProbe`, `musInit`'s stream validation and the sphere-table setup
-  are all boot-only and all currently resident.
-- **Accept fragmentation.** M1's sphere test lives in four pieces across three
-  holes because that is what existed. M2 should expect the same and design
-  routines that split cleanly at a `jsr`.
-
-## 9. Phase 7 — Clear the ground
-
-Nothing here is a feature. All of it makes the rest of the milestone possible or
-cheaper, and the first item is a hard blocker.
-
-### 9.1 The uploader must stop sending 470 KB *(blocker — closed 2026-08-11)*
-
-The image went from ~36 KB to ~470 KB when music landed, because `u64push.py`
-sent one contiguous region from offset 0 to the last byte any descriptor
-claimed — 3 chunks became 29 and `make run-u64` went from seconds to minutes.
-Worse, several such uploads in a session made `run_prg` start answering `404`
-until a power cycle.
-
-**Fixed**: chunking now covers only the regions descriptors claim (28 chunks,
-not 29), and a content-hash skip cache (`build/.reu-upload-cache.json`,
-validated by a token written to unclaimed REU space so a stale cache can't be
-trusted) skips unchanged chunks — `make run-u64` is back to **8 seconds**,
-`0 chunks sent, 28 unchanged and skipped` on a rebuild. `--no-reu-cache` forces
-a full send, `--verify-reu` reads every chunk back regardless of skip state.
-The 404 did not recur over 12 rapid `run_prg` calls, but risk #6 (§14) stays
-open since that's a weaker negative result than the one that motivated the fix.
-
-Also verified here (gates §8.3): **`$0400-$07ff` is `COLBUF`**, not free RAM —
-see §8.3 for the numbers.
-
-### 9.2 Sliding along walls, and the two-boundary loop *(closed 2026-08-12)*
-
-M1's worst gameplay defect: a blocked move was undone whole, so walking into a
-wall at a shallow angle stopped you dead. **Fixed**: `checkMove` now projects a
-blocked move onto the seg it hit and retries, up to `SLIDETRY` = 3 times
-(`src/input.asm`, `slideVec`, ~250 bytes, paid for by moving boot-only code
-into MATRIX as `BOOTCODE3`). `make walktest` is green: a 20° run along a
-704-unit wall covers 96% of the unobstructed distance, an inside-corner run
-ends 12 units from the vertex without crossing a linedef.
-
-**Reduced, not fully closed**: the iteration cap resolves an inside corner in
-one frame (each retry re-descends the BSP from the new destination), but a
-move that legally crosses one subsector boundary and hits a wall in the next
-is still tested only against the first boundary — `bspFindSsec` returns the
-subsector containing the *destination*, so a true march along the motion
-segment would be needed to close it fully. Not written; not observed at 21
-units/frame against E1M1's subsector sizes. `pipeline.md` §5.3 notes this.
-
-### 9.3 `data_structures.md` reconciled *(closed 2026-08-12 — deleted)*
-
-The document described a format (`MAPBIN`, PVS, collision grid, LUT taxonomy)
-the project never built — everything in it was superseded by `docs/reu-format.md`
-(frozen, boot-checked) or by this plan's §12.2. **Deleted**, and references in
-`README.md`/`pipeline.md`/`docs/georam-vs-reu.md` repointed to the surviving
-authority directly. The memory map still has independent copies in `defs.asm`,
-the image header, `probe.py`'s allowed-region table and `docs/reu-format.md`;
-only the first two are cross-checked automatically.
-
-### 9.4 `pipeline.md` still described the portal renderer *(closed 2026-08-12)*
-
-Found while closing §9.3: `pipeline.md` still documented the pre-M1 portal
-traversal in several places. **Reconciled** — §5 (collision), §7 (BSP descent),
-§8.7 (texture line layout), §9 (`spanFillTex`), §12.1-12.3 (measured cost
-breakdown) now describe the code as built. **§11 (a worked frame trace against
-the deleted test map) is the one section left unreconciled** — it needs a fresh
-live-capture session against E1M1, not a documentation-only pass.
-
-## 10. Phase 8 — Textured walls *(closed 2026-08-13)*
-
-The defining feature of M2. **Shipped and measured on hardware**: `16.63 fps
-(60.1 ms/frame)`, `compute 46.7-47.7 ms` against the `59.85 ms` deadline,
-`raster frames 3x168 4+x0 -- 100%`, `make check` green, `make framehash`
-`c1dd1bb3…`. ~12 ms of budget remains for §12's sprites.
-
-**What shipped**, and why, in one pass:
-
-- **A tile modulates the intensity nibble only, never the ramp** — the only
-  form of texture a VIC multicolor cell (one 3-colour palette per 4×8 cell)
-  can carry without attribute clash. `wad2reu.py`'s ramp table stays the
-  colour knob; depth falloff becomes a bias on the texel's intensity.
-- **16×16 tiles, resident** (`WALLTILE`, `$7600`, 2 KB — freed by §14a.1's row
-  cut). Started as an 8×8 Stage-A tile streamed per seg (+8.7 ms, the top of
-  the original 6-9 ms estimate); 16×16 residency cost +5.4% compute
-  (`+2.4 ms` CPU) but saved ~1.0 ms of per-seg DMA, netting +1.4 ms — measured,
-  not estimated, and the projection held to within a millisecond on hardware.
-  **Stage B (64×64 streamed/cached texels) is out of M2** on this budget;
-  revisit in M3.
-- **8 world units/texel** (128-unit repeat, native WAD scale) — kept over the
-  16-unit alternative after re-checking on `make shot` (post-dither VIC
-  output) rather than a raw chunky dump, which had wrongly made 8 units look
-  like noise in an earlier session. The two tile axes being powers of two on
-  the 4×4 Bayer grid means they phase-lock rather than moiré.
-- **`u` is `lineSetup`'s existing 5th line** (no new per-column divide); **`v`
-  is affine per seg**, anchored exact at mid-`ry`, drifting only toward a
-  seg's ends — the deferred subspan divide from the original design was never
-  needed at this tile size. **`u` reuses the seg's dominant-axis byte**, no
-  texture offset and no 11th seg-record byte (widening the hottest record is
-  the standing warning from §4's reverted 6-byte experiment).
-- **Five new ramps** (tan/slime/tech/door/lite) claimed from six duplicate
-  stone ramps, spreading E1M1's wall segs over ten ramps instead of six — free
-  at runtime, pure asset-table work.
-- **Floors/ceilings stay flat** — structural, not budgetary: `doWall` fills
-  them as vertical constant-byte runs, and a textured flat needs the opposite
-  rasterizer (horizontal spans, visplanes), which §8 already put out of M2.
-- **653 bytes of code in eleven `.pc` blocks**, three of them below `$0801`
-  (in `colTop`/`colBot`/`COLBUF` tails) relocated via `BOOTCODE4`/`texBoot` and
-  checked every `make check` by `probe.py`'s `check_texcode` — this class of
-  "looks like a free hole, is actually X" mistake is now standard-shaped
-  across the codebase (§4, §11, §13) and worth checking for by name in any
-  new phase before designing around a hole.
-
-## 11. Phase 9 — Doors and moving sectors *(closed 2026-08-12)*
-
-The cheapest feature in M2. **The renderer needs no change at all**: a door is
-just a sector whose ceiling height animates, and `doWall` already draws a
-closed door as a two-sided seg's upper step covering the opening — change the
-height in RAM and it renders. Bounding spheres are 2D (x/y) so a z-moving
-sector needs no re-culling, and `checkMove`'s existing step/headroom tests
-already read live sector heights, so collision follows for free too.
-
-**What shipped**, versus what was planned:
-
-- **No seg → linedef reference was needed at all.** E1M1 has only 19 special
-  lines (11 that do something: 8 doors, 1 lift, 1 floor, 1 exit) — small
-  enough to keep fully resident, with activation running against the *lines*
-  directly rather than needing a per-seg pointer. This sidesteps the planned
-  format-bump-vs-geometry-lookup decision entirely.
-- **Activation is sector-based, not geometric**: the use key fires the door
-  whose sector contains the point `USERANGE` ahead of the eye; a walkover
-  fires when `camSec` becomes a trigger sector. Doom's exact line-crossing
-  test was written but not shipped — it needed ~660 B against the 640 B
-  budget below. Cost: a trigger fires on entering the sector rather than on
-  the exact line crossing, and `segFacing` (which side of the seg, not which
-  way the player looks) means a shared-subsector door opens whichever way the
-  player faces. **Logged for M3**, alongside §12.1's per-seg opening list.
-- **Tags/target heights resolve in `wad2reu.py` at build time**, not at
-  runtime — exact for M2, stops being exact once two thinkers can act on
-  neighbouring sectors (M3).
-- **A door closing on the player was not built** — E1M1's doors reopen on use,
-  which is the escape in practice; play-testing found nothing to fix.
-- **The whole feature — thinker list, activation, trimmed `LINEDEFS` — lives
-  in the 640 bytes under I/O** (`$DB40-DBFF`, `$DE40-DEFF`, `$DF00-DFFF`),
-  the largest free block left, as `.pseudopc` images (`BOOTCODE5`/`lineBoot`).
-  Code under I/O must `sei` around the bank switch (the music IRQ writes SID
-  registers into the RAM underneath otherwise) and can't call anything that
-  itself touches I/O.
-
-**Measured**: `make check`/`walktest`/`doortest` green, `make framehash`
-unchanged (the renderer never learned what a door is), `make u64-fps`:
-`16.67 fps`, `compute 34.5 ms` (well under §10's 46.7 ms baseline — doors cost
-effectively nothing), `raster frames 3x334 4+x1 -- 100%`. ~13 ms of budget
-remained for sprites and the HUD, confirming §10's estimate.
-
-**Lesson repeated here** (§4, §13): back-to-back `u64-fps` readings taken
-within a minute or two of each other degrade (100% → 88% across three runs)
-regardless of the engine — treat close-together readings as noise, don't try
-to warm your way out of it, and don't shorten the gap between runs.
-
-## 11a. Jumping *(shipped 2026-08-12, out of scope, built anyway)*
-
-Cheap (42 bytes + 2 zero page) and worth it: everything else that sells depth
-(walls, shading, textures) moves when the player turns; nothing moved when the
-world stayed still. SPACE (shared with the door-use key, level not edge — door
-code keeps its own edge). **The arc is a 7-byte table** (`jumpTab`, eye height
-above floor + `$ff` sentinel), not physics — a velocity/gravity model would
-cost a second zero-page byte and a rounding-dependent peak. `EYE + JUMPPEAK =
-69` against E1M1's lowest opening (72) is the whole safety margin and has to be
-exact, since nothing stops the eye rising through a ceiling otherwise.
-`setEyeZ`'s `camJZ` read gives ledge-jumping for free (a ledge looks `camJZ`
-shorter to the step test) without being implemented on purpose.
-
-Code lives in three fragments squeezed from slack found elsewhere (`TX_SHADE`,
-`TX_UADV`, `SSECHDR`'s tail, and `$ffe4` between the music IRQ and the CPU
-vectors). **One relocation bug found the hard way**: a routine placed at
-`$0f40` (misread as free) silently got overwritten by boot data at that
-address and did nothing on a build that was green — `.errorif` only proves no
-overlap with the *next* block, never that an address is unowned. Fixed the
-same way `LINECODE*`/`MUSCODE` already do it: assemble with `.pseudopc`, copy
-up at boot, and let `probe.py`'s relocated-block check compare live RAM every
-`make check`. `make jumptest` verifies the eye clears the ceiling and lands.
-
-## 11b. The walk bob *(shipped 2026-08-12, out of scope, built anyway)*
-
-23 bytes, no zero page, no table — same motivation as §11a. `bobStep` computes
-a triangle wave from `frameCnt`'s low 3 bits (`0 2 4 6 6 4 2 0`) rather than
-looking one up; upward-only because `camJZ` is unsigned. Runs off `IN_MOVE` so
-turning in place leaves the eye still. **One real bug, found by its own
-test**: `zInput` aliased `zNum+1`, which `checkMove` also writes, so walking
-occasionally deposited a cross-product byte into the input register and fired
-jumps/doors nobody asked for — moved to `$90`. Same lesson as §11a: a
-`.const` proves nothing about ownership; only reading the byte back live
-catches a second writer. `make bobtest` checks the triangle traces unbroken
-while moving and the eye is still while only turning.
-
-## 11c. A 1351 mouse alongside WASD/joystick 2 *(option, not built)*
-
-Proposed 2026-08-12, evaluated for feasibility, not scheduled. Recorded here so
-it isn't re-derived if it's picked up later.
-
-
-**No port conflict.** Only joystick port 2 is read (`readInput`, `$dc00`);
-port 1 is untouched, so a 1351 in proportional mode there costs nothing in
-contention. It reads via SID `POTX`/`POTY` (`$d419`/`$d41a`), muxed by the same
-`$dc00` bits 6/7 the row strobes already write every frame — sequencable, but
-the pot-select write has to be added to that existing sequence deliberately,
-not bolted on beside it.
-
-**It doesn't fit `zInput`'s model.** `movePlayer` turns by adding/subtracting a
-fixed `TURN_SPEED` gated on a bit in `zInput`; a mouse delta is a variable
-signed value, not a flag, so it needs its own path — `camA += scaledDelta`
-run alongside the keyboard/joystick turn, not through it. The delta itself is
-an 8-bit wraparound subtract against the previous frame's `POTX`, which is
-exact as long as per-frame motion stays under ~128 units.
-
-**Cost, if built:**
-- Cycles: negligible — one `$dc00` write, two pot reads, one subtract, once a
-  frame, against a 59.85 ms deadline that currently has ~13 ms of margin.
-- RAM: a couple of zero-page bytes plus an estimated 20-40 bytes of code, the
-  same class as §11a's jump (43 B) and §11b's bob (23 B) — except those two
-  spent the last free holes below `$d000` that size. This would likely need
-  its own `.pseudopc` block relocated at boot, same as `LINECODE*`/`MUSCODE`,
-  rather than a hole to drop into.
-- A sensitivity constant, tuned by feel — same deferred-judgment shape as
-  `TURN_SPEED` in §8.1.
-
-**Not scheduled**: it competes for code RAM that is now more fragmented than
-when jump and bob were built, and it changes player feel in a way that wants a
-tuning pass, not a one-shot implementation. Pick up if a future session wants
-mouselook specifically; nothing here blocks it.
-
-### 11c landing note *(built 2026-08-14, not yet verified on hardware or VICE)*
-
-Built as X-only turning, additive alongside keys/joystick, single button
-shared with SPACE's use/jump — decided by conversation, not re-derived here.
-
-**A fresh audit found the machine tighter than this section's own estimate**:
-every carved-out hole from §11a onward (`MOVECODE`, `BODYCODE`, `WPNBLIT`,
-`SPRCODE`/`2`/`3`, `JUMPBOOT`, `LINECODE*`, `TX_SEED`/`TX_FETCH`) is now sized
-flush to its contents, each guarded by its own `.errorif`; the tape buffer and
-the classic FP zero page were checked as possible finds and are already spent
-(`colBot`/`TX_FETCH` and the engine's own `zA`-`zT` scratch, respectively).
-Zero page had exactly three free bytes left (`$e3`, `$f3`, `$f8`), not the
-"couple" estimated above — enough regardless, since `mouseTurn` needs only
-one persistent byte.
-
-**Where the code went**: `MAXVIS` (§12) dropped 10 → 8 — §12.6's stress pass
-never saw more than 6 things in one sightline, so two of the ten slots were
-margin nobody had exercised — which frees 16 bytes in `SPRCODE3`, the gap
-between the visible-thing list and `SPRIMG`. `mouseTurn` (28 bytes, `src/
-render/sprite.asm`) lives there. No new call site was needed anywhere: both
-`jumpStep` and `bobStep` already end in `jmp setEyeZ` on `playerFrame`'s
-behalf, and both now say `jmp mouseTurn` instead (which itself ends `jmp
-setEyeZ`) — changing an existing jmp's operand costs the packed segment
-nothing, unlike a new `jsr`.
-
-**Left over, not yet checked:** the `$dc00` bit pattern that selects port 1's
-pots onto POTX (`%01000000`) is inferred from `readInput`'s own row-7 keyboard
-mask, not confirmed against real 1351 hardware or VICE's mux emulation — per
-§4's rule, nothing on an unverified hardware path should be trusted, and this
-qualifies. `MOUSE_SHIFT = 2` (defs.asm) is a guess at sensitivity, picked the
-same way `TURN_SPEED` was, and wants a feel pass. The terminal was unusable
-this session (`Sandbox dependency installation failed`, both plain commands
-and package installs), so none of this has been run through `make check` —
-verified by code review only, same caveat as the HUD's `.kla` change in
-§13's history.
-
-## 11d. The player stops being a point *(shipped 2026-08-13)*
-
-Two play-reported bugs, one cause: collision was a **point** test, sampled once
-a frame, against the segs of **one** subsector. Both were reproduced on the
-pre-texture build before anything was changed — neither is a texture
-regression, which is where the session would otherwise have spent its day.
-
-**Walking through closed doors — the step, not the test, was wrong.**
-`checkMove` tests the destination against the segs of the subsector the step
-*started* in, so the real limit on a step is not how far the player may travel
-but how far they may travel **unchecked**. E1M1's sector-76 door track is 16
-units deep with another 16-unit sector in front of it, against `MOVE_SPEED =
-21`: the step crossed one legally passable seg, jumped clean over the subsector
-that owns the door's seg, and landed inside the shut door. Fixed by
-`moveSteps` (`MOVECODE`, `$7500`): `MOVESUBS = 4` pieces, each a whole move
-with its own undo point, `checkMove` and `bspFindSsec`, so the next piece is
-tested against the subsector the last one entered. `d & 3` is handed out one
-unit per substep so the pieces sum exactly — `floor(d/4)` alone would make
-walking west up to 20% faster than east. ~22k cycles against a ~3.1M-cycle
-frame, and the main segment got 42 bytes *smaller* (the whole-frame `oldX/oldY`
-save went away). **56 of 56 door approaches blocked, from 5 walked through.**
-
-**Seeing past a wall you stand against — the player needed a body.** `doWall`
-drops a seg with both endpoints nearer than `NEAR = 16`, and a dropped seg
-leaves its columns open for whatever the BSP paints next — the room behind the
-wall. A point player could stand *on* the wall, so it was trivially reachable.
-The fix is nearly free because the cross product `checkMove` already computes
-is **linear in the test point**: the most-outside corner of a box of radius R
-is that value plus `R*(|dx| + |dy|)` — Doom's own `P_BoxOnLineSide`, two shifts
-and an add, no second cross product (`segBody`, `BODYCODE` at `$7e00`). Three
-things must hold before it blocks, and two of them are the whole design:
-
-- `segNear` — the player is beside the seg, not across the room from the
-  infinite line it lies on;
-- **a passable two-sided seg is never padded.** A portal the body may not
-  overlap is a portal the player can never cross;
-- `segPush` — the motion pushes *into* the seg. Without it, a player carried
-  into the band through a portal (only the subsector he is in is ever tested)
-  would be frozen with every direction blocked, including out. Sliding along a
-  wall is exactly the `d = 0` case and stays legal.
-
-`PLRAD = 24`, not Doom's 16, because it must exceed `NEAR`: at 24 no wall of
-the subsector the player stands in can enter the near plane at all. Exact for
-an axis-aligned seg, up to 6.6 units early on a 45-degree one — early is the
-safe direction. **Checked for impassable geometry before committing**: an
-offline flood of E1M1 on an 8-unit lattice under the engine's own rules loses
-15% of the standable cells against R = 8, all of it wall-hugging margin, and
-seals no room off. Doors 4 and 68 are still walked through end to end; doors 76
-and 81 are not, but they open to 44 units against `MINHEAD = 56` and are shut
-to the engine either way — **pre-existing, identical on the previous build, not
-fixed here**.
-
-**The renderer's fail-open closed, honestly measured.** The radius cannot reach
-segs of *neighbouring* subsectors, and E1M1 still has 538 standable lattice
-cells within 16 units of an occluding seg's vertex. So `nearFix` drops a seg
-only when *both* endpoints are behind the eye, and otherwise pushes both to
-`ry = NEAR` and draws from there — a span narrower than the truth, but the wall
-is drawn and its columns close, and the pipeline already handles `ry = NEAR`
-endpoints because that is what the clip paths produce. It is *entered* at the
-tight spots, but across 48 probed views (6 positions × 8 angles, MATRIX
-compared byte for byte against the previous build) **it never changed a pixel**
-— those segs lose the backface test or fall off-screen anyway. The radius is
-what fixed the artifact; this is a net under a case that stays reachable. A
-blockmap would close it properly; out of scope, and only worth pricing if
-hugging a neighbour's wall ever leaks visibly. Both fixes confirmed on hardware
-2026-08-13.
-
-**RAM.** `MOVECODE` `$7500-$7593`, the page between the HUD's boot staging
-(`$74ff`) and the wall tiles (`$7600`) — runtime code inside MATRIX, safe only
-because the 160-row viewport stops at `$73ff` (§14a.1). `BODYCODE`
-`$7e00-$7eea`, the 512 bytes between the end of MATRIX and `SCREEN0` that the
-map had always had spare, and which `make check`'s live-RAM diff is what makes
-safe to claim (§11a's lesson: a `.const` proves nothing about ownership).
-`WALLSCODE` moved `$ca30` → `$ca28` — the walls block was flush against
-`TX_COL` and the fail-safe needed two bytes. Zero page `$d4-$e1`; `$e2-$e3` is
-what is left in the machine.
-
-**The test had to change, and the reason generalises.** `walktest` failed after
-substepping with a wall leak that never happened: `camX/camY` are written
-**speculatively** — `checkMove` applies a move and then slides or undoes it —
-and substepping does that four times a frame, so a free-running sample can read
-a position the player never stood at. It now samples with the CPU stopped at a
-checkpoint on `readInput`: every sample is a settled position, and consecutive
-samples are exactly one frame apart. Any future test that reads engine state
-mid-frame has the same hazard.
+Zero page now has `$e2-$e3` left; `$e3`, `$f3`, `$f8` were the three remaining when audit ran.
 
 ## 12. Phase 10 — Sprites
 
@@ -909,141 +312,37 @@ savings) is roughly 2-4 ms, but §12's sprites draw from the **same** ~10 ms
 margin the doc currently earmarks for things, so the two must be measured and
 budgeted together, not assumed independently affordable.
 
-## 13. Phase 11 — The HUD *(closed 2026-08-12)*
+## 13. The HUD (closed)
 
-Cheap, independent of everything else, and jumped the queue while a hardware
-question elsewhere was waiting on the machine. Status bar with health/armour/
-ammo, blitted from REU into `BITMAP0`/`BITMAP1` once at boot below the
-viewport — confirmed on hardware, `make check` green.
+**Shipped:** Status bar (health/armour/ammo) blitted at boot below viewport. Values wired to real bytes for M3 live-patch. Boot-only in MATRIX (`BOOTCODE6`), costs 3 bytes resident.
 
-**Shipped simpler than planned, on purpose**: values are wired to real bytes
-(`hudHealth`/`hudArmor`/`hudAmmo`, read once by `hudBoot`) so M3 can make them
-live later, but the **runtime patch-on-change path was not built** — code RAM
-was at zero in every hole that mattered, and a static paint costs nothing
-per-frame. `make framehash` is unchanged (`27f1774c…`) — proof the renderer
-has no idea the HUD exists. 10 digit glyphs, no face frames. The whole feature
-is boot-only code in MATRIX (`BOOTCODE6`) + 2 REU blocks, costing the resident
-build only the 3 value bytes.
+**Cost:** Measured 49.7 ms compute (59.85 ms deadline), 100% on 3 rasters, no outliers — **HUD costs nothing**, per-frame path untouched. `make framehash` bit-identical.
 
-Four traps found by diffing live memory (all now commented at the site): the
-dither-accumulator routine can't be transliterated to indirect addressing
-without losing state across `ora`s; a block's boot-staging address can't
-assume descriptor emission order; **`$07e8` looked free and wasn't** — it's
-`tex.asm`'s `TX_SEED` tail, same shape as §10's "free hole is actually X"
-mistakes; and `hudBlitCell` clobbers X, so its caller's loop counter needed
-its own zero-page byte. Asset lesson: a HUD digit needs at least 2×2 cells to
-read, and must **not** be ordered-dithered (intensities snapped to
-`chunky2mc`'s fixed points) or it comes out speckled.
+**Traps (all in code now):** dither accumulator can't transliterate; boot-stage address can't assume emission order; `$07e8` was `TX_SEED` tail; `hudBlitCell` clobbers X. Digits need ≥2×2 cells, must not be ordered-dithered.
 
-**Frame cost, measured idle**: `compute 49.7 ms` against the 59.85 ms
-deadline, `raster frames 3x335 4+x0 -- 100%`, with the tool's own "every frame
-fits in 3 raster frames" verdict and **no outlier
-warning at all** — the first §12-era reading with a completely empty `4+`
-bucket. **The HUD costs nothing measurable**, which it cannot: `hudBoot` runs
-once from `bootMain`, the per-frame path is untouched, and the framehash is
-bit-identical. ~10 ms of budget remains for §12 sprites.
+## 14. Risk register and leverage points
 
-Confirms §11's back-to-back-readings lesson again: the first runs this session
-read 90-92% until four minutes of quiet between uploads produced the clean
-number above.
+| Risk | Status | Response |
+|---|---|---|
+| **Budget**: `$0400-$07ff` unavailable | Arrived day 1; `COLBUF` found | Sprite depth in `colTop` (§12.1); Stage B less likely; boot code to MATRIX |
+| **Textures overrun 9 ms** | Not observed; 8.7 ms measured on hardware | If: 8×8→4×4 tiles, one-sided only, depth threshold |
+| **Sprites overrun 6-8 ms** | Unknown — not measured on hardware yet | If: near-distance cap first; Stage A resident (§14a.2) |
+| **Compute ≥ 59.85 ms** | Not observed; 48.5 ms with weapon (§12a) + sprites tbd | If: four frames (12.5 fps) only as last resort |
+| **Ultimate 404 recurs** | Not re-observed after §9.1 cache fix (12 runs tested) | Open — may not be upload volume |
 
-**`u64-fps` does not push the REU** (`--reu` is commented out in the Makefile,
-on purpose) — after changing `assets.reu`, run `make u64-map` first or the
-engine halts on a stale image and the tool reports "frame counter never
-advanced".
+### 14a. Budget relief levers
 
-## 14. M2 risk register
+**Closed (both took effect for §12a weapon):**
+- **§14a.1:** Viewport 176 → 160 rows (20 cell-rows) → 2560 B MATRIX freed, ~1.1 ms compute
+- **§14a.1b:** Viewport 160 → 144 rows (18 cell-rows, symmetric top/bottom) → another 2560 B + ~1.1 ms; horizon stays at raster 88
 
-| # | Risk | Early warning | Response if it arrives |
-|---|---|---|---|
-| 1 | ~~**There is nowhere to put M2's state.**~~ **Arrived, day one.** `$0400-$07ff` is `COLBUF` and always was | §9.1's watched-region run, before any design depends on it — which is exactly what caught it | ~200 B of data RAM and ~90 B of code RAM is the real budget (§8.3). Sprite depth moves into `colTop` (§12.1), Stage B textures get less likely, boot-only code goes into MATRIX |
-| 2 | **Textures overrun 9 ms.** The per-pixel estimate is 3-7× wrong, as it has been before | `ftComp` after the first textured wall, measured on hardware | Tile size 8×8 → 4×4; texture only one-sided segs; last resort, texture only walls within a depth threshold |
-| 3 | **Multicolor cells break anyway.** Intensity-only texturing still crosses a cell boundary where two surfaces meet, and always did | The first textured frame, by eye | This is M1's risk #5 returning; the fix is the same, in `wad2reu.py`'s ramp table |
-| 4 | **Sprite clipping mis-draws through openings** (§12.1's known simplification) | A sprite visible through a window in E1M1 | Accept for M2. It is a per-seg opening list in M3, which needs RAM M2 does not have |
-| 5 | **Three raster frames still is not enough.** Everything lands and compute exceeds 59.85 ms | `ftHist`'s `4+` bucket leaving zero | Four frames is 12.5 fps and that is below playable. Cut sprites to a near-distance cap first, then Stage A textures on fewer surfaces |
-| 6 | **The Ultimate's `404 Cannot open file` recurs** after §9.1's fix | Any `make run-u64` in a long session. Deliberately re-run 2026-08-11 — 12 `run_prg` calls in 40 s, clean — but 40 s is not a session | Then it is not upload volume, and the milestone needs a reliable reset procedure before it needs features |
-
-## 14a. Budget relief — the options, priced *(analysed 2026-08-12, mostly not decided)*
-
-Both budgets are tight at the same time, and it is worth being precise about
-where they stand before spending either.
-
-**Time.** 46.7 ms compute against 59.85 ms (§10's landing note) = **13.1 ms
-free**. Doors measured at effectively nothing (§11) and the HUD has landed,
-so the whole remainder is §12's sprites, estimated at 6-8 ms. That closes M2
-with ~5 ms of margin *if the estimate holds*, and §4 is unambiguous that this
-class of estimate has been wrong by 3-7× in this engine, in both directions.
-
-**RAM.** `defs.asm` now reads *"below MATRIX the largest unclaimed run left is
-five bytes"*. ~90 B of code RAM in ten fragments, ~200 B of data RAM, and the
-640 B under I/O is spent on doors. There is nothing left.
-
-**Both budgets are consumed by the same object.** `MATRIX` is `$1000-$7dff` —
-28160 B, 160×176 chunky, **45% of usable RAM** — and the per-pixel work over it
-(`spanFill`, the texture sampler, `chunky2mc`'s conversion) is the bulk of the
-frame. That is why the options below are largely one compromise wearing
-different hats, and why the first is the only one that pays into both budgets
-at once.
-
-### 14a.1 Viewport height *(closed 2026-08-12: 176 → 160; reopened and closed again 2026-08-13 at 144 — see §14a.1b)*
-
-176 → 160 rows (20 cell-rows), a contained edit in four places (`math.asm`,
-`bsp.asm`, `walls.asm`, `chunky2mc.asm`), freeing 2560 B of MATRIX — the tail
-past the new 25600-byte live buffer, **contiguous, above `$0801`, and code-
-capable**, unlike every other RAM find this milestone. `make check`/
-`walktest`/`doortest` green, `make framehash` a new digest (expected — the
-frame genuinely shrinks), `clearHudRows` extended to blank the new letterbox
-rows. Taller cuts (144, 128 rows) are the same edit with a different constant
-and are not scheduled — 160 is the look judgement to live with first.
-
-**Priced with a new instrument, `make phaseprof`** (stopping exec checkpoints
-on each `mainLoop` phase against the CIA clock — exact, not sampled). Result:
-the cut **returned a quarter of what the row percentage predicted** — `convert`
-(chunky2mc) dropped its full 9.1% as expected, but `renderFrame`'s cost is
-dominated by per-seg/per-column work (7485 `mul8` calls/frame) that the
-removed rows barely touch. Net: **compute −2.4%, ~1.1 ms on hardware**, not the
-~4 ms the pixel percentage implied — so a further cut to 144 rows would buy
-roughly another 1.1 ms, not 4. `chunky2mc` itself costs **391.2k cycles = 6.1
-ms of a hardware frame (13.5% of compute)** — previously unpriced — and the
-cost model this run established (`ms ≈ cycles/64e6 + 1 µs/DMA byte`) predicted
-§10's textured-wall hardware measurement to within a percent, validating
-phaseprof's cycle counts as usable without a hardware trip.
-
-**What it costs:** a letterboxed view — Doom's own 320×200 view is 168 rows
-under its status bar, so 176 was already generous.
-
-#### 14a.1b Reopened for §12: 160 → 144 rows, split evenly *(closed 2026-08-13)*
-
-"Not scheduled" lasted one section. §12 needs ~2 KB of contiguous code-capable
-RAM for resident sprite art and there is no other lever in the machine that
-produces any (§14a.7), so the second cut was taken after all: **160 → 144 rows
-(18 cell-rows), freeing another 2560 B** and, as §14a.1 predicted to the
-decimal, **another 1.13 ms** (compute 3051.1k → 2979.1k cycles, −2.4%;
-`convert` 391.1k → 352.1k, exactly the 18/20 row ratio).
-
-**The 32 rows now come off symmetrically — 16 top, 16 bottom.** The first pass
-took all 32 off the bottom, which is cheaper to write (the buffer still starts
-at row 0) but drops eye level to two thirds of the way down the picture: the
-player reads it as permanently looking up at the ceiling. Symmetric splits the
-letterbox into two 16-row bands and keeps the horizon at raster 88 where it has
-always been. It costs one constant offset, applied in exactly one place —
-`initFrame` aims the converter's three output pointers `VIEWCELLTOP` cell-rows
-in, and nothing upstream of the bitmap knows. Two coordinate systems now exist
-and `defs.asm` names both: MATRIX rows 0..143 with `HORIZON` = 72 (what
-`projRow` subtracts from), and raster rows 0..199 with the view at 16..159.
-
-Fallout worth knowing: the burst in `flip` has to reach a *fourth* page of
-`$d8xx` once the view starts at colour cell 80, and those nine bytes overran
-the converter's block. `cntBump` moved to the top of the same 21-byte gap
-(`instrument.asm`) — the two blocks now spend the gap exactly, with an
-`.errorif` on each side. `TABLES_FREE` is not a fallback despite the name;
-SEGBUF, the BSP node test and the counters have taken all of it.
-
-Also fixed here, not in this section's scope but found by it: `make shot` ran
-`SHOT_CYCLES = 50000000` and was landing the screenshot *inside* the first
-conversion, so `checkshot.py` was passing a bitmap half full of staging bytes
-at 39.7% coverage. Raised to 80M. §4's warning that `make framehash`, not
-`make shot`, is the acceptance test was showing up in the gate itself.
+**Open (ranked by trade-off):**
+1. **§14a.2:** Resident 16×16 sprites (8 props = 1 KB) vs streamed — eliminates 2.5-4 ms DMA, trades blocky sprites; needs §14a.1-1b's freed space
+2. **§14a.3:** Drop double buffering (`BITMAP1`/`SCREEN1` = 9 KB) — zero frame cost, trades tearing visible at 16.7 fps
+3. **§14a.4:** Halve horizontal (80 cols) — ~15 ms + 14 KB, rejected for 4:1 aspect (changes what the game is, not how much)
+4. **§14a.5:** Cold-code overlays for non-hot paths — modest savings; `.pseudopc` pattern already trusted
+5. **§14a.6:** Fourth raster frame (12.5 fps) — frees time, not RAM; separate lever from §14a.1-1b
+6. **§14a.7:** §14a.1 (144 rows) + §14a.2 (resident sprites) together = 5 KB + 2–3 ms sprites, leaves ~15 ms for Stage B textures
 
 ### 12a landing note *(2026-08-13)*
 
@@ -1108,99 +407,19 @@ frame at roughly **48.5 ms against the 49.7 ms cap**, which is the first time
 this milestone has been inside one raster frame of the limit: §12's sprites
 have to be measured on hardware before they are believed.
 
-### 14a.2 Resident downsampled sprites, instead of streamed *(open, recommended)*
-
-§12.4 says sprite cost is **dominated by REU streaming** — 5-8 sprites × 512 B
-= 2.5-4 ms of the 6-8 ms estimate. But M2's sprites are static props and there
-are few *distinct* ones. At **16×16 4-bit = 128 B**, eight props is **1 KB
-fully resident** and the streaming cost goes to zero, taking the phase to
-plausibly 2-3 ms.
-
-This is precisely §10's Stage A argument applied to §12, and Stage A shipped.
-It converts the phase's largest and least controllable cost into a fixed RAM
-charge, payable out of what §14a.1 frees.
-
-**What it costs:** blockier sprites than the walls behind them — at 160 columns
-with 2:1 pixels, a 16×16 sprite scaled up close is visibly coarse. Mitigated by
-§12.3's near-distance cap, which is wanted regardless.
-
-### 14a.3 Drop double buffering *(open, held in reserve)*
-
-`BITMAP1` (`$e000-$ff3f`, 8000 B) + `SCREEN1` (`$c000`, 1000 B) = **9 KB**, the
-largest single block available, freed at **zero cost in frame time**.
-
-**What it costs:** tearing. `chunky2mc` writes the bitmap across the frame and
-`flip` syncs to raster 251; single-buffered, the conversion is visible as it
-happens, and at 16.7 fps on a three-raster-frame period that is not subtle.
-Ranked **below** §14a.1 and §14a.2 despite the larger number: it is the option
-most likely to look *broken* rather than to look *reduced*. The card to play if
-Stage B textures become the thing worth having most.
-
-### 14a.4 Halve horizontal resolution to 80 columns *(rejected)*
-
-MATRIX → 80×176 = 14080 B (**14 KB**), the column loop halves, the divide count
-halves, texture sampling halves. Probably 15+ ms and 14 KB in one change, and
-it dominates every other option numerically.
-
-**Rejected on look.** Multicolor is already 2:1; this is 4:1, which changes what
-the game is rather than how much of it there is. Recorded so it does not have to
-be re-derived.
-
-### 14a.5 Cold-code REU overlay *(open, modest)*
-
-The general question was: can RAM be found by DMAing code blobs from REU,
-executing them, and overwriting them with the next blob?
-
-**Not for the hot path.** The ~90 B shortage is tight because `bspLoop`,
-`doWall`, `spanFill`, the texture sampler and `checkMove` must be
-*simultaneously* resident — they call each other within one pass and none of
-them idles long enough to be safely overwritten. Reloading a 1-2 KB overlay
-every frame also costs 1-2 ms/frame *permanently* at the REU's flat 1 byte/µs,
-which spends the scarce frame budget to relieve the RAM budget — the inverse of
-§3's one trade that works. And it does not produce what Stage B actually needs,
-which is *data* scratch concurrent with rendering: MATRIX is the framebuffer
-during play, not idle memory.
-
-**Yes for cold code.** The door thinker, the use-key/walkover handler and the
-HUD blit run rarely, not every frame. Making them on-demand overlays reclaims a
-few hundred bytes of *resident* code RAM with no recurring per-frame cost,
-because the reload only happens when the feature fires. `lineBoot`/BOOTCODE5
-already does exactly this at boot, and `probe.py`'s relocated-block check
-already guards the pattern (§11a) — so this is extending a mechanism the
-codebase trusts, not inventing one.
-
-### 14a.6 A fourth raster frame *(separate question, not a RAM lever)*
-
-12.5 fps buys ~20 ms outright through machinery that already exists
-(`FPS_CAP_TICKS`, `TARGET_FRAMES`, §8.1's phase-drift fix), and is far more
-frame budget than any option above.
-
-**But it frees no RAM at all**, and §14's risk #5 already called 12.5 fps below
-playable. The two are independent: dropping to four frames does not require
-overlays, and overlays do not require four frames. Worth keeping them separate
-so that the cheap lever is not credited to the complicated mechanism.
-
-### 14a.7 The combination worth revisiting
-
-**§14a.1 at 144 rows + §14a.2** would together give ~5 KB of contiguous
-code-capable RAM and land sprites at 2-3 ms instead of 6-8 — leaving roughly
-15 ms free rather than 5, which is enough to make **Stage B textures a live
-question again** after §10 closed them on budget grounds.
-
-That is recorded as the shape of the argument, not as a plan. The agreed step
-is 160 rows, looked at on hardware first.
+---
 
 ## 15. Sequencing
 
-Everything through §13 (clearing the ground, textures, doors, jump, bob, HUD)
-is closed. **§12, sprites, is what remains of M2** — the only phase whose RAM
-requirement is firm and whose budget has no fallback smaller than "draw fewer
-things". §12a (the weapon view) is recommended to land first: it is a strict
-subset of §12.2 item 4's masked blit (no scale accumulator, fixed position),
-so it de-risks the general blit and streaming path cheaply before sprites
-commit to it.
+Everything through §13 is closed. **§12, sprites, is what remains of M2** — the
+only phase whose RAM requirement is firm and whose budget has no fallback
+smaller than "draw fewer things". §12a (the weapon view) is recommended to land
+first: it is a strict subset of §12.2 item 4's masked blit (no scale
+accumulator, fixed position), so it de-risks the general blit and streaming
+path cheaply before sprites commit to it.
 
-The lesson worth repeating for this phase, as for every phase before it:
-**build the instrument first.** Every session that skipped a `phaseprof`/
-`profile.py` checkpoint before estimating a cost had sound reasoning and the
-wrong conclusion.
+**Next milestone steps:** (1) Measure sprites on hardware with `make u64-fps`.
+(2) If overrunning, apply leverage points in order: near-distance cap (§12.3),
+Stage A resident sprites (§14a.2), viewport cut to 144 (§14a.1b). (3) Build a
+positive control into every measurement. (4) Price any optimization first with
+`phaseprof`/`profile.py` before design commits to it.
