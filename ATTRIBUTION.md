@@ -43,19 +43,14 @@ The extracted assets remain under their original copyright by id Software. This 
 
 ### Music
 
-Two SID tunes are included in this project:
+One SID tune is included in this project:
 
-1. **"At Doom's Gate (E1M1)"**
-   - Composer: Nordischsound (Ben Dibbert), 2021
-   - Released by: Hokuto Force
-   - Credit is embedded in the PSID file header
+**"DooM Medley"**
+- Composer: Thanos B. (DJ Space), 2025
+- Released by: Hokuto Force
+- Credit is embedded in the PSID file header
 
-2. **"DooM Medley"**
-   - Composer: Thanos B. (DJ Space), 2025
-   - Released by: Hokuto Force
-   - Credit is embedded in the PSID file header
-
-Neither track is composed by this project; they are fan arrangements played back as a register stream from REU hardware.
+The track is a fan arrangement played back as a register stream from REU hardware (no resident SID player code; `tools/sidstream.py` generates the delta-encoded stream from the PSID file).
 
 ### Commodore 64 Ultimate Hardware
 

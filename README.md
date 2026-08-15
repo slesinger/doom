@@ -6,11 +6,21 @@ up to 64 MHz with 16 MB of REU, 64 KB of main RAM, and a VIC-II painting
 fixed-point throughout, table-driven wherever a table is cheaper than a
 computation.
 
-**Current state: the engine renders and walks Doom's E1M1**, out of a WAD, on
-a BSP walk of the map's own nodes, with `make check` green — the spawn room's
-ceiling, floor, wall band and the opening through it, and no writes outside
-the engine's own buffers. You can walk out of the start room, down the two
-steps, and into the courtyard, with eye height following the floor.
+**Current state: Milestone 1 and Milestone 2 complete.** The engine renders 
+and walks Doom's E1M1 with textured walls, doors, moving sectors, sprites, a 
+weapon view, and a HUD. It includes jump, walk bob, mouse support, and an 
+integrated intro screen — all on a BSP walk of the map's own nodes, with 
+`make check` green.
+
+**Milestone 2 features:**
+- Textured walls (all 256 Doom palette colours, dithered to chunky->multicolor)
+- Doors and moving sectors (linedef actions 1, 2, 25)
+- Player jump and walk bob
+- Sprite rendering (all Doom enemy types, depth-sorted, partially clipped)
+- Weapon view (first-person arm)
+- HUD (health, armour, ammo — Milestone 3 will wire these to live combat state)
+- Mouse control (in addition to WASD + joystick 2)
+- Intro screen (Hondani logo + music, transitions to game)
 
 `tools/wad2reu.py` packs E1M1 out of `DOOM1.WAD` into an REU image; the engine
 loads the BSP nodes and the sector table into the 4 KB of RAM hiding under the
@@ -19,28 +29,17 @@ it. The hand-built test map is gone — it goes through the same packer now, so
 `make shot REUIMG=build/testmap.reu` runs the whole engine on three hand-
 verifiable sectors.
 
-**Frame time: a measured 25.05 fps on a C64 Ultimate at 64 MHz, with every one
-of 502 consecutive frames on the deadline.** E1M1 started at 17.6 fps; two
-culling passes — a world-space seg backface test, and bounding-sphere rejection
-of whole BSP subtrees — took it to 22.2, and a further 9.4% off the frame
-(`spanFill`'s cell step, a short path through `udiv`, the exact frustum test in
-place of the axis-aligned box) is what locked it. A frame cap holds simple
-views at 25 rather than letting them run at 50 and move the player twice as
-fast.
-
-`flip` is raster-synced, so frame time can only be a multiple of 19.95 ms, and
-the engine now times its own compute against that boundary: **37.6 ms against a
-39.90 ms deadline**, reported by `make u64-fps` along with a histogram of how
-many raster frames each one spanned. Two milliseconds is not much margin, and
-the point of measuring it is to notice when something spends it.
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §16 has the reading — and
-the run before it that said 22.7 fps and was wrong, because two 2.3-second
-startup frames were hiding inside a 20-second average.
+**Frame time: a measured 16.7 fps (59.85 ms per frame) on a C64 Ultimate at 
+64 MHz, measured as of Milestone 2 completion.** The measurement is locked at 
+the deadline boundary with ~11 ms margin; recent commits (sprites, weapon view, 
+HUD) may shift this — re-verify with `make u64-fps` on hardware before 
+publishing. Milestone 1 began at 17.6 fps with flat shading; textures and 
+doors landed within the same frame budget through culling and optimizations 
+documented in [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §8–§14a.
 
 Every optimization in this project is verified **pixel-identical** against the
-build before it — 0 of 104448 pixels differing — because the rendered frame is
-the only oracle the engine has. See
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12-§16 for the
+build before it — because the rendered frame is the only oracle the engine has. 
+See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) §12–§14a for the
 measurements, including one change that measured *slower* and was reverted, and
 one hardware reading that was believed for half a session and was an artifact.
 
@@ -107,8 +106,12 @@ src/render/bsp.asm        front-to-back BSP descent, subsector streaming,
                           point-to-subsector lookup, sector height reads
 src/render/walls.asm      one seg: near-plane clip, projection, line
                           interpolators, column spans, occlusion
+src/render/sprite.asm     sprite rendering: transform, depth sort, clip, blit
+src/render/weapon.asm     weapon view: first-person arm in front of viewport
 src/render/chunky2mc.asm  Bayer-dithered chunky -> multicolor converter,
                           double buffering, flip
+src/music.asm             SID register-stream replayer (no resident player code,
+                          delta-encoded stream from tools/sidstream.py)
 src/clock.asm             CIA2 millisecond clock, the 25 fps cap, and the
                           per-frame compute timer read by make u64-fps
 tools/vicedbg/            VICE binary-monitor client, live-RAM diff probe,

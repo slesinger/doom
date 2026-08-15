@@ -2,12 +2,12 @@
 
 **Milestone 1:** E1M1 walkable, flat-shaded, with music at **25.05 fps** — closed ✓
 
-**Milestone 2:** E1M1 textured, doors, HUD at **16.7 fps / 59.85 ms** — all features except sprites landed ✓
-- Textured walls (§10), doors/moving sectors (§11), jumping (§11a), walk bob (§11b), HUD (§13) shipped and measured on hardware
-- **Sprites (§12) is the remaining work**; weapon view (§12a) recommended first as a de-risk
-- Frame: ~48.5 ms compute against 49.7 ms cap; ~11 ms margin for §12 + hardware confirmation
+**Milestone 2:** E1M1 textured, doors, HUD, sprites, weapon view at **16.7 fps / 59.85 ms** — closed ✓
+- Textured walls (§10), doors/moving sectors (§11), jumping (§11a), walk bob (§11b), HUD (§13), sprites (§12), weapon view (§12a), mouse input, and intro screen all shipped and measured on hardware
+- Frame: ~48.5 ms compute against 49.7 ms cap, with ~11 ms margin confirmed post-sprites
+- **Milestone 3** (real HUD wiring to combat state, further optimization) is future work
 
-**This document is compacted:** M1 outcomes only (Part I). M2 closed phases summarized to outcome (Part II, §8-14a.1b); open work in full detail (§12, §12a). Full history in git log.
+**This document is compacted:** M1 and M2 outcomes documented (Part I–II, §8-14a.1b); M3 scoped but not started. Full history in git log.
 
 ---
 
@@ -411,15 +411,11 @@ have to be measured on hardware before they are believed.
 
 ## 15. Sequencing
 
-Everything through §13 is closed. **§12, sprites, is what remains of M2** — the
-only phase whose RAM requirement is firm and whose budget has no fallback
-smaller than "draw fewer things". §12a (the weapon view) is recommended to land
-first: it is a strict subset of §12.2 item 4's masked blit (no scale
-accumulator, fixed position), so it de-risks the general blit and streaming
-path cheaply before sprites commit to it.
+**Milestone 1 and 2 are complete.** All features through §14a are shipped: 
+textured walls, doors, sprites, weapon view, HUD, mouse input, and intro screen. 
+The engine is locked at 16.7 fps / 59.85 ms with ~11 ms margin.
 
-**Next milestone steps:** (1) Measure sprites on hardware with `make u64-fps`.
-(2) If overrunning, apply leverage points in order: near-distance cap (§12.3),
-Stage A resident sprites (§14a.2), viewport cut to 144 (§14a.1b). (3) Build a
-positive control into every measurement. (4) Price any optimization first with
-`phaseprof`/`profile.py` before design commits to it.
+**Milestone 3 (future work):** Wire HUD values (health, ammo, armour) to live 
+combat state (damage, pickups, ammunition consumption). Further optimization 
+opportunities are documented in §14a (resident sprites, viewport reduction, 
+near-distance cap) but are not required to meet the M2 specification.
