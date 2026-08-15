@@ -497,7 +497,7 @@
 .const LIFT_SPEED = 8
 .const FLOOR_SPEED = 2
 .const DOOR_WAIT = 71               // 150 tics = 4.3 s
-.const LIFT_WAIT = 50               // 105 tics = 3.0 s
+.const LIFT_WAIT = 100               // 105 tics = 3.0 s, +2 s for the walkthrough
 
 // Code, in what the tables leave of the three holes. The split is by run
 // order rather than by size: LINECODE is the per-frame thinker, LINECODE2 the
