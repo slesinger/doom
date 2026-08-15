@@ -1,7 +1,10 @@
 //============================================================
-//  chunky2mc.asm — 160x160 chunky buffer -> VIC-II multicolor
-//  (176 -> 160 rows, IMPLEMENTATION_PLAN.md §14a.1: a 320x200 frame with
-//  rows 160-175 letterboxed black and the HUD unchanged at rows 176-199)
+//  chunky2mc.asm — 160x144 chunky buffer -> VIC-II multicolor
+//  (a 320x200 frame: rows 0-15 letterboxed black, the view at rows 16-159,
+//  and the HUD flush against it at rows 160-199 -- IMPLEMENTATION_PLAN.md
+//  §14a.1/§12 cut the view to 144 rows, and 2026-08-15 moved the HUD up one
+//  cell-row (defs.asm's HUD_CELL_ROW) to close the 8-row gap that left
+//  between the view and the bar)
 //  C64 Ultimate @ turbo, 25 fps double-buffered
 //
 //  Matrix byte format: %rrrriiii  (ramp 0-15, intensity 0-15)

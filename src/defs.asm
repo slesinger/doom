@@ -62,9 +62,15 @@
 .const VIEWBMPOFS   = VIEWCELLTOP * 320     // 640: bitmap bytes to skip
 .errorif VIEWROWS != VIEWCELLROWS * 8, "the viewport must be a whole number of cell-rows"
 .errorif VIEWTOP != VIEWCELLTOP * 8, "the top letterbox must be a whole number of cell-rows"
-// The HUD's four cell-rows are fixed at raster 168; the view plus both bands
-// must fit above them, or the converter writes over the bar.
-.errorif VIEWTOP + VIEWROWS > 168, "the view and its top letterbox overrun the HUD"
+// The HUD's four cell-rows: cell-row 20 (raster 160), flush against the view's
+// bottom letterbox. Was cell-row 21 (raster 168) until 2026-08-15, which left
+// an 8-row black gap -- one whole cell-row -- between the letterbox and the
+// bar; moving the bar up one cell-row closes it, and pushes the gap to the
+// bottom edge of the physical screen (cell-row 24, raster 192-199) where it
+// reads as normal border, not a seam in the HUD. hudBoot/hudDrawDigit
+// (src/mapload.asm) are the only consumers.
+.const HUD_CELL_ROW = 20
+.errorif VIEWTOP + VIEWROWS > HUD_CELL_ROW*8, "the view and its top letterbox overrun the HUD"
 
 // Wall texture tiles, resident, in the tail the 160-row viewport freed.
 //
