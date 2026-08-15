@@ -361,11 +361,11 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
 </head>
 <body>
 
-<div class="prehead">A <b>Hondani</b> release &middot; C64 scene group, <a href="https://csdb.dk/group/?id=901" target="_blank" rel="noopener">CSDb</a> &middot; <span title="Domain not live yet — placeholder for where this project will eventually live">hondani.com</span></div>
+<div class="prehead">A <b><a href="https://hondani.com" target="_blank" rel="noopener">Hondani</a></b> release &middot; C64 scene group, <a href="https://csdb.dk/group/?id=901" target="_blank" rel="noopener">CSDb</a> &middot; <a href="https://hondani.com" target="_blank" rel="noopener">hondani.com</a></div>
 
 <header class="topbar">
   <div class="topbar-inner">
-    <div class="brand"><span class="dot"></span>DOOM_C64U<span class="cursor">&nbsp;</span><span style="font-weight:400; color:var(--text-faint); font-size:11px; margin-left:6px;">by Hondani</span></div>
+    <div class="brand"><span class="dot"></span>DOOM_C64U<span class="cursor">&nbsp;</span><span style="font-weight:400; color:var(--text-faint); font-size:11px; margin-left:6px;">by <a href="https://hondani.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:none; cursor:pointer;">Hondani</a></span></div>
     <nav class="tabs" id="tabs">
       <button data-tab="overview" class="active">Overview</button>
       <button data-tab="tech">Technology</button>
@@ -408,7 +408,7 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       </div>
 
       <div class="shot shot-21x9">
-        <img class="shot-img" src="/doom/screenshots/doom-c64u-hero.png" alt="Doom C64U hero shot: corridor with colored doors, textured walls, HUD visible">
+        <img class="shot-img" src="./screenshots/doom-c64u-hero.png" alt="Doom C64U hero shot: corridor with colored doors, textured walls, HUD visible">
       </div>
 
       <div class="stats">
@@ -467,22 +467,56 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <div class="grid4">
         <div class="shot shot-4x3">
           <div class="shot-tag">1</div>
-          <img class="shot-img" src="/doom/screenshots/doom-c64u-gameplay-2.png" alt="Environmental variety: green grass, brown rock textures, open chamber">
+          <img class="shot-img" src="./screenshots/doom-c64u-gameplay-2.png" alt="Environmental variety: green grass, brown rock textures, open chamber">
         </div>
         <div class="shot shot-4x3">
           <div class="shot-tag">2</div>
-          <img class="shot-img" src="/doom/screenshots/door-half-open.png" alt="Door mid-open: brick wall texture detail, animated sector in transit">
+          <img class="shot-img" src="./screenshots/door-half-open.png" alt="Door mid-open: brick wall texture detail, animated sector in transit">
         </div>
         <div class="shot shot-4x3">
           <div class="shot-tag">3</div>
-          <img class="shot-img" src="/doom/screenshots/doom-c64u-sprites-detail.png" alt="Sprite and geometry close-up: player view, props rendered in scene">
+          <img class="shot-img" src="./screenshots/doom-c64u-sprites-detail.png" alt="Sprite and geometry close-up: player view, props rendered in scene">
         </div>
         <div class="shot shot-4x3">
           <div class="shot-tag">4</div>
-          <img class="shot-img" src="/doom/screenshots/doom-c64u-hud-crop.png" alt="HUD detail: health, armor, ammo digits clearly visible and readable">
+          <img class="shot-img" src="./screenshots/doom-c64u-hud-crop.png" alt="HUD detail: health, armor, ammo digits clearly visible and readable">
         </div>
       </div>
       <p style="margin-top:14px; font-size:12px; color:var(--text-faint);">Captured straight off real hardware with <a href="https://hdn.sh/" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline;">HDN Shell</a>, Hondani's other C64 Ultimate project.</p>
+    </div>
+  </section>
+
+  <section class="tight">
+    <div class="wrap">
+      <div class="eyebrow">Get started</div>
+      <h2>Download and run</h2>
+      <div class="grid2" style="margin-top:28px; align-items:start;">
+        <div>
+          <p style="margin-bottom:18px;">Pre-built binaries are ready to run on your C64 Ultimate. Download from the latest release on GitHub, copy to your device, and follow the quick setup steps.</p>
+          <a class="btn btn-primary" href="https://github.com/slesinger/doom/releases/latest" target="_blank" rel="noopener">↓ Download from GitHub releases</a>
+          <div class="card" style="margin-top:20px;">
+            <h3 style="font-size:15px; margin-bottom:12px;"><span class="chip"></span>Setup steps</h3>
+            <ol style="padding-left:20px; color:var(--text-dim); font-size:13.5px; line-height:1.8;">
+              <li style="margin-bottom:6px;"><b>Download</b> the release from <code style="color:var(--amber);">github.com/slesinger/doom/releases/latest</code></li>
+              <li style="margin-bottom:6px;"><b>Copy</b> the files to your <code style="color:var(--amber);">doom</code> folder in your C64 Ultimate</li>
+              <li style="margin-bottom:6px;"><b>Open</b> the Ultimate menu → DISK FILE BROWSER and navigate to the doom folder</li>
+              <li style="margin-bottom:6px;"><b>Load settings:</b> <code style="color:var(--amber);">doom.cfg</code> → RETURN</li>
+              <li style="margin-bottom:6px;"><b>Load into REU:</b> <code style="color:var(--amber);">game.reu</code> → RETURN</li>
+              <li><b>Run:</b> <code style="color:var(--amber);">launcher.prg</code> → RETURN</li>
+            </ol>
+          </div>
+        </div>
+        <div class="card">
+          <h3><span class="chip"></span>What you'll need</h3>
+          <ul style="font-size:13.5px;">
+            <li>Commodore 64 Ultimate (official hardware, 2025+)</li>
+            <li><em>Or:</em> VICE emulator on any PC for development &amp; testing</li>
+            <li>A copy of DOOM1.WAD to build from source (licensed or free shareware)</li>
+          </ul>
+          <hr class="rule" style="margin:14px 0; border-color:var(--line);">
+          <p style="font-size:13px; color:var(--text-faint);">The pre-built binaries above include the assembled engine and pre-packed assets — no build tools needed to run.</p>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -560,7 +594,7 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <div class="eyebrow">In practice</div>
       <h2>What the five-stage pipeline looks like in real time</h2>
       <div class="shot shot-4x3" style="margin-top:20px; max-width:520px;">
-        <img class="shot-img" src="/doom/screenshots/doom-c64u-gameplay-1.png" alt="Five-stage pipeline in action: chamber with colored geometry, textures, lighting, and sprites rendered in real-time">
+        <img class="shot-img" src="./screenshots/doom-c64u-gameplay-1.png" alt="Five-stage pipeline in action: chamber with colored geometry, textures, lighting, and sprites rendered in real-time">
       </div>
       <p style="margin-top:14px; font-size:13px; color:var(--text-dim); max-width:70ch;">Every frame you see is the result of these five stages executing within the 59.85 ms deadline. The chambers, textures, dithering, and sprite rendering happen in lockstep.</p>
     </div>
@@ -728,6 +762,19 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
 
   <section class="tight">
     <div class="wrap">
+      <div class="eyebrow">Proof shot</div>
+      <h2>Real hardware verification</h2>
+      <div style="max-width:75%; margin:0 auto;">
+        <div class="shot shot-16x9">
+          <img class="shot-img" src="./screenshots/full-frame-fps-counter-terminal.png" alt="make u64-fps output: 16.61 fps hardware-measured, frame timing, and deadline validation">
+        </div>
+      </div>
+      <p style="margin-top:14px; font-size:13px; color:var(--text-dim); text-align:center;">Every frame rate number on this site comes from real C64 Ultimate hardware, verified with <code>make u64-fps</code> and cross-checked against raster-sync boundaries.</p>
+    </div>
+  </section>
+
+  <section class="tight">
+    <div class="wrap">
       <div class="eyebrow">The optimization story</div>
       <h2>Milestone 1: 56.9&nbsp;ms → 39.9&nbsp;ms</h2>
       <div class="timeline">
@@ -854,12 +901,12 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
 
       <div class="grid2" style="margin-top:28px;">
         <div class="card" style="border-color:rgba(255,194,51,.3);">
-          <h3><span class="chip" style="background:var(--amber)"></span>Hondani</h3>
+          <h3><span class="chip" style="background:var(--amber)"></span><a href="https://hondani.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:none; cursor:pointer;">Hondani</a></h3>
           <p style="font-size:13.5px;">This project is made by <b>Hondani</b>, a C64 scene group — Doom C64U is a Hondani production, credited to the group rather than any one contributor.</p>
           <a class="btn btn-ghost" style="margin-top:12px;" href="https://csdb.dk/group/?id=901" target="_blank" rel="noopener">Hondani on CSDb →</a>
         </div>
         <div class="card">
-          <h3><span class="chip" style="background:var(--cyan)"></span>Also from Hondani — HDN Shell</h3>
+          <h3><span class="chip" style="background:var(--cyan)"></span>Also from <a href="https://hondani.com" target="_blank" rel="noopener" style="color:var(--amber);">Hondani</a> — <a href="https://hdn.sh" target="_blank" rel="noopener" style="color:var(--amber);">HDN Shell</a></h3>
           <p style="font-size:13.5px;">A modern shell for the C64 Ultimate: AI chat, a text-mode web browser, an assembler/monitor, Telegram and RSS, all in an 8&nbsp;KB ROM alongside BASIC. It's Hondani's other C64U project — and, fittingly, the tool this page's own screenshots were captured with.</p>
           <div style="display:flex; gap:10px; margin-top:12px; flex-wrap:wrap;">
             <a class="btn btn-ghost" href="https://hdn.sh/" target="_blank" rel="noopener">hdn.sh →</a>
@@ -907,14 +954,6 @@ footer{border-top:1px solid var(--line); padding:40px 0; margin-top:20px;}
       <p style="margin-bottom:14px;">The intro screenshot shown on this project's launch screen is captured from id Software's original Doom (1993). In-game screenshots of the C64 Ultimate engine itself are captured directly from real hardware using <a href="https://hdn.sh/" target="_blank" rel="noopener" style="color:var(--amber); text-decoration:underline;">HDN Shell</a>.</p>
 
       <hr class="rule">
-
-      <div class="eyebrow">Proof shot</div>
-      <div style="max-width:75%; margin:0 auto;">
-        <div class="shot shot-16x9">
-          <div class="shot-tag">Terminal capture</div>
-          <img class="shot-img" src="/doom/screenshots/full-frame-fps-counter-terminal.png" alt="make u64-fps output: 16.61 fps hardware-measured, frame timing, and deadline validation">
-        </div>
-      </div>
 
       <hr class="rule">
 
