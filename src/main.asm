@@ -1,6 +1,11 @@
 //============================================================
 //  main.asm — Doom C64U entry point
 //
+//  License: CC BY-NC-SA 4.0 (Creative Commons Attribution-NonCommercial-ShareAlike)
+//  © 2026 Honza Slesinger, Hondani
+//  Based on Doom (1993) © id Software
+//  See LICENSE and ATTRIBUTION.md for complete licensing details.
+//
 //  Milestone 1: walkable 3D demo — BSP renderer into the chunky
 //  MATRIX, chunky2mc conversion, double buffering.
 //

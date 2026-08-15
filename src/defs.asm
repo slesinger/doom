@@ -1,6 +1,10 @@
 //============================================================
 //  defs.asm — shared constants: memory map + zero page
 //  Imported first; keep ALL .const here so every module sees them.
+//
+//  License: CC BY-NC-SA 4.0
+//  © 2026 Honza Slesinger, Hondani
+//  Based on Doom (1993) © id Software
 //============================================================
 
 //------------------------------------------------------------

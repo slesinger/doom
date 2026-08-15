@@ -27,6 +27,18 @@
 #                   src/intro/ultaudio.asm for why VICE has no sound here)
 #   make run-intro-u64  push the title screen to the Ultimate and run it,
 #                   with sound
+#
+#   make launcher   build/launcher.prg + build/game.reu -- what ships: the
+#                   Hondani logo, then the title, then the game, merged
+#   make run-launcher   run the merged launcher in VICE (picture only)
+#   make shot-launcher  headless VICE run of the launcher, screenshot only
+#                   (through the logo/title -- space isn't scriptable, see
+#                   framehash-launcher for how the game side is checked)
+#   make framehash-launcher  proves the game reached via the launcher's
+#                   chain-in tail renders identically to a cold doom.prg
+#                   boot (tools/vicedbg/launcherhash.py)
+#   make run-u64-launcher    push the launcher to the Ultimate and run it
+#
 #   make clean
 
 # KickAssembler is only distributed from theweb.dk; keep the location
@@ -92,7 +104,8 @@ VICEOPTS   = -default +confirmonexit -autostartprgmode 1 +sound
 
 .PHONY: all run shot check debug stats profile phaseprof framehash walktest doortest jumptest bobtest assets reubench run-u64 u64-config \
         u64-fps u64-map sidtest irqtest audiotest music setup clean \
-        intro run-intro shot-intro run-intro-u64 intro-config
+        intro run-intro shot-intro run-intro-u64 intro-config \
+        launcher run-launcher shot-launcher framehash-launcher run-u64-launcher
 
 # `setup` is defined first for readability but must not be the default goal:
 # a bare `make` has to build, as the README says it does.
@@ -261,6 +274,75 @@ intro-config:
 # mp3 still rebuilds the image and reminds you to reload it.
 run-intro-u64: $(INTROPRG) $(INTROREU) u64-config intro-config
 	$(PYTHON) tools/u64push.py $(U64_HOST) $(INTROPRG)
+
+# The launcher: the Hondani logo + title screen + game, merged into one PRG
+# and one REU image (tools/build_launcher_reu.py). This is what actually
+# ships -- doom.prg/assets.reu stay the dev/test path above (walktest,
+# framehash, u64-fps, ...), unmodified, because they are cheaper to iterate
+# on directly and nothing about the merge changes what they exercise.
+#
+# GAMEREU is assets.reu (unchanged) with GAMECODE (doom.prg's body, stub-
+# stripped) and INTROMUSIC (the title's own PCM) appended at page-aligned
+# offsets recorded in GAMELAYOUT -- see build_launcher_reu.py's docstring
+# and docs/reu-format.md's "outer envelope" appendix. Not a new D64U
+# version: mapload.asm never reads past assets.reu's own block table.
+LAUNCHERPRG := build/launcher.prg
+GAMEREU     := build/game.reu
+GAMELAYOUT  := build/game-layout.asm
+HONDANIKLA  := assets/hondani-logo-placeholder.kla
+
+$(GAMEREU) $(GAMELAYOUT) &: tools/build_launcher_reu.py $(PRG) $(REUIMG) $(INTROREU) $(INTROASM)
+	$(PYTHON) tools/build_launcher_reu.py \
+	    --assets $(REUIMG) --game $(PRG) \
+	    --pcm $(INTROREU) --pcm-asm $(INTROASM) \
+	    -o $(GAMEREU) --asm $(GAMELAYOUT)
+
+$(LAUNCHERPRG): $(INTROSRC) $(KLA) $(HONDANIKLA) $(INTROASM) $(GAMELAYOUT)
+	$(KICKASS) src/intro/intro.asm -odir build -o $(LAUNCHERPRG) -libdir build \
+	    -showmem -symbolfile -vicesymbols
+
+launcher: $(LAUNCHERPRG) $(GAMEREU)
+
+# 8192 = 8 MB: must equal REU_TOTAL_SIZE in tools/build_launcher_reu.py, for
+# the same reason the intro's own -reusize must match mp3topcm.py's REU_SIZE
+# (docs/reu-format.md §9.1 -- VICE refuses a mismatched -reuimage).
+LAUNCHERREUOPTS = -reu -reusize 8192 +reuimagerw -reuimage $(GAMEREU)
+
+run-launcher: $(LAUNCHERPRG) $(GAMEREU)
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(LAUNCHERREUOPTS) -autostart $(LAUNCHERPRG)
+
+SHOT_LAUNCHER := build/shot-launcher.png
+shot-launcher: $(LAUNCHERPRG) $(GAMEREU)
+	rm -f $(SHOT_LAUNCHER)
+	-$(VICEWRAP) $(VICE) $(VICEOPTS) $(LAUNCHERREUOPTS) -warp \
+	    -limitcycles $(SHOT_CYCLES) -exitscreenshot $(SHOT_LAUNCHER) \
+	    -autostart $(LAUNCHERPRG)
+	@test -s $(SHOT_LAUNCHER) || { echo "shot-launcher: VICE wrote no $(SHOT_LAUNCHER)"; exit 1; }
+	@echo "shot-launcher: wrote $(SHOT_LAUNCHER)"
+
+# The warm-boot proof IMPLEMENTATION_PLAN's launcher plan §3 calls for:
+# the game reached via the merged launcher's chain-in tail (no reset, no
+# doom.prg autostart) must render the identical frame to a cold doom.prg
+# boot. See tools/vicedbg/launcherhash.py for how it stands in for the
+# space press VICE's monitor can't fake.
+framehash-launcher: $(LAUNCHERPRG) $(GAMEREU)
+	@mkdir -p build
+	$(VICEWRAP) $(VICE) $(VICEOPTS) $(LAUNCHERREUOPTS) -warp \
+	    -binarymonitor -binarymonitoraddress ip4://127.0.0.1:$(MONPORT) \
+	    -autostart $(LAUNCHERPRG) > $(VICELOG) 2>&1 & \
+	vpid=$$!; \
+	$(PYTHON) tools/vicedbg/launcherhash.py $(MONPORT); rc=$$?; \
+	pkill -P $$vpid 2>/dev/null; kill $$vpid 2>/dev/null; \
+	exit $$rc
+
+# Real hardware: one PRG, one REU. Unlike run-u64 (the dev/test loop against
+# doom.prg + assets.reu), the REU here is loaded the same way intro.reu is
+# today -- once, from the Ultimate's own menu (REU Preload Image ->
+# /Usb0/game.reu, then reset) -- because it is now several MB, same
+# reasoning as run-intro-u64 above. $(GAMEREU) stays a prerequisite so a
+# changed WAD/mp3/doom.prg still rebuilds it and reminds you to reload it.
+run-u64-launcher: $(LAUNCHERPRG) $(GAMEREU) u64-config intro-config
+	$(PYTHON) tools/u64push.py $(U64_HOST) $(LAUNCHERPRG)
 
 # The map images. Both go through the same packers in wad2reu.py; the format
 # they share is frozen in docs/reu-format.md.

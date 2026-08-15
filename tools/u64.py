@@ -1,5 +1,8 @@
 """Minimal client for the Ultimate REST API (firmware >= 3.11 / C64U 1.x).
 
+License: CC BY-NC-SA 4.0
+© 2026 Honza Slesinger, Hondani
+
 Standard library only -- this runs from the Makefile on a bare machine.
 
 The API is documented at

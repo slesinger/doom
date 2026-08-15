@@ -58,7 +58,7 @@ reports on firmware 1.1.0 / core 1.49; the register API PDF's §2.1 names an
 older menu wording that does not exist here.
 
 `tools/mp3topcm.py` does the offline half: ffmpeg decodes the mp3 to raw
-8-bit unsigned **mono** PCM (default 22050 Hz — 3.6 MB for the 2:53 track),
+8-bit signed **mono** PCM (default 22050 Hz — 3.6 MB for the 2:53 track),
 and both title-music channels point at that one buffer at the same offset,
 differing only in pan: hard left and hard right. Repeat points loop the whole
 buffer for as long as the gate bit stays set, i.e. for as long as the title
@@ -84,9 +84,13 @@ it already doesn't care what's playing the file, only that bytes land in REU
 RAM. The one thing it assumed was the engine's own `D64U` block-header
 format, to know how many of a padded image's bytes are worth uploading;
 `image_regions` falls back to trimming trailing zero padding for
-images with no such header, which works here because 8-bit *unsigned* PCM
-silence sits at $80, not $00 — a run of zero bytes can only be the pad
-`mp3topcm.py` appended.
+images with no such header — a heuristic that only ever worked while the PCM
+was unsigned (silence at $80, so a run of zero bytes could only be pad).
+`mp3topcm.py` moved to *signed* PCM (2026-08-15, matching the sampler's
+actual two's-complement format), where silence legitimately reads $00 too;
+this fallback path is unused by the merged launcher's `game.reu` (D64U-framed,
+never falls through to it) and should not be relied on again for a raw image
+without revisiting the trim.
 
 **The intro does not use that uploader.** `intro.reu` is loaded once from the
 Ultimate's own menu — `REU Preload Image` → `/Usb0/intro.reu`, then reset —

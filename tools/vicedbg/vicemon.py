@@ -85,6 +85,18 @@ class Mon:
             off += size + 1
         return out
 
+    def regs_set(self, values, memspace=0):
+        """Write CPU registers. `values` is {register id: value}, the same
+        shape regs() returns -- get the ids from register_names(). Used only
+        by launcherhash.py, to force PC past a hardware-keyboard wait loop
+        the monitor has no other way to satisfy (see its header)."""
+        body = struct.pack("<BH", memspace, len(values))
+        for rid, val in values.items():
+            body += struct.pack("<BBH", 3, rid, val)   # item size excludes itself
+        _, err, _ = self.cmd(0x32, body)
+        if err:
+            raise RuntimeError(f"regs_set failed, err={err}")
+
     def register_names(self, memspace=0):
         _, _, b = self.cmd(0x83, bytes([memspace]))
         n = struct.unpack("<H", b[:2])[0]

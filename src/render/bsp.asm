@@ -1,6 +1,10 @@
 //============================================================
 //  bsp.asm — BSP traversal, subsector streaming, point lookup
 //
+//  License: CC BY-NC-SA 4.0
+//  © 2026 Honza Slesinger, Hondani
+//  Based on Doom (1993) © id Software
+//
 //  This replaces the portal walker. The engine descends the WAD's
 //  own NODES front-to-back from the camera, exactly as Doom does,
 //  and the only occlusion state is the per-column window

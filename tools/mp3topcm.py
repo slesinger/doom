@@ -5,7 +5,7 @@
         -o build/intro.reu --asm build/intro-audio.asm
 
 The Ultimate Audio module (register API pulled into src/intro/ultaudio.asm)
-plays 8-bit unsigned PCM straight out of REU memory -- no player code, no
+plays 8-bit signed PCM straight out of REU memory -- no player code, no
 CPU time per sample, just an address, a length and a divider register. So
 the whole job here is offline: decode the mp3 and resample it, then hand the
 raw bytes to the REU image the Ultimate's sampler reads from directly. There
@@ -50,13 +50,23 @@ DIVIDER_CLOCK = 6_250_000
 
 
 def decode(mp3: str, rate: int) -> bytes:
-    """mp3 -> mono 8-bit unsigned PCM, via ffmpeg.
+    """mp3 -> mono 8-bit signed PCM, via ffmpeg.
 
+    Signed, not unsigned: the Ultimate Audio sampler's 8-bit format is
+    two's-complement (register API v0.2's channels feed a signed DAC, same
+    as every other 8-bit PCM sampler convention this side of a WAV file).
+    Encoding unsigned and handing it to a signed consumer folds the whole
+    top half of the waveform -- samples >=128 read back as negative --
+    which leaves the tune recognisable and roughly on pitch but adds a
+    dense harmonic buzz on top of it. Found on real hardware (the emulator
+    doesn't drive $DF20+ at all, so this was invisible in every VICE test):
+    the intro title music played "unclean, a bit faster", and the same
+    tune's own audible file was not.
     -vn drops the embedded cover-art video stream ffprobe reports on these
     files; without it ffmpeg either errors or tries to transcode a JPEG.
     """
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", mp3, "-vn",
-           "-ar", str(rate), "-ac", "1", "-f", "u8", "-acodec", "pcm_u8", "-"]
+           "-ar", str(rate), "-ac", "1", "-f", "s8", "-acodec", "pcm_s8", "-"]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, check=True)
     except FileNotFoundError:

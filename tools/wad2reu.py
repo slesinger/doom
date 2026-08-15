@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """wad2reu.py — pack a Doom map into the engine's REU image.
 
+License: CC BY-NC-SA 4.0 (Creative Commons Attribution-NonCommercial-ShareAlike)
+© 2026 Honza Slesinger, Hondani
+Based on Doom (1993) © id Software
+See LICENSE and ATTRIBUTION.md for complete licensing details.
+
+Usage:
     python3 tools/wad2reu.py assets/DOOM1.WAD -o build/assets.reu
     python3 tools/wad2reu.py --map TEST      -o build/testmap.reu
     python3 tools/wad2reu.py assets/DOOM1.WAD -o build/assets.reu --png build/assets-map.png

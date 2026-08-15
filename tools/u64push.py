@@ -229,11 +229,19 @@ def image_regions(img: bytes) -> list[tuple[int, int]]:
 
     Two image shapes reach here: the engine's own D64U block format
     (wad2reu.py), whose descriptors say exactly what is used, and a plain
-    padded blob (tools/mp3topcm.py's PCM for the intro), which carries no
+    padded blob (tools/mp3topcm.py's standalone intro.reu), which carries no
     header at all. The second is told apart by the missing magic and
-    measured by trimming its trailing zero padding instead -- silence in
-    8-bit *unsigned* PCM sits at $80, not $00, so trailing zero bytes can
-    only be the pad mp3topcm.py itself appended, never audio content.
+    measured by trimming its trailing zero padding instead.
+    #
+    # This trim is only safe because mp3topcm.py's PCM is unsigned -- silence
+    # sits at $80, not $00, so a run of zero bytes can only be the pad it
+    # appended, never audio content. mp3topcm.py switched to *signed* PCM
+    # (2026-08-15, matching the sampler's actual two's-complement format --
+    # see its own docstring), where silence legitimately reads $00 too. That
+    # makes this fallback trim-happy on a signed image with a quiet passage
+    # near the end. It is dead code today -- game.reu is D64U-framed and
+    # never falls through to it -- but do not resurrect the standalone
+    # intro.reu path without fixing this first.
 
     Regions rather than a single length, because `assets.reu` is not
     contiguous: the map blocks end around 36 KB and MUSIC starts at a fixed

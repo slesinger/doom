@@ -1,6 +1,10 @@
 //============================================================
 //  walls.asm — seg renderer into the chunky MATRIX
 //
+//  License: CC BY-NC-SA 4.0
+//  © 2026 Honza Slesinger, Hondani
+//  Based on Doom (1993) © id Software
+//
 //  One seg of one subsector, drawn into the per-column clip
 //  windows colTop/colBot. The traversal that decides which
 //  subsectors get here, and in what order, is bsp.asm; this file
