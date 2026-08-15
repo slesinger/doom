@@ -220,6 +220,7 @@ INTROPRG   := build/intro.prg
 INTROREU   := build/intro.reu
 INTROASM   := build/intro-audio.asm
 KLA        := assets/doom-title.kla
+HONDANIART := assets/ilogo6.art
 INTROMP3   := assets/04 - Intermission From Doom.mp3
 # The asset ships with spaces in its name, which Make's prerequisite lists
 # cannot carry unescaped (quoting a prerequisite does nothing -- Make splits
@@ -230,7 +231,7 @@ empty      :=
 space      := $(empty) $(empty)
 INTROMP3_ESC := $(subst $(space),\ ,$(INTROMP3))
 
-$(INTROPRG): $(INTROSRC) $(KLA) $(INTROASM)
+$(INTROPRG): $(INTROSRC) $(KLA) $(HONDANIART) $(INTROASM)
 	$(KICKASS) src/intro/intro.asm -odir build -o $(INTROPRG) -libdir build \
 	    -showmem -symbolfile -vicesymbols
 
@@ -289,7 +290,6 @@ run-intro-u64: $(INTROPRG) $(INTROREU) u64-config intro-config
 LAUNCHERPRG := build/launcher.prg
 GAMEREU     := build/game.reu
 GAMELAYOUT  := build/game-layout.asm
-HONDANIKLA  := assets/hondani-logo-placeholder.kla
 
 $(GAMEREU) $(GAMELAYOUT) &: tools/build_launcher_reu.py $(PRG) $(REUIMG) $(INTROREU) $(INTROASM)
 	$(PYTHON) tools/build_launcher_reu.py \
@@ -297,7 +297,7 @@ $(GAMEREU) $(GAMELAYOUT) &: tools/build_launcher_reu.py $(PRG) $(REUIMG) $(INTRO
 	    --pcm $(INTROREU) --pcm-asm $(INTROASM) \
 	    -o $(GAMEREU) --asm $(GAMELAYOUT)
 
-$(LAUNCHERPRG): $(INTROSRC) $(KLA) $(HONDANIKLA) $(INTROASM) $(GAMELAYOUT)
+$(LAUNCHERPRG): $(INTROSRC) $(KLA) $(HONDANIART) $(INTROASM) $(GAMELAYOUT)
 	$(KICKASS) src/intro/intro.asm -odir build -o $(LAUNCHERPRG) -libdir build \
 	    -showmem -symbolfile -vicesymbols
 
