@@ -30,3 +30,5 @@ build/intro-audio.asm
 # Get it yourself (free shareware DOOM1.WAD or your own licensed full WAD)
 # and drop it in assets/ -- see assets/DOOM1.WAD.README.
 assets/DOOM1.WAD
+release/game.reu
+release/launcher.prg
